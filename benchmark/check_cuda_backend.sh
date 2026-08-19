@@ -21,4 +21,6 @@ fi
 
 "$root_dir/build/cuda/cuda_backend_smoke" --device "$device" >"$result"
 cat "$result"
+"$root_dir/build/cuda/fortran_cuda_backend_smoke" >"$result.fortran.json"
+cat "$result.fortran.json"
 printf 'result=%s\n' "$result"

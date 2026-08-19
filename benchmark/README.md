@@ -40,8 +40,9 @@ process. The result JSON records `cuda_visible_devices`.
 ## Resident CUDA kernel
 
 The reusable CUDA ABI smoke check validates persistent weight upload, a
-resident-device activation/output path, and the host-controlled integration
-path against the same independent CPU oracle:
+resident-device activation/output path, the host-controlled integration path,
+and the linked Fortran binding. The C++ path is checked against the same
+independent CPU oracle:
 
 ```bash
 CUDA_DEVICE=0 benchmark/check_cuda_backend.sh
