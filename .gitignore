@@ -9,6 +9,7 @@ fortai
 *.profraw
 benchmark/results/
 benchmark/logs/
+benchmark/profiles/
 .provenance/src/
 .provenance/downloads/
 .provenance/records/

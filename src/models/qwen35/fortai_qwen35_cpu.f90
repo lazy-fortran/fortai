@@ -1,9 +1,35 @@
 module fortai_qwen35_cpu
+    use, intrinsic :: iso_c_binding, only: c_float, c_int64_t
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_tensor_t
     use fortai_status, only: FORTAI_INVALID, status_t
     implicit none
     private
+
+    interface
+        subroutine fortai_gdn_step(state, key, value, query, decay, beta, head_size, &
+                output_scale, output) bind(C, name='fortai_gdn_step')
+            import c_float, c_int64_t
+            real(c_float), intent(inout) :: state(*)
+            real(c_float), intent(in) :: key(*), value(*), query(*)
+            real(c_float), value, intent(in) :: decay, beta, output_scale
+            integer(c_int64_t), value, intent(in) :: head_size
+            real(c_float), intent(out) :: output(*)
+        end subroutine fortai_gdn_step
+
+        subroutine fortai_silu(values, count) bind(C, name='fortai_silu')
+            import c_float, c_int64_t
+            real(c_float), intent(inout) :: values(*)
+            integer(c_int64_t), value, intent(in) :: count
+        end subroutine fortai_silu
+
+        subroutine fortai_silu_product(left, right, count) bind(C, name='fortai_silu_product')
+            import c_float, c_int64_t
+            real(c_float), intent(inout) :: left(*)
+            real(c_float), intent(in) :: right(*)
+            integer(c_int64_t), value, intent(in) :: count
+        end subroutine fortai_silu_product
+    end interface
 
     type :: qwen35_cpu_layer_t
         logical :: recurrent = .false.
@@ -313,10 +339,8 @@ contains
             call rms_norm(self % x, self % file % tensors(self % layers(i) % post_norm), &
                 self % norm_epsilon, self % normalized, stat)
             if (.not. stat % is_ok()) return
-            call model_matvec(self, self % layers(i) % ffn_gate, self % normalized, &
-                self % ffn_gate_work, stat)
-            if (.not. stat % is_ok()) return
-            call model_matvec(self, self%layers(i)%ffn_up, self%normalized, self%ffn_up_work, stat)
+            call model_matvec_pair(self, self%layers(i)%ffn_gate, self%layers(i)%ffn_up, &
+                self%normalized, self%ffn_gate_work, self%ffn_up_work, stat)
             if (.not. stat % is_ok()) return
             call silu_product(self % ffn_gate_work, self % ffn_up_work)
             call model_matvec(self, self % layers(i) % ffn_down, self % ffn_gate_work, &
@@ -336,9 +360,10 @@ contains
         type(qwen35_cpu_layer_t), intent(inout) :: layer
         real(real32), intent(in) :: input(:)
         type(status_t), intent(out) :: stat
-        integer :: channel, head, i, j, k, key_head, slot
+        integer :: channel, head, j, key_head, slot
+        integer :: key_offset, query_offset, state_offset, value_offset
         integer(int64) :: tensor_index
-        real(real32) :: accumulator, beta, decay, delta, norm_factor
+        real(real32) :: accumulator, beta, decay, decay_factor, norm_factor
 
         call stat % clear()
         call layer_matvec(self, layer%attn_qkv, input, self%qkv_work(1:self%recurrent_conv_size), &
@@ -347,6 +372,7 @@ contains
         call layer_matvec(self, layer%attn_gate, input, self%gate_work(1:self%recurrent_inner_size), &
             self % recurrent_inner_size, stat)
         if (.not. stat % is_ok()) return
+        call fortai_silu(self % gate_work, int(self % recurrent_inner_size, c_int64_t))
         call layer_matvec(self, layer % ssm_alpha, input, self % alpha_work, &
             self % recurrent_value_heads, stat)
         if (.not. stat % is_ok()) return
@@ -365,8 +391,9 @@ contains
                 self % recurrent_conv_kernel, int64)
             accumulator = accumulator + self%file%tensors(layer%ssm_conv)%value(tensor_index) &
                 * self % qkv_work(channel)
-            self % conv_work(channel) = silu(accumulator)
+            self % conv_work(channel) = accumulator
         end do
+        call fortai_silu(self % conv_work, int(self % recurrent_conv_size, c_int64_t))
         if (self % recurrent_conv_kernel > 2) then
             do slot = 1, self % recurrent_conv_kernel - 2
                 layer % conv_state((slot - 1) * self % recurrent_conv_size + 1: &
@@ -391,34 +418,19 @@ contains
             decay = self % file % tensors(layer % ssm_a) % value(int(head, int64)) * &
                 softplus(self % alpha_work(head) + self % file % tensors(layer % ssm_dt) % value( &
                 int(head, int64)))
-            do j = 1, self % recurrent_head_size
-                do i = 1, self % recurrent_head_size
-                    call self % layers_state_update(layer, head, j, i, decay)
-                end do
-            end do
-            do j = 1, self % recurrent_head_size
-                accumulator = 0.0_real32
-                do k = 1, self % recurrent_head_size
-                    accumulator = accumulator + self % gdn_state_value(layer, head, j, k) * &
-                        self % conv_work(self % recurrent_state_size * self % recurrent_key_heads + &
-                        key_head * self % recurrent_head_size + k)
-                end do
-                delta = (self % conv_work(2 * self % recurrent_state_size * &
-                    self % recurrent_key_heads + (head - 1) * self % recurrent_head_size + j) - &
-                    accumulator) * beta
-                do i = 1, self % recurrent_head_size
-                    call self % gdn_state_add(layer, head, j, i, delta * self % conv_work( &
-                        self % recurrent_state_size * self % recurrent_key_heads + &
-                        key_head * self % recurrent_head_size + i))
-                end do
-                accumulator = 0.0_real32
-                do k = 1, self % recurrent_head_size
-                    accumulator = accumulator + self % gdn_state_value(layer, head, j, k) * &
-                        self % conv_work(key_head * self % recurrent_head_size + k)
-                end do
-                self % attention_work((head - 1) * self % recurrent_head_size + j) = &
-                    accumulator / sqrt(real(self % recurrent_head_size, real32))
-            end do
+            decay_factor = exp(decay)
+            state_offset = (head - 1) * self % recurrent_head_size * self % recurrent_head_size
+            key_offset = self % recurrent_state_size * self % recurrent_key_heads + &
+                key_head * self % recurrent_head_size
+            query_offset = key_head * self % recurrent_head_size
+            value_offset = 2 * self % recurrent_state_size * self % recurrent_key_heads + &
+                (head - 1) * self % recurrent_head_size
+            call fortai_gdn_step(layer % gdn_state(state_offset + 1:), &
+                self % conv_work(key_offset + 1:), self % conv_work(value_offset + 1:), &
+                self % conv_work(query_offset + 1:), decay_factor, beta, &
+                int(self % recurrent_head_size, c_int64_t), &
+                1.0_real32 / sqrt(real(self % recurrent_head_size, real32)), &
+                self % attention_work((head - 1) * self % recurrent_head_size + 1:))
             norm_factor = rms_slice(self % attention_work, &
                 (head - 1) * self % recurrent_head_size + 1, self % recurrent_head_size, &
                 self % norm_epsilon)
@@ -426,7 +438,7 @@ contains
                 self % attention_work((head - 1) * self % recurrent_head_size + j) = &
                     self % attention_work((head - 1) * self % recurrent_head_size + j) / norm_factor * &
                     self % file % tensors(layer % ssm_norm) % value(int(j, int64)) * &
-                    silu(self % gate_work((head - 1) * self % recurrent_head_size + j))
+                    self % gate_work((head - 1) * self % recurrent_head_size + j)
             end do
         end do
         call model_matvec(self, layer%ssm_out, self%attention_work, self%hidden_work, stat)
@@ -589,6 +601,31 @@ contains
         end if
     end subroutine model_matvec
 
+    subroutine model_matvec_pair(self, first_index, second_index, input, first_output, &
+            second_output, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: first_index, second_index
+        real(real32), intent(in) :: input(:)
+        real(real32), intent(out) :: first_output(:), second_output(:)
+        type(status_t), intent(out) :: stat
+
+        call stat%clear()
+        if (first_index == 0 .or. second_index == 0) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CPU paired tensor binding is invalid')
+            return
+        end if
+        if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &
+            self%file%tensors(second_index)%value_type == GGML_TYPE_Q8_0) then
+            call self%file%tensors(first_index)%matvec_pair_q8( &
+                self%file%tensors(second_index), input, first_output, second_output, &
+                self%quantized_input, self%quantized_scales, stat)
+        else
+            call model_matvec(self, first_index, input, first_output, stat)
+            if (.not. stat%is_ok()) return
+            call model_matvec(self, second_index, input, second_output, stat)
+        end if
+    end subroutine model_matvec_pair
+
     subroutine rms_norm(input, weights, epsilon, output, stat)
         real(real32), intent(in) :: input(:), epsilon
         type(gguf_tensor_t), intent(in) :: weights
@@ -655,27 +692,11 @@ contains
     end subroutine apply_rope
 
     subroutine silu_product(left, right)
-        real(real32), intent(inout) :: left(:)
-        real(real32), intent(in) :: right(:)
-        integer :: i
+        real(real32), contiguous, intent(inout) :: left(:)
+        real(real32), contiguous, intent(in) :: right(:)
 
-        !$omp simd
-        do i = 1, size(left)
-            left(i) = silu(left(i)) * right(i)
-        end do
+        call fortai_silu_product(left, right, int(size(left), c_int64_t))
     end subroutine silu_product
-
-    real(real32) function silu(value)
-        real(real32), intent(in) :: value
-
-        if (value > 20.0_real32) then
-            silu = value
-        else if (value < -20.0_real32) then
-            silu = 0.0_real32
-        else
-            silu = value / (1.0_real32 + exp(-value))
-        end if
-    end function silu
 
     real(real32) function sigmoid(value)
         real(real32), intent(in) :: value

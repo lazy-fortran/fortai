@@ -13,7 +13,7 @@ if [[ ! -f "$model_path" ]]; then
 fi
 
 token_id="${2:-${FORTAI_TOKEN_ID:-9419}}"
-steps="${3:-${FORTAI_BENCH_STEPS:-1}}"
+steps="${3:-${FORTAI_BENCH_STEPS:-8}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 result_dir="$root_dir/benchmark/results"
 log_dir="$root_dir/benchmark/logs"

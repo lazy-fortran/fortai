@@ -13,7 +13,7 @@ if [[ ! -f "$model_path" ]]; then
 fi
 
 token_id="${2:-${FORTAI_TOKEN_ID:-9419}}"
-steps="${3:-${FORTAI_BENCH_STEPS:-1}}"
+steps="${3:-${FORTAI_BENCH_STEPS:-8}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 threads="${OMP_NUM_THREADS:-$(nproc)}"
 llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"

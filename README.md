@@ -54,6 +54,19 @@ benchmark/run_cpu_reference.sh
 
 # model-level CPU smoke/benchmark
 benchmark/run_qwen35_cpu.sh .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
+
+# fair short-decode comparison; FortAI and llama.cpp run sequentially
+OMP_NUM_THREADS=4 OMP_PROC_BIND=spread \
+  benchmark/compare_qwen35_cpu_llama.sh \
+  .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf 9419 8 128
+
+# find the best thread count for both harnesses
+benchmark/tune_qwen35_cpu.sh \
+  .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
+
+# collect perf counters and a symbol-level call-graph profile
+OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu.sh \
+  .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
 ```
 
 The local Lazy Fortran workflow is also supported:
@@ -65,6 +78,10 @@ fo
 The model runner accepts a GGUF file, an initial Qwen tokenizer ID, a decode
 step count, and a context limit. The persistent model fetch manifest is in
 `.provenance/models.tsv`.
+
+Benchmark results, logs, and perf data stay machine-local under
+`benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts
+and their provenance logic are tracked.
 
 ## Status
 

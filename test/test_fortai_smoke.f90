@@ -1,4 +1,5 @@
 program test_fortai_smoke
+    use, intrinsic :: iso_c_binding, only: c_float, c_int64_t
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
     use fortai_arena, only: arena_t
     use fortai_backend_cpu, only: cpu_matvec, cpu_matvec_inplace
@@ -20,6 +21,25 @@ program test_fortai_smoke
     use fortai_tokenizer, only: tokenizer_t
     implicit none
 
+    interface
+        subroutine fortai_gdn_step_test(state, key, value, query, decay, beta, head_size, &
+                output_scale, output) bind(C, name='fortai_gdn_step')
+            import c_float, c_int64_t
+            real(c_float), intent(inout) :: state(*)
+            real(c_float), intent(in) :: key(*), value(*), query(*)
+            real(c_float), value, intent(in) :: decay, beta, output_scale
+            integer(c_int64_t), value, intent(in) :: head_size
+            real(c_float), intent(out) :: output(*)
+        end subroutine fortai_gdn_step_test
+
+        subroutine fortai_silu_product(left, right, count) bind(C, name='fortai_silu_product')
+            import c_float, c_int64_t
+            real(c_float), intent(inout) :: left(*)
+            real(c_float), intent(in) :: right(*)
+            integer(c_int64_t), value, intent(in) :: count
+        end subroutine fortai_silu_product
+    end interface
+
     integer :: failures
 
     failures = 0
@@ -32,6 +52,8 @@ program test_fortai_smoke
     call test_device_and_arena(failures)
     call test_gguf_cache_qwen(failures)
     call test_gguf_q8_matvec(failures)
+    call test_gdn_kernel(failures)
+    call test_silu_kernel(failures)
     if (failures > 0) error stop 1
     print '(a)', 'FortAI smoke tests passed'
 
@@ -210,5 +232,40 @@ contains
         call require(abs(real(output(1), real64) - 528.0_real64) < 1.0e-4_real64, &
             'Q8 activation matvec independent oracle', failures)
     end subroutine test_gguf_q8_matvec
+
+    subroutine test_gdn_kernel(failures)
+        integer, intent(inout) :: failures
+        real(real32) :: state(4), key(2), value(2), query(2), output(2)
+
+        state = [1.0_real32, 2.0_real32, 3.0_real32, 4.0_real32]
+        key = [1.0_real32, 2.0_real32]
+        value = [5.0_real32, 6.0_real32]
+        query = [2.0_real32, 1.0_real32]
+        call fortai_gdn_step_test(state, key, value, query, 0.5_real32, 0.25_real32, &
+            int(2, c_int64_t), 1.0_real32 / sqrt(2.0_real32), output)
+        call require(maxval(abs(output - [4.5_real32, 5.5_real32] / sqrt(2.0_real32))) < 1.0e-5, &
+            'fused GDN kernel independent oracle', failures)
+        call require(maxval(abs(state - [1.125_real32, 2.25_real32, 1.625_real32, 2.25_real32])) < 1.0e-5, &
+            'fused GDN state update', failures)
+    end subroutine test_gdn_kernel
+
+    subroutine test_silu_kernel(failures)
+        integer, intent(inout) :: failures
+        real(real32) :: left(8), right(8), expected(8)
+        integer :: i
+
+        left = [-8.0_real32, -2.0_real32, -0.25_real32, 0.0_real32, &
+            0.25_real32, 2.0_real32, 8.0_real32, 16.0_real32]
+        right = [1.0_real32, -2.0_real32, 0.5_real32, 3.0_real32, &
+            -1.0_real32, 0.25_real32, 2.0_real32, -0.5_real32]
+        do i = 1, size(left)
+            expected(i) = left(i) / (1.0_real32 + exp(-left(i))) * right(i)
+        end do
+        call fortai_silu_product(left, right, int(size(left), c_int64_t))
+        if (maxval(abs(left - expected)) > 2.0e-6_real32) then
+            failures = failures + 1
+            write (*, '(a, es12.4)') 'silu kernel mismatch: ', maxval(abs(left - expected))
+        end if
+    end subroutine test_silu_kernel
 
 end program test_fortai_smoke

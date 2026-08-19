@@ -1,8 +1,21 @@
 module fortai_gguf_runtime
+    use, intrinsic :: iso_c_binding, only: c_float, c_int8_t, c_int64_t
     use, intrinsic :: iso_fortran_env, only: int8, int16, int32, int64, real32, real64
     use fortai_status, only: FORTAI_INVALID, FORTAI_IO_ERROR, FORTAI_UNSUPPORTED, status_t
     implicit none
     private
+
+    interface
+        function fortai_q8_dot(weights, quantized, scales, row, block_count) &
+                bind(C, name='fortai_q8_dot') result(value)
+            import c_float, c_int8_t, c_int64_t
+            integer(c_int8_t), intent(in) :: weights(*)
+            integer(c_int8_t), intent(in) :: quantized(*)
+            real(c_float), intent(in) :: scales(*)
+            integer(c_int64_t), value, intent(in) :: row, block_count
+            real(c_float) :: value
+        end function fortai_q8_dot
+    end interface
 
     integer(int32), parameter, public :: GGML_TYPE_F32 = 0_int32
     integer(int32), parameter, public :: GGML_TYPE_F16 = 1_int32
@@ -40,10 +53,12 @@ module fortai_gguf_runtime
         integer(int64) :: file_offset = 0_int64
         integer(int64) :: byte_count = 0_int64
         integer(int8), allocatable :: bytes(:)
+        real(real32), allocatable :: decoded_values(:)
     contains
         procedure :: dot => gguf_tensor_dot
         procedure :: get_row => gguf_tensor_get_row
         procedure :: matvec => gguf_tensor_matvec
+        procedure :: matvec_pair_q8 => gguf_tensor_matvec_pair_q8
         procedure :: matvec_q8 => gguf_tensor_matvec_q8
         procedure :: value => gguf_tensor_value
     end type gguf_tensor_t
@@ -157,6 +172,7 @@ contains
                 call stat%set(FORTAI_IO_ERROR, 'could not read GGUF tensor data')
                 return
             end if
+            call decode_small_tensor(self%tensors(i))
         end do
         close (unit)
     end subroutine gguf_file_open
@@ -168,6 +184,8 @@ contains
         if (allocated(self%tensors)) then
             do i = 1, size(self%tensors)
                 if (allocated(self%tensors(i)%bytes)) deallocate (self%tensors(i)%bytes)
+                if (allocated(self%tensors(i)%decoded_values)) &
+                    deallocate (self%tensors(i)%decoded_values)
                 if (allocated(self%tensors(i)%shape)) deallocate (self%tensors(i)%shape)
                 if (allocated(self%tensors(i)%name)) deallocate (self%tensors(i)%name)
             end do
@@ -259,6 +277,10 @@ contains
         gguf_tensor_value = 0.0_real32
         if (.not. allocated(self%bytes)) return
         if (index < 1_int64 .or. index > tensor_elements(self%shape)) return
+        if (allocated(self%decoded_values)) then
+            gguf_tensor_value = self%decoded_values(index)
+            return
+        end if
         select case (self%value_type)
         case (GGML_TYPE_F32)
             byte_index = 1_int64 + (index - 1_int64) * 4_int64
@@ -349,8 +371,11 @@ contains
             integer(int64) :: row
 
             call stat%clear()
-            if (size(self%shape) /= 2 .or. size(vector) /= self%shape(1) .or. &
-                size(values) /= self%shape(2)) then
+            if (size(self%shape) /= 2) then
+                call stat%set(FORTAI_INVALID, 'GGUF matvec dimensions do not agree')
+                return
+            end if
+            if (size(vector) /= self%shape(1) .or. size(values) /= self%shape(2)) then
                 call stat%set(FORTAI_INVALID, 'GGUF matvec dimensions do not agree')
                 return
             end if
@@ -359,19 +384,25 @@ contains
                 call stat%set(FORTAI_UNSUPPORTED, 'GGUF matvec type is not supported')
                 return
             end if
-            !$omp parallel do default(none) shared(self, vector, values) private(row) schedule(static)
-            do row = 1, self%shape(2)
-                values(row) = self%dot(row, vector)
-            end do
-            !$omp end parallel do
+            if (self%shape(2) < 128_int64) then
+                do row = 1, self%shape(2)
+                    values(row) = self%dot(row, vector)
+                end do
+            else
+                !$omp parallel do default(none) shared(self, vector, values) private(row) schedule(static)
+                do row = 1, self%shape(2)
+                    values(row) = self%dot(row, vector)
+                end do
+                !$omp end parallel do
+            end if
         end subroutine gguf_tensor_matvec
 
         subroutine gguf_tensor_matvec_q8(self, vector, values, quantized, scales, stat)
             class(gguf_tensor_t), intent(in) :: self
             real(real32), intent(in) :: vector(:)
             real(real32), intent(out) :: values(:)
-            integer(int8), intent(out) :: quantized(:)
-            real(real32), intent(out) :: scales(:)
+            integer(int8), contiguous, intent(out) :: quantized(:)
+            real(real32), contiguous, intent(out) :: scales(:)
             type(status_t), intent(out) :: stat
             integer(int64) :: block, row
             integer(int64) :: block_count
@@ -382,8 +413,12 @@ contains
                 call stat%set(FORTAI_UNSUPPORTED, 'activation Q8 matvec needs a Q8_0 tensor')
                 return
             end if
-            if (size(self%shape) /= 2 .or. size(vector) /= self%shape(1) .or. &
-                size(values) /= self%shape(2) .or. mod(size(vector), 32) /= 0 .or. &
+            if (size(self%shape) /= 2) then
+                call stat%set(FORTAI_INVALID, 'activation Q8 matvec dimensions do not agree')
+                return
+            end if
+            if (size(vector) /= self%shape(1) .or. size(values) /= self%shape(2) .or. &
+                mod(size(vector), 32) /= 0 .or. &
                 size(quantized) < size(vector) .or. size(scales) < (size(vector) + 31) / 32) then
                 call stat%set(FORTAI_INVALID, 'activation Q8 matvec dimensions do not agree')
                 return
@@ -401,39 +436,85 @@ contains
                     quantized(block * 32 + 1:(block + 1) * 32) = 0_int8
                 end if
             end do
-            !$omp parallel do default(none) shared(self, quantized, scales, values, block_count) &
-            !$omp& private(row) schedule(static)
-            do row = 1, self%shape(2)
-                values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
-            end do
-            !$omp end parallel do
+            if (self%shape(2) < 128_int64) then
+                do row = 1, self%shape(2)
+                    values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
+                end do
+            else
+                !$omp parallel do default(none) shared(self, quantized, scales, values, block_count) &
+                !$omp& private(row) schedule(static)
+                do row = 1, self%shape(2)
+                    values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
+                end do
+                !$omp end parallel do
+            end if
         end subroutine gguf_tensor_matvec_q8
+
+        subroutine gguf_tensor_matvec_pair_q8(self, other, vector, values, other_values, &
+                quantized, scales, stat)
+            class(gguf_tensor_t), intent(in) :: self, other
+            real(real32), intent(in) :: vector(:)
+            real(real32), intent(out) :: values(:), other_values(:)
+            integer(int8), contiguous, intent(out) :: quantized(:)
+            real(real32), contiguous, intent(out) :: scales(:)
+            type(status_t), intent(out) :: stat
+            integer(int64) :: block, row
+            integer(int64) :: block_count
+            real(real32) :: maximum, scale
+
+            call stat%clear()
+            if (self%value_type /= GGML_TYPE_Q8_0 .or. other%value_type /= GGML_TYPE_Q8_0) then
+                call stat%set(FORTAI_UNSUPPORTED, 'paired activation matvec needs Q8_0 tensors')
+                return
+            end if
+            if (size(self%shape) /= 2 .or. size(other%shape) /= 2) then
+                call stat%set(FORTAI_INVALID, 'paired activation matvec dimensions do not agree')
+                return
+            end if
+            if (self%shape(1) /= other%shape(1) .or. self%shape(2) /= other%shape(2) .or. &
+                size(vector) /= self%shape(1) .or. size(values) /= self%shape(2) .or. &
+                size(other_values) /= other%shape(2) .or. mod(size(vector), 32) /= 0 .or. &
+                size(quantized) < size(vector) .or. size(scales) < (size(vector) + 31) / 32) then
+                call stat%set(FORTAI_INVALID, 'paired activation matvec dimensions do not agree')
+                return
+            end if
+            block_count = size(vector) / 32
+            do block = 0, block_count - 1
+                maximum = maxval(abs(vector(block * 32 + 1:(block + 1) * 32)))
+                if (maximum > 0.0_real32) then
+                    scale = maximum / 127.0_real32
+                    scales(block + 1) = scale
+                    quantized(block * 32 + 1:(block + 1) * 32) = int(max(-127, min(127, &
+                        nint(vector(block * 32 + 1:(block + 1) * 32) / scale))), int8)
+                else
+                    scales(block + 1) = 0.0_real32
+                    quantized(block * 32 + 1:(block + 1) * 32) = 0_int8
+                end if
+            end do
+            if (self%shape(2) < 128_int64) then
+                do row = 1, self%shape(2)
+                    values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
+                    other_values(row) = gguf_tensor_dot_q8_quantized(other, row, quantized, scales, block_count)
+                end do
+            else
+                !$omp parallel do default(none) shared(self, other, quantized, scales, values, &
+                !$omp& other_values, block_count) private(row) schedule(static)
+                do row = 1, self%shape(2)
+                    values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
+                    other_values(row) = gguf_tensor_dot_q8_quantized(other, row, quantized, scales, block_count)
+                end do
+                !$omp end parallel do
+            end if
+        end subroutine gguf_tensor_matvec_pair_q8
 
         real(real32) function gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
             class(gguf_tensor_t), intent(in) :: self
             integer(int64), intent(in) :: row, block_count
-            integer(int8), intent(in) :: quantized(:)
-            real(real32), intent(in) :: scales(:)
-            integer(int64) :: block, i, offset
-            integer(int32) :: accumulator
-            integer(int32) :: weight, activation
-            integer(int16) :: scale_bits
+            integer(int8), contiguous, intent(in) :: quantized(:)
+            real(real32), contiguous, intent(in) :: scales(:)
 
-            gguf_tensor_dot_q8_quantized = 0.0_real32
-            offset = (row - 1_int64) * block_count * 34_int64 + 1_int64
-            do block = 0, block_count - 1
-                scale_bits = transfer(self%bytes(offset + block * 34_int64: &
-                    offset + block * 34_int64 + 1_int64), scale_bits)
-                accumulator = 0_int32
-                !$omp simd reduction(+:accumulator)
-                do i = 0, 31
-                    weight = int(self%bytes(offset + block * 34_int64 + 2_int64 + i), int32)
-                    activation = int(quantized(block * 32_int64 + i + 1_int64), int32)
-                    accumulator = accumulator + weight * activation
-                end do
-                gguf_tensor_dot_q8_quantized = gguf_tensor_dot_q8_quantized + &
-                    gguf_fp16_to_real(scale_bits) * scales(block + 1) * real(accumulator, real32)
-            end do
+            gguf_tensor_dot_q8_quantized = fortai_q8_dot(self%bytes, quantized, scales, &
+                int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
         end function gguf_tensor_dot_q8_quantized
 
         subroutine read_metadata_value(unit, value_type, value, io_status)
@@ -551,6 +632,29 @@ contains
             allocate (character(len=length) :: value)
             if (length > 0_int64) read (unit, iostat=io_status) value
         end subroutine read_string
+
+        subroutine decode_small_tensor(tensor)
+            type(gguf_tensor_t), intent(inout) :: tensor
+            integer(int64) :: byte_index, elements, index
+
+            if (tensor%value_type /= GGML_TYPE_F32 .and. tensor%value_type /= GGML_TYPE_F16) return
+            elements = tensor_elements(tensor%shape)
+            if (elements > 131072_int64) return
+            allocate (tensor%decoded_values(elements))
+            if (tensor%value_type == GGML_TYPE_F32) then
+                do index = 1, elements
+                    byte_index = 1_int64 + (index - 1_int64) * 4_int64
+                    tensor%decoded_values(index) = transfer( &
+                        tensor%bytes(byte_index:byte_index + 3_int64), 0.0_real32)
+                end do
+            else
+                do index = 1, elements
+                    byte_index = 1_int64 + (index - 1_int64) * 2_int64
+                    tensor%decoded_values(index) = gguf_fp16_to_real(transfer( &
+                        tensor%bytes(byte_index:byte_index + 1_int64), 0_int16))
+                end do
+            end if
+        end subroutine decode_small_tensor
 
         integer(int64) function tensor_elements(shape)
             integer(int64), intent(in) :: shape(:)
