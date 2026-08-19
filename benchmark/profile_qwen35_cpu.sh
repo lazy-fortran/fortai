@@ -63,6 +63,9 @@ env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES
 
 perf report --stdio --no-children --sort symbol,dso -i "$profile_dir/perf.data" \
     >"$profile_dir/perf-report.txt"
+perf script -i "$profile_dir/perf.data" >"$profile_dir/perf-script.txt"
+objdump -d -Mintel "$root_dir/build/fo/bin/fortai_cpu_run" \
+    >"$profile_dir/fortai-objdump.txt"
 
 if rg -q '^# Total Lost Samples: [1-9]' "$profile_dir/perf-report.txt"; then
     echo "profile contains lost samples: $profile_dir/perf-report.txt" >&2

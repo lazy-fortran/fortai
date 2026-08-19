@@ -184,6 +184,17 @@ perf report --stdio --children --sort symbol,dso -i "$profile_dir/fortai-perf.da
     >"$profile_dir/fortai-perf-report-children.txt"
 perf report --stdio --children --sort symbol,dso -i "$profile_dir/llama-record-perf.data" \
     >"$profile_dir/llama-perf-report-children.txt"
+perf script -i "$profile_dir/fortai-perf.data" >"$profile_dir/fortai-perf-script.txt"
+perf script -i "$profile_dir/llama-record-perf.data" >"$profile_dir/llama-perf-script.txt"
+objdump -d -Mintel "$root_dir/build/fo/bin/fortai_cpu_run" \
+    >"$profile_dir/fortai-objdump.txt"
+objdump -d -Mintel "$llama_server" >"$profile_dir/llama-server-objdump.txt"
+llama_cpu_library=$(find "$llama_library_dir" -maxdepth 1 -type f \
+    -name 'libggml-cpu.so*' | sort | tail -n 1 || true)
+if [[ -n "$llama_cpu_library" ]]; then
+    objdump -d -Mintel "$llama_cpu_library" \
+        >"$profile_dir/llama-ggml-cpu-objdump.txt"
+fi
 
 for report in "$profile_dir/fortai-perf-report.txt" "$profile_dir/llama-perf-report.txt"; do
     if rg -q '^# Total Lost Samples: [1-9]' "$report"; then

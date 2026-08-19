@@ -256,9 +256,10 @@ static float q8_dot_avx2(const int8_t *__restrict weights,
     int64_t row, int64_t block_count)
 {
     __m256 accumulator = _mm256_setzero_ps();
-    const int8_t *row_weights = weights + row * block_count * 34 + 2;
-    const int8_t *activation_values = quantized + 2;
+    const int8_t *row_start = weights + row * block_count * 34;
+    const int8_t *activation_start = quantized;
     const int32_t blocks = (int32_t)block_count;
+    int64_t offset = 0;
     int32_t block;
 
     for (block = 0; block < blocks; ++block) {
@@ -267,12 +268,12 @@ static float q8_dot_avx2(const int8_t *__restrict weights,
          * block counter into a 64-bit pointer-end comparison. */
         __asm__ volatile("" : "+r"(block));
 #endif
-        const uint16_t scale_bits = load_u16(row_weights - 2);
-        const uint16_t activation_scale_bits = load_u16(activation_values - 2);
+        const uint16_t scale_bits = load_u16(row_start + offset);
+        const uint16_t activation_scale_bits = load_u16(activation_start + offset);
         const __m256i weight = _mm256_loadu_si256(
-            (const __m256i *)row_weights);
+            (const __m256i *)(row_start + offset + 2));
         const __m256i activation = _mm256_loadu_si256(
-            (const __m256i *)activation_values);
+            (const __m256i *)(activation_start + offset + 2));
         const __m256 scale = _mm256_set1_ps(fortai_f16_table[scale_bits] *
             fortai_f16_table[activation_scale_bits]);
         /* psignb(x, x) is the exact full-width sequence used by llama.cpp
@@ -285,8 +286,7 @@ static float q8_dot_avx2(const int8_t *__restrict weights,
             _mm256_set1_epi16(1));
         const __m256 dot = _mm256_cvtepi32_ps(pairs);
         accumulator = _mm256_fmadd_ps(scale, dot, accumulator);
-        row_weights += 34;
-        activation_values += 34;
+        offset += 34;
     }
     {
         const __m128 lower = _mm256_castps256_ps128(accumulator);
