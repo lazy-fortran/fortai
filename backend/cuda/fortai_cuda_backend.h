@@ -33,6 +33,8 @@ int fortai_cuda_q8_device_buffer_destroy(fortai_cuda_q8_context *context,
     void *device_buffer);
 int fortai_cuda_q8_device_buffer_upload(fortai_cuda_q8_context *context,
     void *device_buffer, const void *host_data, size_t bytes);
+int fortai_cuda_q8_device_buffer_upload_ptr(fortai_cuda_q8_context *context,
+    void *device_buffer, const void *host_data, size_t bytes);
 int fortai_cuda_q8_device_buffer_download(fortai_cuda_q8_context *context,
     void *host_data, const void *device_buffer, size_t bytes);
 
@@ -41,6 +43,15 @@ int fortai_cuda_q8_device_buffer_download(fortai_cuda_q8_context *context,
 int fortai_cuda_q8_matvec_resident(fortai_cuda_q8_context *context,
     const fortai_cuda_q8_weights *weights, const void *device_activation,
     void *device_output, float *kernel_ms);
+
+int fortai_cuda_qwen35_copy_device(fortai_cuda_q8_context *context,
+    const void *device_input, void *device_output, size_t bytes);
+int fortai_cuda_qwen35_add_device(fortai_cuda_q8_context *context,
+    const void *device_left, const void *device_right, void *device_output,
+    size_t elements);
+int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *context,
+    const void *device_input, const void *device_weights, void *device_output,
+    size_t elements, float epsilon);
 
 /* Convenience operation for the first host-controlled integration slice.
  * Weights remain resident across calls; activation and output are transferred
@@ -80,6 +91,12 @@ int fortai_cuda_q8_ffn_host(fortai_cuda_q8_context *context,
     size_t activation_bytes, float *host_output, size_t output_bytes,
     float *elapsed_ms);
 
+int fortai_cuda_q8_ffn_device(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *gate_weights,
+    const fortai_cuda_q8_weights *up_weights,
+    const fortai_cuda_q8_weights *down_weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements);
+
 /* A Qwen3.5 recurrent layer keeps its convolution and GDN state on-device.
  * The run call accepts one host Q8 activation and returns only the layer
  * output after the recurrent projection; all intermediate projections,
@@ -100,6 +117,9 @@ int fortai_cuda_qwen35_recurrent_reset(fortai_cuda_qwen35_recurrent *layer);
 int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *layer,
     const void *host_activation, size_t activation_bytes, float *host_output,
     size_t output_bytes, float *elapsed_ms);
+int fortai_cuda_qwen35_recurrent_run_device(fortai_cuda_qwen35_recurrent *layer,
+    const void *device_activation, size_t activation_elements,
+    void *device_output, size_t output_elements);
 
 const char *fortai_cuda_q8_last_error(const fortai_cuda_q8_context *context);
 

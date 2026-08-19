@@ -1,12 +1,14 @@
 module fortai_qwen35_cpu
-    use, intrinsic :: iso_c_binding, only: c_associated, c_float, c_int16_t, c_int64_t, c_int8_t, c_size_t
+    use, intrinsic :: iso_c_binding, only: c_associated, c_float, c_int16_t, c_int64_t, c_int8_t, &
+        c_null_ptr, c_ptr, c_size_t
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
     use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, &
-        cuda_q8_ffn_host, cuda_q8_matvec_host_pair, cuda_q8_matvec_host_triplet, &
-        cuda_q8_matvec_host_triplet_contiguous, cuda_q8_weights_t
+        cuda_q8_ffn_host, cuda_q8_ffn_device, cuda_q8_matvec_host_pair, &
+        cuda_q8_matvec_host_triplet, cuda_q8_matvec_host_triplet_contiguous, cuda_q8_weights_t, &
+        cuda_qwen35_add_device, cuda_qwen35_copy_device, cuda_qwen35_rms_norm_device
     use fortai_backend_cuda, only: cuda_qwen35_recurrent_t
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_fp16_to_real, gguf_tensor_t
-    use fortai_status, only: FORTAI_INVALID, status_t
+    use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
     implicit none
     private
 
@@ -129,7 +131,14 @@ module fortai_qwen35_cpu
         real(real32), allocatable :: quantized_scales(:)
         type(cuda_q8_context_t) :: cuda
         type(cuda_q8_weights_t), allocatable :: cuda_weights(:)
+        type(c_ptr), allocatable :: cuda_attn_norm(:)
+        type(c_ptr), allocatable :: cuda_post_norm(:)
+        type(c_ptr) :: cuda_x = c_null_ptr
+        type(c_ptr) :: cuda_residual = c_null_ptr
+        type(c_ptr) :: cuda_normalized = c_null_ptr
+        type(c_ptr) :: cuda_hidden = c_null_ptr
         logical :: cuda_enabled = .false.
+        logical :: cuda_device_pipeline = .false.
     contains
         procedure :: close => qwen35_cpu_close
         procedure :: enable_cuda => qwen35_cpu_enable_cuda
@@ -282,6 +291,7 @@ contains
             return
         end if
         if (allocated(self%cuda_weights)) then
+            call cuda_device_pipeline_cleanup(self, cleanup_stat)
             if (allocated(self%layers)) then
                 do i = 1, size(self%layers)
                     call self%layers(i)%cuda_recurrent%destroy(cleanup_stat)
@@ -292,6 +302,7 @@ contains
             end do
             deallocate(self%cuda_weights)
         end if
+        self%cuda_enabled = .false.
         call self%cuda%destroy(cleanup_stat)
         call self%cuda%create(device, stat)
         if (.not. stat%is_ok()) return
@@ -342,13 +353,107 @@ contains
             end if
         end do
         self%cuda_enabled = .true.
+        call setup_cuda_device_pipeline(self, cleanup_stat)
+        if (.not. cleanup_stat%is_ok()) call cleanup_stat%clear()
     end subroutine qwen35_cpu_enable_cuda
+
+    subroutine setup_cuda_device_pipeline(self, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        integer :: i
+        integer(c_size_t) :: hidden_bytes
+
+        call stat%clear()
+        self%cuda_device_pipeline = .false.
+        if (.not. self%cuda_enabled) return
+        if (.not. allocated(self%layers)) then
+            call stat%set(FORTAI_UNSUPPORTED, 'CUDA device pipeline has no layers')
+            return
+        end if
+        do i = 1, size(self%layers)
+            if (.not. self%layers(i)%recurrent) cycle
+            if (.not. c_associated(self%layers(i)%cuda_recurrent%handle)) then
+                call stat%set(FORTAI_UNSUPPORTED, 'CUDA recurrent layer is not device resident')
+                return
+            end if
+            if (.not. cuda_ffn_ready(self, self%layers(i))) then
+                call stat%set(FORTAI_UNSUPPORTED, 'CUDA FFN layer is not device resident')
+                return
+            end if
+            if (size(self%file%tensors(self%layers(i)%attn_norm)%bytes) /= &
+                size(self%x) * storage_size(self%x(1)) / 8) then
+                call stat%set(FORTAI_UNSUPPORTED, 'CUDA RMS norm weights are not F32')
+                return
+            end if
+            if (size(self%file%tensors(self%layers(i)%post_norm)%bytes) /= &
+                size(self%x) * storage_size(self%x(1)) / 8) then
+                call stat%set(FORTAI_UNSUPPORTED, 'CUDA post norm weights are not F32')
+                return
+            end if
+        end do
+        allocate (self%cuda_attn_norm(size(self%layers)), self%cuda_post_norm(size(self%layers)))
+        do i = 1, size(self%layers)
+            self%cuda_attn_norm(i) = c_null_ptr
+            self%cuda_post_norm(i) = c_null_ptr
+        end do
+        hidden_bytes = int(size(self%x) * storage_size(self%x(1)) / 8, c_size_t)
+        call self%cuda%allocate_buffer(hidden_bytes, self%cuda_x, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(hidden_bytes, self%cuda_residual, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(hidden_bytes, self%cuda_normalized, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(hidden_bytes, self%cuda_hidden, stat)
+        if (.not. stat%is_ok()) return
+        do i = 1, size(self%layers)
+            if (.not. self%layers(i)%recurrent) cycle
+            call self%cuda%allocate_buffer(hidden_bytes, self%cuda_attn_norm(i), stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%upload(self%cuda_attn_norm(i), &
+                self%file%tensors(self%layers(i)%attn_norm)%bytes, hidden_bytes, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%allocate_buffer(hidden_bytes, self%cuda_post_norm(i), stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%upload(self%cuda_post_norm(i), &
+                self%file%tensors(self%layers(i)%post_norm)%bytes, hidden_bytes, stat)
+            if (.not. stat%is_ok()) return
+        end do
+        self%cuda_device_pipeline = .true.
+    end subroutine setup_cuda_device_pipeline
+
+    subroutine cuda_device_pipeline_cleanup(self, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        integer :: i
+
+        call stat%clear()
+        self%cuda_device_pipeline = .false.
+        if (allocated(self%cuda_attn_norm)) then
+            do i = 1, size(self%cuda_attn_norm)
+                if (.not. c_associated(self%cuda_attn_norm(i))) cycle
+                call self%cuda%free_buffer(self%cuda_attn_norm(i), stat)
+            end do
+            deallocate (self%cuda_attn_norm)
+        end if
+        if (allocated(self%cuda_post_norm)) then
+            do i = 1, size(self%cuda_post_norm)
+                if (.not. c_associated(self%cuda_post_norm(i))) cycle
+                call self%cuda%free_buffer(self%cuda_post_norm(i), stat)
+            end do
+            deallocate (self%cuda_post_norm)
+        end if
+        if (c_associated(self%cuda_x)) call self%cuda%free_buffer(self%cuda_x, stat)
+        if (c_associated(self%cuda_residual)) call self%cuda%free_buffer(self%cuda_residual, stat)
+        if (c_associated(self%cuda_normalized)) call self%cuda%free_buffer(self%cuda_normalized, stat)
+        if (c_associated(self%cuda_hidden)) call self%cuda%free_buffer(self%cuda_hidden, stat)
+    end subroutine cuda_device_pipeline_cleanup
 
     subroutine qwen35_cpu_close(self)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer :: i
         type(status_t) :: cuda_stat
 
+        call cuda_device_pipeline_cleanup(self, cuda_stat)
         if (allocated(self%cuda_weights)) then
             if (allocated(self%layers)) then
                 do i = 1, size(self%layers)
@@ -441,8 +546,21 @@ contains
         end if
         call self%file%tensors(self%token_embedding)%get_row(token_id + 1_int64, self%x, stat)
         if (.not. stat % is_ok()) return
+        if (self%cuda_device_pipeline) then
+            call self%cuda%upload_real(self%cuda_x, self%x, stat)
+            if (.not. stat%is_ok()) return
+        end if
 
         do i = 1, self % layer_count
+            if (self%cuda_device_pipeline) then
+                if (self%layers(i)%recurrent) then
+                    call forward_recurrent_device(self, i, stat)
+                    if (.not. stat%is_ok()) return
+                    cycle
+                end if
+                call self%cuda%download_real(self%cuda_x, self%x, stat)
+                if (.not. stat%is_ok()) return
+            end if
             self % residual = self % x
             call rms_norm(self % x, self % file % tensors(self % layers(i) % attn_norm), &
                 self % norm_epsilon, self % normalized, stat)
@@ -477,13 +595,57 @@ contains
             end if
             if (.not. stat % is_ok()) return
             self % x = self % hidden_work + self % residual
+            if (self%cuda_device_pipeline .and. .not. self%layers(i)%recurrent) then
+                call self%cuda%upload_real(self%cuda_x, self%x, stat)
+                if (.not. stat%is_ok()) return
+            end if
         end do
 
+        if (self%cuda_device_pipeline) then
+            call self%cuda%download_real(self%cuda_x, self%x, stat)
+            if (.not. stat%is_ok()) return
+        end if
         call rms_norm(self%x, self%file%tensors(self%output_norm), self%norm_epsilon, &
             self % normalized, stat)
         if (.not. stat % is_ok()) return
         call model_matvec(self, self % output, self % normalized, logits, stat)
     end subroutine qwen35_cpu_forward
+
+    subroutine forward_recurrent_device(self, layer_index, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: layer_index
+        type(status_t), intent(out) :: stat
+        integer(c_size_t) :: hidden_elements, hidden_bytes
+
+        call stat%clear()
+        hidden_elements = int(size(self%x), c_size_t)
+        hidden_bytes = hidden_elements * int(storage_size(self%x(1)) / 8, c_size_t)
+        call cuda_qwen35_copy_device(self%cuda, self%cuda_x, self%cuda_residual, hidden_bytes, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
+            self%cuda_attn_norm(layer_index), self%cuda_normalized, hidden_elements, &
+            self%norm_epsilon, stat)
+        if (.not. stat%is_ok()) return
+        call self%layers(layer_index)%cuda_recurrent%run_device(self%cuda_normalized, hidden_elements, &
+            self%cuda_hidden, hidden_elements, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_add_device(self%cuda, self%cuda_hidden, self%cuda_residual, self%cuda_x, &
+            hidden_elements, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_copy_device(self%cuda, self%cuda_x, self%cuda_residual, hidden_bytes, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
+            self%cuda_post_norm(layer_index), self%cuda_normalized, hidden_elements, &
+            self%norm_epsilon, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_q8_ffn_device(self%cuda, self%cuda_weights(self%layers(layer_index)%ffn_gate), &
+            self%cuda_weights(self%layers(layer_index)%ffn_up), &
+            self%cuda_weights(self%layers(layer_index)%ffn_down), self%cuda_normalized, &
+            hidden_elements, self%cuda_hidden, hidden_elements, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_add_device(self%cuda, self%cuda_hidden, self%cuda_residual, self%cuda_x, &
+            hidden_elements, stat)
+    end subroutine forward_recurrent_device
 
     subroutine forward_recurrent(self, layer, layer_index, input, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
@@ -612,7 +774,7 @@ contains
         if (.not. self%cuda_enabled) return
         if (.not. allocated(self%file%tensors)) return
         if (layer%attn_qkv <= 0 .or. layer%attn_gate <= 0 .or. layer%ssm_alpha <= 0 .or. &
-                layer%ssm_beta <= 0) return
+            layer%ssm_beta <= 0) return
         if (self%file%tensors(layer%attn_qkv)%value_type /= GGML_TYPE_Q8_0) return
         if (self%file%tensors(layer%attn_gate)%value_type /= GGML_TYPE_Q8_0) return
         if (self%file%tensors(layer%ssm_alpha)%value_type /= GGML_TYPE_Q8_0) return
@@ -639,10 +801,10 @@ contains
         if (.not. allocated(self%file%tensors)) return
         if (layer%ffn_gate <= 0 .or. layer%ffn_up <= 0 .or. layer%ffn_down <= 0) return
         if (layer%ffn_gate > size(self%cuda_weights) .or. layer%ffn_up > size(self%cuda_weights) .or. &
-                layer%ffn_down > size(self%cuda_weights)) return
+            layer%ffn_down > size(self%cuda_weights)) return
         if (self%file%tensors(layer%ffn_gate)%value_type /= GGML_TYPE_Q8_0 .or. &
-                self%file%tensors(layer%ffn_up)%value_type /= GGML_TYPE_Q8_0 .or. &
-                self%file%tensors(layer%ffn_down)%value_type /= GGML_TYPE_Q8_0) return
+            self%file%tensors(layer%ffn_up)%value_type /= GGML_TYPE_Q8_0 .or. &
+            self%file%tensors(layer%ffn_down)%value_type /= GGML_TYPE_Q8_0) return
         if (.not. allocated(self%file%tensors(layer%ffn_gate)%shape)) return
         if (.not. allocated(self%file%tensors(layer%ffn_up)%shape)) return
         if (.not. allocated(self%file%tensors(layer%ffn_down)%shape)) return
@@ -933,7 +1095,7 @@ contains
         block_count = input_size / 32
         activation_bytes = input_size + 2 * block_count
         if (size(self%quantized_input) < activation_bytes .or. &
-                size(output) /= int(self%file%tensors(tensor_index)%shape(2))) then
+            size(output) /= int(self%file%tensors(tensor_index)%shape(2))) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
             return
         end if
@@ -957,7 +1119,7 @@ contains
             return
         end if
         if (first_index <= 0 .or. first_index > size(self%cuda_weights) .or. &
-                second_index <= 0 .or. second_index > size(self%cuda_weights)) then
+            second_index <= 0 .or. second_index > size(self%cuda_weights)) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
             return
         end if
@@ -976,8 +1138,8 @@ contains
         block_count = input_size / 32
         activation_bytes = input_size + 2 * block_count
         if (size(self%quantized_input) < activation_bytes .or. &
-                size(first_output) /= int(self%file%tensors(first_index)%shape(2)) .or. &
-                size(second_output) /= int(self%file%tensors(second_index)%shape(2))) then
+            size(first_output) /= int(self%file%tensors(first_index)%shape(2)) .or. &
+            size(second_output) /= int(self%file%tensors(second_index)%shape(2))) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
             return
         end if
@@ -1003,8 +1165,8 @@ contains
             return
         end if
         if (first_index <= 0 .or. first_index > size(self%cuda_weights) .or. &
-                second_index <= 0 .or. second_index > size(self%cuda_weights) .or. &
-                third_index <= 0 .or. third_index > size(self%cuda_weights)) then
+            second_index <= 0 .or. second_index > size(self%cuda_weights) .or. &
+            third_index <= 0 .or. third_index > size(self%cuda_weights)) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
             return
         end if
@@ -1027,9 +1189,9 @@ contains
         block_count = input_size / 32
         activation_bytes = input_size + 2 * block_count
         if (size(self%quantized_input) < activation_bytes .or. &
-                size(first_output) /= int(self%file%tensors(first_index)%shape(2)) .or. &
-                size(second_output) /= int(self%file%tensors(second_index)%shape(2)) .or. &
-                size(third_output) /= int(self%file%tensors(third_index)%shape(2))) then
+            size(first_output) /= int(self%file%tensors(first_index)%shape(2)) .or. &
+            size(second_output) /= int(self%file%tensors(second_index)%shape(2)) .or. &
+            size(third_output) /= int(self%file%tensors(third_index)%shape(2))) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
             return
         end if
@@ -1039,7 +1201,7 @@ contains
                 self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), &
                 self%qkv_download_work, &
                 int((size(first_output) + size(second_output) + size(third_output)) * &
-                    storage_size(first_output(1)) / 8, c_size_t), elapsed_ms, stat)
+                storage_size(first_output(1)) / 8, c_size_t), elapsed_ms, stat)
             if (stat%is_ok()) then
                 first_output = self%qkv_download_work(1:size(first_output))
                 second_output = self%qkv_download_work(size(first_output) + 1:size(first_output) + size(second_output))
@@ -1071,8 +1233,8 @@ contains
             return
         end if
         if (layer%ffn_gate <= 0 .or. layer%ffn_up <= 0 .or. layer%ffn_down <= 0 .or. &
-                layer%ffn_gate > size(self%cuda_weights) .or. layer%ffn_up > size(self%cuda_weights) .or. &
-                layer%ffn_down > size(self%cuda_weights)) then
+            layer%ffn_gate > size(self%cuda_weights) .or. layer%ffn_up > size(self%cuda_weights) .or. &
+            layer%ffn_down > size(self%cuda_weights)) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA FFN tensor binding is invalid')
             return
         end if
@@ -1082,7 +1244,7 @@ contains
         end if
         activation_bytes = input_size + 2 * (input_size / 32)
         if (size(self%quantized_input) < activation_bytes .or. size(output) /= &
-                int(self%file%tensors(layer%ffn_down)%shape(2))) then
+            int(self%file%tensors(layer%ffn_down)%shape(2))) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA FFN dimensions do not agree')
             return
         end if

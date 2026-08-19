@@ -15,6 +15,7 @@ module fortai_backend_cuda
         procedure :: allocate_buffer => cuda_q8_allocate_buffer
         procedure :: free_buffer => cuda_q8_free_buffer
         procedure :: upload => cuda_q8_upload
+        procedure :: upload_real => cuda_q8_upload_real
         procedure :: download => cuda_q8_download
         procedure :: download_real => cuda_q8_download_real
         procedure :: last_error => cuda_q8_last_error
@@ -34,6 +35,7 @@ module fortai_backend_cuda
         procedure :: destroy => cuda_qwen35_recurrent_destroy
         procedure :: reset => cuda_qwen35_recurrent_reset
         procedure :: run => cuda_qwen35_recurrent_run
+        procedure :: run_device => cuda_qwen35_recurrent_run_device
     end type cuda_qwen35_recurrent_t
 
     public :: cuda_q8_matvec_host
@@ -41,6 +43,10 @@ module fortai_backend_cuda
     public :: cuda_q8_matvec_host_triplet
     public :: cuda_q8_matvec_host_triplet_contiguous
     public :: cuda_q8_ffn_host
+    public :: cuda_q8_ffn_device
+    public :: cuda_qwen35_copy_device
+    public :: cuda_qwen35_add_device
+    public :: cuda_qwen35_rms_norm_device
     public :: cuda_q8_matvec_resident
 
     interface
@@ -102,6 +108,14 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_buffer_upload
 
+        function c_buffer_upload_ptr(context, buffer, host_data, bytes) &
+                bind(C, name='fortai_cuda_q8_device_buffer_upload_ptr') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, buffer, host_data
+            integer(c_size_t), value :: bytes
+            integer(c_int) :: code
+        end function c_buffer_upload_ptr
+
         function c_buffer_download(context, host_data, buffer, bytes) &
                 bind(C, name='fortai_cuda_q8_device_buffer_download') result(code)
             import c_int, c_int8_t, c_ptr, c_size_t
@@ -126,6 +140,31 @@ module fortai_backend_cuda
             real(c_float), intent(out) :: kernel_ms
             integer(c_int) :: code
         end function c_matvec_resident
+
+        function c_qwen35_copy_device(context, device_input, device_output, bytes) &
+                bind(C, name='fortai_cuda_qwen35_copy_device') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, device_input, device_output
+            integer(c_size_t), value :: bytes
+            integer(c_int) :: code
+        end function c_qwen35_copy_device
+
+        function c_qwen35_add_device(context, device_left, device_right, device_output, elements) &
+                bind(C, name='fortai_cuda_qwen35_add_device') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, device_left, device_right, device_output
+            integer(c_size_t), value :: elements
+            integer(c_int) :: code
+        end function c_qwen35_add_device
+
+        function c_qwen35_rms_norm_device(context, device_input, device_weights, device_output, &
+                elements, epsilon) bind(C, name='fortai_cuda_qwen35_rms_norm_device') result(code)
+            import c_float, c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, device_input, device_weights, device_output
+            integer(c_size_t), value :: elements
+            real(c_float), value :: epsilon
+            integer(c_int) :: code
+        end function c_qwen35_rms_norm_device
 
         function c_matvec_host(context, weights, activation, activation_bytes, output, &
                 output_bytes, elapsed_ms) bind(C, name='fortai_cuda_q8_matvec_host') result(code)
@@ -199,6 +238,16 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_ffn_host
 
+        function c_ffn_device(context, gate_weights, up_weights, down_weights, device_activation, &
+                activation_elements, device_output, output_elements) &
+                bind(C, name='fortai_cuda_q8_ffn_device') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, gate_weights, up_weights, down_weights
+            type(c_ptr), value :: device_activation, device_output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int) :: code
+        end function c_ffn_device
+
         function c_qwen35_recurrent_create(context, qkv_weights, gate_weights, alpha_weights, &
                 beta_weights, output_weights, conv_weights, conv_weight_bytes, conv_size, conv_kernel, &
                 ssm_a, ssm_a_bytes, ssm_dt, ssm_dt_bytes, ssm_norm, ssm_norm_bytes, state_size, &
@@ -247,6 +296,15 @@ module fortai_backend_cuda
             real(c_float), intent(out) :: elapsed_ms
             integer(c_int) :: code
         end function c_qwen35_recurrent_run
+
+        function c_qwen35_recurrent_run_device(layer, device_activation, activation_elements, &
+                device_output, output_elements) bind(C, name='fortai_cuda_qwen35_recurrent_run_device') &
+                result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: layer, device_activation, device_output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int) :: code
+        end function c_qwen35_recurrent_run_device
 
         function c_last_error(context) bind(C, name='fortai_cuda_q8_last_error') result(message)
             import c_ptr
@@ -375,6 +433,25 @@ contains
             'CUDA Q8 device upload failed')
     end subroutine cuda_q8_upload
 
+    subroutine cuda_q8_upload_real(self, buffer, host_data, stat)
+        class(cuda_q8_context_t), intent(in) :: self
+        type(c_ptr), intent(in) :: buffer
+        real(c_float), contiguous, target, intent(in) :: host_data(:)
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle) .or. .not. c_associated(buffer) .or. &
+            size(host_data) <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA real device upload')
+            return
+        end if
+        code = c_buffer_upload_ptr(self%handle, buffer, c_loc(host_data), &
+            int(size(host_data), c_size_t) * int(storage_size(host_data(1)) / 8, c_size_t))
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA real device upload failed')
+    end subroutine cuda_q8_upload_real
+
     subroutine cuda_q8_download(self, buffer, host_data, bytes, stat)
         class(cuda_q8_context_t), intent(in) :: self
         type(c_ptr), intent(in) :: buffer
@@ -432,6 +509,65 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA Q8 resident matvec failed')
     end subroutine cuda_q8_matvec_resident
+
+    subroutine cuda_qwen35_copy_device(context, device_input, device_output, bytes, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        type(c_ptr), intent(in) :: device_input, device_output
+        integer(c_size_t), intent(in) :: bytes
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(device_input) .or. &
+            .not. c_associated(device_output) .or. bytes <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA device copy')
+            return
+        end if
+        code = c_qwen35_copy_device(context%handle, device_input, device_output, bytes)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA device copy failed')
+    end subroutine cuda_qwen35_copy_device
+
+    subroutine cuda_qwen35_add_device(context, device_left, device_right, device_output, elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        type(c_ptr), intent(in) :: device_left, device_right, device_output
+        integer(c_size_t), intent(in) :: elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(device_left) .or. &
+            .not. c_associated(device_right) .or. .not. c_associated(device_output) .or. &
+            elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA device add')
+            return
+        end if
+        code = c_qwen35_add_device(context%handle, device_left, device_right, device_output, elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA device add failed')
+    end subroutine cuda_qwen35_add_device
+
+    subroutine cuda_qwen35_rms_norm_device(context, device_input, device_weights, device_output, &
+            elements, epsilon, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        type(c_ptr), intent(in) :: device_input, device_weights, device_output
+        integer(c_size_t), intent(in) :: elements
+        real(c_float), intent(in) :: epsilon
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(device_input) .or. &
+            .not. c_associated(device_weights) .or. .not. c_associated(device_output) .or. &
+            elements <= 0_c_size_t .or. epsilon <= 0.0_c_float) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA device RMS norm')
+            return
+        end if
+        code = c_qwen35_rms_norm_device(context%handle, device_input, device_weights, device_output, &
+            elements, epsilon)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA device RMS norm failed')
+    end subroutine cuda_qwen35_rms_norm_device
 
     subroutine cuda_q8_matvec_host(context, weights, activation, activation_bytes, output, &
             output_bytes, elapsed_ms, stat)
@@ -564,6 +700,29 @@ contains
             'CUDA Q8 FFN host operation failed')
     end subroutine cuda_q8_ffn_host
 
+    subroutine cuda_q8_ffn_device(context, gate_weights, up_weights, down_weights, device_activation, &
+            activation_elements, device_output, output_elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: gate_weights, up_weights, down_weights
+        type(c_ptr), intent(in) :: device_activation, device_output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(gate_weights%handle) .or. &
+            .not. c_associated(up_weights%handle) .or. .not. c_associated(down_weights%handle) .or. &
+            .not. c_associated(device_activation) .or. .not. c_associated(device_output) .or. &
+            activation_elements <= 0_c_size_t .or. output_elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q8 FFN device operation')
+            return
+        end if
+        code = c_ffn_device(context%handle, gate_weights%handle, up_weights%handle, down_weights%handle, &
+            device_activation, activation_elements, device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q8 FFN device operation failed')
+    end subroutine cuda_q8_ffn_device
+
     subroutine cuda_qwen35_recurrent_create(self, context, qkv_weights, gate_weights, alpha_weights, &
             beta_weights, output_weights, conv_weights, conv_weight_bytes, conv_size, conv_kernel, &
             ssm_a, ssm_a_bytes, ssm_dt, ssm_dt_bytes, ssm_norm, ssm_norm_bytes, state_size, &
@@ -649,6 +808,27 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'Qwen3.5 CUDA recurrent run failed')
     end subroutine cuda_qwen35_recurrent_run
+
+    subroutine cuda_qwen35_recurrent_run_device(self, device_activation, activation_elements, &
+            device_output, output_elements, stat)
+        class(cuda_qwen35_recurrent_t), intent(in) :: self
+        type(c_ptr), intent(in) :: device_activation, device_output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle) .or. .not. c_associated(device_activation) .or. &
+            .not. c_associated(device_output) .or. activation_elements <= 0_c_size_t .or. &
+            output_elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid Qwen3.5 CUDA recurrent device run')
+            return
+        end if
+        code = c_qwen35_recurrent_run_device(self%handle, device_activation, activation_elements, &
+            device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'Qwen3.5 CUDA recurrent device run failed')
+    end subroutine cuda_qwen35_recurrent_run_device
 
     function cuda_q8_last_error(self) result(message)
         class(cuda_q8_context_t), intent(in) :: self
