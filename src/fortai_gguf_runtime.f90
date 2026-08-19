@@ -16,6 +16,15 @@ module fortai_gguf_runtime
             real(c_float) :: value
         end function fortai_q8_dot
 
+        subroutine fortai_q8_quantize(vector, quantized, scales, count) &
+                bind(C, name='fortai_q8_quantize')
+            import c_float, c_int8_t, c_int64_t
+            real(c_float), intent(in) :: vector(*)
+            integer(c_int8_t), intent(out) :: quantized(*)
+            real(c_float), intent(out) :: scales(*)
+            integer(c_int64_t), value, intent(in) :: count
+        end subroutine fortai_q8_quantize
+
     end interface
 
     integer(int32), parameter, public :: GGML_TYPE_F32 = 0_int32
@@ -367,8 +376,8 @@ contains
 
         subroutine gguf_tensor_matvec(self, vector, values, stat)
             class(gguf_tensor_t), intent(in) :: self
-            real(real32), intent(in) :: vector(:)
-            real(real32), intent(out) :: values(:)
+            real(real32), contiguous, intent(in) :: vector(:)
+            real(real32), contiguous, intent(out) :: values(:)
             type(status_t), intent(out) :: stat
             integer(int64) :: row
 
@@ -401,14 +410,12 @@ contains
 
         subroutine gguf_tensor_matvec_q8(self, vector, values, quantized, scales, stat)
             class(gguf_tensor_t), intent(in) :: self
-            real(real32), intent(in) :: vector(:)
-            real(real32), intent(out) :: values(:)
+            real(real32), contiguous, intent(in) :: vector(:)
+            real(real32), contiguous, intent(out) :: values(:)
             integer(int8), contiguous, intent(out) :: quantized(:)
             real(real32), contiguous, intent(out) :: scales(:)
             type(status_t), intent(out) :: stat
-            integer(int64) :: block, row
-            integer(int64) :: block_count
-            real(real32) :: maximum, scale
+            integer(int64) :: row, block_count
 
             call stat%clear()
             if (self%value_type /= GGML_TYPE_Q8_0) then
@@ -426,18 +433,7 @@ contains
                 return
             end if
             block_count = size(vector) / 32
-            do block = 0, block_count - 1
-                maximum = maxval(abs(vector(block * 32 + 1:(block + 1) * 32)))
-                if (maximum > 0.0_real32) then
-                    scale = maximum / 127.0_real32
-                    scales(block + 1) = scale
-                    quantized(block * 32 + 1:(block + 1) * 32) = int(max(-127, min(127, &
-                        nint(vector(block * 32 + 1:(block + 1) * 32) / scale))), int8)
-                else
-                    scales(block + 1) = 0.0_real32
-                    quantized(block * 32 + 1:(block + 1) * 32) = 0_int8
-                end if
-            end do
+            call fortai_q8_quantize(vector, quantized, scales, int(size(vector), c_int64_t))
             if (self%shape(2) < 128_int64) then
                 do row = 1, self%shape(2)
                     values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
@@ -457,14 +453,12 @@ contains
         subroutine gguf_tensor_matvec_pair_q8(self, other, vector, values, other_values, &
                 quantized, scales, stat)
             class(gguf_tensor_t), intent(in) :: self, other
-            real(real32), intent(in) :: vector(:)
-            real(real32), intent(out) :: values(:), other_values(:)
+            real(real32), contiguous, intent(in) :: vector(:)
+            real(real32), contiguous, intent(out) :: values(:), other_values(:)
             integer(int8), contiguous, intent(out) :: quantized(:)
             real(real32), contiguous, intent(out) :: scales(:)
             type(status_t), intent(out) :: stat
-            integer(int64) :: block, row
-            integer(int64) :: block_count
-            real(real32) :: maximum, scale
+            integer(int64) :: row, block_count
 
             call stat%clear()
             if (self%value_type /= GGML_TYPE_Q8_0 .or. other%value_type /= GGML_TYPE_Q8_0) then
@@ -483,18 +477,7 @@ contains
                 return
             end if
             block_count = size(vector) / 32
-            do block = 0, block_count - 1
-                maximum = maxval(abs(vector(block * 32 + 1:(block + 1) * 32)))
-                if (maximum > 0.0_real32) then
-                    scale = maximum / 127.0_real32
-                    scales(block + 1) = scale
-                    quantized(block * 32 + 1:(block + 1) * 32) = int(max(-127, min(127, &
-                        nint(vector(block * 32 + 1:(block + 1) * 32) / scale))), int8)
-                else
-                    scales(block + 1) = 0.0_real32
-                    quantized(block * 32 + 1:(block + 1) * 32) = 0_int8
-                end if
-            end do
+            call fortai_q8_quantize(vector, quantized, scales, int(size(vector), c_int64_t))
             if (self%shape(2) < 128_int64) then
                 do row = 1, self%shape(2)
                     values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
@@ -518,14 +501,13 @@ contains
         subroutine gguf_tensor_matvec_triplet_q8(self, second, third, vector, values, &
                 second_values, third_values, quantized, scales, stat)
             class(gguf_tensor_t), intent(in) :: self, second, third
-            real(real32), intent(in) :: vector(:)
-            real(real32), intent(out) :: values(:), second_values(:), third_values(:)
+            real(real32), contiguous, intent(in) :: vector(:)
+            real(real32), contiguous, intent(out) :: values(:), second_values(:), third_values(:)
             integer(int8), contiguous, intent(out) :: quantized(:)
             real(real32), contiguous, intent(out) :: scales(:)
             type(status_t), intent(out) :: stat
-            integer(int64) :: block, row, total_rows, first_rows, second_rows
+            integer(int64) :: row, total_rows, first_rows, second_rows
             integer(int64) :: block_count, index
-            real(real32) :: maximum, scale
 
             call stat%clear()
             if (self%value_type /= GGML_TYPE_Q8_0 .or. second%value_type /= GGML_TYPE_Q8_0 &
@@ -548,18 +530,7 @@ contains
                 return
             end if
             block_count = size(vector) / 32
-            do block = 0, block_count - 1
-                maximum = maxval(abs(vector(block * 32 + 1:(block + 1) * 32)))
-                if (maximum > 0.0_real32) then
-                    scale = maximum / 127.0_real32
-                    scales(block + 1) = scale
-                    quantized(block * 32 + 1:(block + 1) * 32) = int(max(-127, min(127, &
-                        nint(vector(block * 32 + 1:(block + 1) * 32) / scale))), int8)
-                else
-                    scales(block + 1) = 0.0_real32
-                    quantized(block * 32 + 1:(block + 1) * 32) = 0_int8
-                end if
-            end do
+            call fortai_q8_quantize(vector, quantized, scales, int(size(vector), c_int64_t))
 
             first_rows = self%shape(2)
             second_rows = second%shape(2)

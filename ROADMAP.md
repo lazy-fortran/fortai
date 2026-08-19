@@ -7,7 +7,7 @@ OpenMP parallelism, SIMD directives, and reproducible benchmark tooling.
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
-| FAI-CPU-001 | Qwen3.5-0.8B text-only CPU reference | experimental | model opens, independent Q8 oracle passes, trace mismatch is tracked |
+| FAI-CPU-001 | Qwen3.5-0.8B text-only CPU reference | experimental | model opens, independent Q8 oracle passes, and the 8-step trace matches llama.cpp |
 | FAI-CPU-001B | Qwen3.5-2B CPU scaling path | experimental | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-001C | Qwen3.5-4B CPU scaling path | experimental | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-002 | CPU logits parity and tokenizer path | open | token-by-token logits agree with an independent oracle |
@@ -53,6 +53,7 @@ No FortAI versus llama.cpp performance claim is valid until FortAI has a
 model-level forward and decode path. Kernel microbenchmarks and model-level
 token benchmarks must remain separate.
 
-The tracked trace verifier currently reports a first-token mismatch for the
-0.8B Q8_0 fixture (`FortAI=1076`, `llama.cpp=11` at token 9419). Throughput
-results therefore remain diagnostic until FAI-CPU-002 closes.
+The tracked trace verifier currently matches the 0.8B Q8_0 fixture for the
+eight-token oracle run beginning at token 9419. Throughput remains diagnostic
+until the named workload performance gate is passed; the current CPU profile
+shows a real gap against llama.cpp that is being optimized under FAI-CPU-003.

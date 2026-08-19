@@ -68,6 +68,10 @@ benchmark/tune_qwen35_cpu.sh \
 # collect perf counters and a symbol-level call-graph profile
 OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu.sh \
   .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
+
+# collect matched decode-only perf profiles for FortAI and llama.cpp
+OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu_both.sh \
+  .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
 ```
 
 The local Lazy Fortran workflow is also supported:

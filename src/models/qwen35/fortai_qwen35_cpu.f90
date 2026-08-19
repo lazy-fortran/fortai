@@ -1,12 +1,18 @@
 module fortai_qwen35_cpu
-    use, intrinsic :: iso_c_binding, only: c_float, c_int64_t
-    use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32
-    use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_tensor_t
+    use, intrinsic :: iso_c_binding, only: c_float, c_int16_t, c_int64_t
+    use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
+    use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_fp16_to_real, gguf_tensor_t
     use fortai_status, only: FORTAI_INVALID, status_t
     implicit none
     private
 
     interface
+        function fortai_float_to_half(value) bind(C, name='fortai_float_to_half') result(bits)
+            import c_float, c_int16_t
+            real(c_float), value, intent(in) :: value
+            integer(c_int16_t) :: bits
+        end function fortai_float_to_half
+
         subroutine fortai_gdn_step(state, key, value, query, decay, beta, head_size, &
                 output_scale, output) bind(C, name='fortai_gdn_step')
             import c_float, c_int64_t
@@ -303,7 +309,7 @@ contains
     subroutine qwen35_cpu_forward(self, token_id, position, logits, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id, position
-        real(real32), intent(out) :: logits(:)
+        real(real32), contiguous, intent(out) :: logits(:)
         type(status_t), intent(out) :: stat
         integer :: i
 
@@ -358,7 +364,7 @@ contains
     subroutine forward_recurrent(self, layer, input, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         type(qwen35_cpu_layer_t), intent(inout) :: layer
-        real(real32), intent(in) :: input(:)
+        real(real32), contiguous, intent(in) :: input(:)
         type(status_t), intent(out) :: stat
         integer :: channel, head, j, key_head, slot
         integer :: key_offset, query_offset, state_offset, value_offset
@@ -563,8 +569,8 @@ contains
     subroutine layer_matvec(self, tensor_index, input, output, expected, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer, intent(in) :: tensor_index, expected
-        real(real32), intent(in) :: input(:)
-        real(real32), intent(out) :: output(:)
+        real(real32), contiguous, intent(in) :: input(:)
+        real(real32), contiguous, intent(out) :: output(:)
         type(status_t), intent(out) :: stat
 
         call stat % clear()
@@ -578,8 +584,8 @@ contains
     subroutine model_matvec(self, tensor_index, input, output, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer, intent(in) :: tensor_index
-        real(real32), intent(in) :: input(:)
-        real(real32), intent(out) :: output(:)
+        real(real32), contiguous, intent(in) :: input(:)
+        real(real32), contiguous, intent(out) :: output(:)
         type(status_t), intent(out) :: stat
 
         call stat % clear()
@@ -599,8 +605,8 @@ contains
             second_output, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer, intent(in) :: first_index, second_index
-        real(real32), intent(in) :: input(:)
-        real(real32), intent(out) :: first_output(:), second_output(:)
+        real(real32), contiguous, intent(in) :: input(:)
+        real(real32), contiguous, intent(out) :: first_output(:), second_output(:)
         type(status_t), intent(out) :: stat
 
         call stat%clear()
@@ -624,8 +630,8 @@ contains
             first_output, second_output, third_output, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer, intent(in) :: first_index, second_index, third_index
-        real(real32), intent(in) :: input(:)
-        real(real32), intent(out) :: first_output(:), second_output(:), third_output(:)
+        real(real32), contiguous, intent(in) :: input(:)
+        real(real32), contiguous, intent(out) :: first_output(:), second_output(:), third_output(:)
         type(status_t), intent(out) :: stat
 
         call stat%clear()
@@ -655,16 +661,23 @@ contains
         real(real32), intent(out) :: output(:)
         type(status_t), intent(out) :: stat
         integer :: i
-        real(real32) :: scale
+        real(real64) :: sum_squares
+        real(real32) :: mean, inverse_scale
 
         call stat % clear()
         if (size(output) /= size(input) .or. size(weights % shape) /= 1) then
             call stat % set(FORTAI_INVALID, 'RMS norm dimensions do not agree')
             return
         end if
-        scale = sqrt(sum(input * input) / real(size(input), real32) + epsilon)
+        sum_squares = 0.0_real64
         do i = 1, size(input)
-            output(i) = input(i) / scale * weights % value(int(i, int64))
+            sum_squares = sum_squares + real(input(i), real64) * real(input(i), real64)
+        end do
+        mean = real(sum_squares / real(size(input), real64), real32)
+        inverse_scale = 1.0_real32 / sqrt(mean + epsilon)
+        do i = 1, size(input)
+            output(i) = input(i) * inverse_scale
+            output(i) = output(i) * weights % value(int(i, int64))
         end do
     end subroutine rms_norm
 
@@ -674,11 +687,18 @@ contains
         real(real32), intent(in) :: epsilon
         type(gguf_tensor_t), intent(in) :: weights
         integer :: i
-        real(real32) :: scale
+        real(real64) :: sum_squares
+        real(real32) :: mean, inverse_scale
 
-        scale = sqrt(sum(values(first:first + length - 1)**2) / real(length, real32) + epsilon)
+        sum_squares = 0.0_real64
+        do i = first, first + length - 1
+            sum_squares = sum_squares + real(values(i), real64) * real(values(i), real64)
+        end do
+        mean = real(sum_squares / real(length, real64), real32)
+        inverse_scale = 1.0_real32 / sqrt(mean + epsilon)
         do i = 0, length - 1
-            values(first + i) = values(first + i) / scale * weights % value(int(i + 1, int64))
+            values(first + i) = values(first + i) * inverse_scale
+            values(first + i) = values(first + i) * weights % value(int(i + 1, int64))
         end do
     end subroutine normalize_slice
 
@@ -686,10 +706,18 @@ contains
         real(real32), intent(inout) :: values(:)
         integer, intent(in) :: first, length
         real(real32), intent(in) :: epsilon
-        real(real32) :: scale
+        integer :: i
+        real(real64) :: sum_squares
+        real(real32) :: inverse_scale
 
-        scale = sqrt(sum(values(first:first + length - 1)**2) + epsilon)
-        values(first:first + length - 1) = values(first:first + length - 1) / scale
+        sum_squares = 0.0_real64
+        do i = first, first + length - 1
+            sum_squares = sum_squares + real(values(i), real64) * real(values(i), real64)
+        end do
+        inverse_scale = 1.0_real32 / max(sqrt(real(sum_squares, real32)), epsilon)
+        do i = first, first + length - 1
+            values(i) = values(i) * inverse_scale
+        end do
     end subroutine l2_normalize_slice
 
     subroutine apply_rope(values, heads, stride, position, dimension, base)
@@ -750,15 +778,22 @@ contains
     real(real32) function rms_slice(values, first, length, epsilon)
         real(real32), intent(in) :: values(:), epsilon
         integer, intent(in) :: first, length
+        integer :: i
+        real(real64) :: sum_squares
 
-        rms_slice = sqrt(sum(values(first:first + length - 1)**2) / &
-            real(length, real32) + epsilon)
+        sum_squares = 0.0_real64
+        do i = first, first + length - 1
+            sum_squares = sum_squares + real(values(i), real64) * real(values(i), real64)
+        end do
+        rms_slice = sqrt(real(sum_squares / real(length, real64), real32) + epsilon)
     end function rms_slice
 
     integer function q_offset_for_gate(head, head_size)
         integer, intent(in) :: head, head_size
 
-        q_offset_for_gate = (head - 1) * 2 * head_size + head_size + 1
+        ! Return the zero-based offset so the caller's one-based i selects
+        ! the first gate value at the start of the second Q/G half.
+        q_offset_for_gate = (head - 1) * 2 * head_size + head_size
     end function q_offset_for_gate
 
     subroutine qwen35_cpu_model_layers_state_update(self, layer, head, row, column, decay)
@@ -806,12 +841,14 @@ contains
             offset = int(position) * self % attention_head_size * self % attention_heads_kv + &
                 (head - 1) * self % attention_head_size
             do i = 1, self % attention_head_size
-                layer%key_cache(offset + i) = self%k_work((head - 1) * self%attention_head_size + i)
+                layer%key_cache(offset + i) = gguf_fp16_to_real(fortai_float_to_half( &
+                    self%k_work((head - 1) * self%attention_head_size + i)))
             end do
             offset = int(position) * self % value_length * self % attention_heads_kv + &
                 (head - 1) * self % value_length
             do i = 1, self % value_length
-                layer % value_cache(offset + i) = self % v_work((head - 1) * self % value_length + i)
+                layer % value_cache(offset + i) = gguf_fp16_to_real(fortai_float_to_half( &
+                    self % v_work((head - 1) * self % value_length + i)))
             end do
         end do
     end subroutine qwen35_cpu_model_layers_state_store

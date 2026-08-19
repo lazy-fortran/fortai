@@ -82,8 +82,133 @@ static inline float half_to_float(uint16_t value)
     }
 }
 
-static float q8_dot_scalar(const int8_t *weights, const int8_t *quantized,
-    const float *scales, int64_t row, int64_t block_count)
+static inline uint16_t float_to_half(float value)
+{
+    uint32_t bits;
+    __builtin_memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t exponent = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
+    uint32_t fraction = bits & 0x007fffffu;
+
+    if (exponent <= 0) {
+        if (exponent < -10)
+            return (uint16_t)sign;
+        fraction = (fraction | 0x00800000u) >> (uint32_t)(1 - exponent);
+        if ((bits & 0x00001000u) != 0u)
+            fraction += 0x00002000u;
+        return (uint16_t)(sign | (fraction >> 13));
+    }
+    if (exponent >= 31)
+        return (uint16_t)(sign | 0x7c00u);
+    if ((fraction & 0x00001000u) != 0u) {
+        fraction += 0x00002000u;
+        if ((fraction & 0x00800000u) != 0u) {
+            fraction = 0;
+            ++exponent;
+            if (exponent >= 31)
+                return (uint16_t)(sign | 0x7c00u);
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)exponent << 10) | (fraction >> 13));
+}
+
+__attribute__((always_inline))
+static inline uint16_t load_u16(const int8_t *address)
+{
+    uint16_t value;
+    __builtin_memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+uint16_t fortai_float_to_half(float value)
+{
+    return float_to_half(value);
+}
+
+static void q8_quantize_scalar(const float *__restrict input,
+    int8_t *__restrict output, float *__restrict scales, int64_t count)
+{
+    int64_t offset;
+    for (offset = 0; offset < count; offset += 32) {
+        float maximum = 0.0f;
+        int i;
+        for (i = 0; i < 32; ++i) {
+            const float magnitude = fabsf(input[offset + i]);
+            if (magnitude > maximum)
+                maximum = magnitude;
+        }
+        const float scale = maximum / 127.0f;
+        const float inverse = maximum != 0.0f ? 127.0f / maximum : 0.0f;
+        scales[offset / 32] = half_to_float(float_to_half(scale));
+        for (i = 0; i < 32; ++i)
+            output[offset + i] = (int8_t)roundf(input[offset + i] * inverse);
+    }
+}
+
+__attribute__((target("avx2,f16c")))
+static void q8_quantize_avx2(const float *__restrict input,
+    int8_t *__restrict output, float *__restrict scales, int64_t count)
+{
+    int64_t offset;
+    for (offset = 0; offset < count; offset += 32) {
+        const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+        __m256 v0 = _mm256_loadu_ps(input + offset);
+        __m256 v1 = _mm256_loadu_ps(input + offset + 8);
+        __m256 v2 = _mm256_loadu_ps(input + offset + 16);
+        __m256 v3 = _mm256_loadu_ps(input + offset + 24);
+        __m256 maximum = _mm256_andnot_ps(sign_bit, v0);
+        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign_bit, v1));
+        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign_bit, v2));
+        maximum = _mm256_max_ps(maximum, _mm256_andnot_ps(sign_bit, v3));
+        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(maximum, 1),
+            _mm256_castps256_ps128(maximum));
+        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+        const float maximum_scalar = _mm_cvtss_f32(max4);
+        const float scale = maximum_scalar / 127.0f;
+        const float inverse = maximum_scalar != 0.0f ? 127.0f / maximum_scalar : 0.0f;
+        const __m256 multiplier = _mm256_set1_ps(inverse);
+        const uint16_t scale_bits = _cvtss_sh(scale, _MM_FROUND_TO_NEAREST_INT);
+        scales[offset / 32] = _cvtsh_ss(scale_bits);
+
+        const __m256i q0 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v0, multiplier),
+            _MM_FROUND_TO_NEAREST_INT));
+        const __m256i q1 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v1, multiplier),
+            _MM_FROUND_TO_NEAREST_INT));
+        const __m256i q2 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v2, multiplier),
+            _MM_FROUND_TO_NEAREST_INT));
+        const __m256i q3 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v3, multiplier),
+            _MM_FROUND_TO_NEAREST_INT));
+        /* Match llama.cpp's AVX2 pack/permutation sequence.  The pack
+         * instructions operate on independent 128-bit lanes, so the final
+         * permutation restores the original q0/q1/q2/q3 element order. */
+        __m256i packed01 = _mm256_packs_epi32(q0, q1);
+        __m256i packed23 = _mm256_packs_epi32(q2, q3);
+        __m256i packed = _mm256_packs_epi16(packed01, packed23);
+        const __m256i permutation = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        packed = _mm256_permutevar8x32_epi32(packed, permutation);
+        _mm256_storeu_si256((__m256i *)(output + offset), packed);
+    }
+}
+
+void fortai_q8_quantize(const float *__restrict input,
+    int8_t *__restrict output, float *__restrict scales,
+    int64_t count)
+{
+    if (count <= 0 || count % 32 != 0)
+        return;
+#if defined(__GNUC__)
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c")) {
+        q8_quantize_avx2(input, output, scales, count);
+        return;
+    }
+#endif
+    q8_quantize_scalar(input, output, scales, count);
+}
+
+static float q8_dot_scalar(const int8_t *__restrict weights,
+    const int8_t *__restrict quantized, const float *__restrict scales,
+    int64_t row, int64_t block_count)
 {
     float result = 0.0f;
     int64_t block;
@@ -104,20 +229,18 @@ static float q8_dot_scalar(const int8_t *weights, const int8_t *quantized,
 }
 
 __attribute__((target("avx2,f16c,fma")))
-static float q8_dot_avx2(const int8_t *weights, const int8_t *quantized,
-    const float *scales, int64_t row, int64_t block_count)
+static float q8_dot_avx2(const int8_t *__restrict weights,
+    const int8_t *__restrict quantized, const float *__restrict scales,
+    int64_t row, int64_t block_count)
 {
-    const __m256i ones = _mm256_set1_epi16(1);
-    __m256 accumulator0 = _mm256_setzero_ps();
-    __m256 accumulator1 = _mm256_setzero_ps();
+    __m256 accumulator = _mm256_setzero_ps();
     const int8_t *row_weights = weights + row * block_count * 34 + 2;
     const int8_t *activation_values = quantized;
     const float *activation_scales = scales;
     int64_t block;
 
-    for (block = 0; block + 1 < block_count; block += 2) {
-        const uint16_t scale_bits = (uint16_t)(uint8_t)row_weights[-2] |
-            ((uint16_t)(uint8_t)row_weights[-1] << 8);
+    for (block = 0; block < block_count; ++block) {
+        const uint16_t scale_bits = load_u16(row_weights - 2);
         const __m256i weight = _mm256_loadu_si256(
             (const __m256i *)row_weights);
         const __m256i activation = _mm256_loadu_si256(
@@ -126,54 +249,17 @@ static float q8_dot_avx2(const int8_t *weights, const int8_t *quantized,
         const __m256i signed_activation = _mm256_sign_epi8(activation, weight);
         const __m256i products = _mm256_maddubs_epi16(absolute_weight,
             signed_activation);
-        const __m256i pairs = _mm256_madd_epi16(products, ones);
+        const __m256i pairs = _mm256_madd_epi16(products,
+            _mm256_set1_epi16(1));
         const __m256 dot = _mm256_cvtepi32_ps(pairs);
-        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) * activation_scales[0]);
-        accumulator0 = _mm256_fmadd_ps(scale, dot, accumulator0);
+        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) *
+            activation_scales[0]);
+        accumulator = _mm256_fmadd_ps(scale, dot, accumulator);
         row_weights += 34;
         activation_values += 32;
         ++activation_scales;
-
-        {
-            const uint16_t next_scale_bits = (uint16_t)(uint8_t)row_weights[-2] |
-                ((uint16_t)(uint8_t)row_weights[-1] << 8);
-            const __m256i next_weight = _mm256_loadu_si256(
-                (const __m256i *)row_weights);
-            const __m256i next_activation = _mm256_loadu_si256(
-                (const __m256i *)activation_values);
-            const __m256i next_absolute_weight = _mm256_abs_epi8(next_weight);
-            const __m256i next_signed_activation = _mm256_sign_epi8(
-                next_activation, next_weight);
-            const __m256i next_products = _mm256_maddubs_epi16(
-                next_absolute_weight, next_signed_activation);
-            const __m256i next_pairs = _mm256_madd_epi16(next_products, ones);
-            const __m256 next_dot = _mm256_cvtepi32_ps(next_pairs);
-            const __m256 next_scale = _mm256_set1_ps(
-                _cvtsh_ss(next_scale_bits) * activation_scales[0]);
-            accumulator1 = _mm256_fmadd_ps(next_scale, next_dot, accumulator1);
-            row_weights += 34;
-            activation_values += 32;
-            ++activation_scales;
-        }
-    }
-    if (block < block_count) {
-        const uint16_t scale_bits = (uint16_t)(uint8_t)row_weights[-2] |
-            ((uint16_t)(uint8_t)row_weights[-1] << 8);
-        const __m256i weight = _mm256_loadu_si256(
-            (const __m256i *)row_weights);
-        const __m256i activation = _mm256_loadu_si256(
-            (const __m256i *)activation_values);
-        const __m256i absolute_weight = _mm256_abs_epi8(weight);
-        const __m256i signed_activation = _mm256_sign_epi8(activation, weight);
-        const __m256i products = _mm256_maddubs_epi16(absolute_weight,
-            signed_activation);
-        const __m256i pairs = _mm256_madd_epi16(products, ones);
-        const __m256 dot = _mm256_cvtepi32_ps(pairs);
-        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) * activation_scales[0]);
-        accumulator0 = _mm256_fmadd_ps(scale, dot, accumulator0);
     }
     {
-        const __m256 accumulator = _mm256_add_ps(accumulator0, accumulator1);
         const __m128 lower = _mm256_castps256_ps128(accumulator);
         const __m128 upper = _mm256_extractf128_ps(accumulator, 1);
         __m128 sum = _mm_add_ps(lower, upper);
@@ -183,8 +269,9 @@ static float q8_dot_avx2(const int8_t *weights, const int8_t *quantized,
     }
 }
 
-float fortai_q8_dot(const int8_t *weights, const int8_t *quantized,
-    const float *scales, int64_t row, int64_t block_count)
+float fortai_q8_dot(const int8_t *__restrict weights,
+    const int8_t *__restrict quantized, const float *__restrict scales,
+    int64_t row, int64_t block_count)
 {
 #if defined(__GNUC__)
     if (__builtin_cpu_supports("avx2"))

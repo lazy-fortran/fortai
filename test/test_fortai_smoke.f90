@@ -229,7 +229,8 @@ contains
         vector = 1.0_real32
         call tensor%matvec_q8(vector, output, quantized, scales, stat)
         call require(stat%is_ok(), 'Q8 activation matvec status', failures)
-        call require(abs(real(output(1), real64) - 528.0_real64) < 1.0e-4_real64, &
+        ! Q8_0 activation scales are stored as FP16, matching llama.cpp.
+        call require(abs(real(output(1), real64) - 527.9677734375_real64) < 1.0e-4_real64, &
             'Q8 activation matvec independent oracle', failures)
 
         second%value_type = GGML_TYPE_Q8_0
@@ -255,7 +256,8 @@ contains
             third_output, quantized, scales, stat)
         call require(stat%is_ok(), 'Q8 triplet activation matvec status', failures)
         call require(maxval(abs(real([output(1), second_output, third_output], real64) - &
-            [528.0_real64, 528.0_real64, 1056.0_real64, 1584.0_real64])) < 1.0e-4_real64, &
+            [527.9677734375_real64, 527.9677734375_real64, 1055.935546875_real64, &
+            1583.9033203125_real64])) < 1.0e-4_real64, &
             'Q8 triplet activation matvec independent oracle', failures)
     end subroutine test_gguf_q8_matvec
 
