@@ -244,7 +244,7 @@ contains
         allocate (self % beta_work(self % recurrent_value_heads))
         allocate (self % alpha_work(self % recurrent_value_heads))
         allocate (self % logits(self % vocabulary_size))
-        allocate (self % quantized_input(work_size))
+        allocate (self % quantized_input(work_size + 2 * ((work_size + 31) / 32)))
         allocate (self % quantized_scales((work_size + 31) / 32))
         call self % reset()
     end subroutine qwen35_cpu_open

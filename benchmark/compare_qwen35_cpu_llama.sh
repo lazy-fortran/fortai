@@ -45,9 +45,14 @@ if [[ ! -x "$llama_server" ]]; then
     exit 2
 fi
 if pgrep -x llama-server >/dev/null 2>&1; then
-    echo "an existing llama-server is running; stop it before benchmarking" >&2
-    pgrep -a -x llama-server >&2 || true
-    exit 2
+    if [[ "${FORTAI_ALLOW_EXISTING_LLAMA_SERVER:-0}" == 1 ]]; then
+        echo "allowing existing llama-server; this comparison is intentionally under shared-service conditions" >&2
+        pgrep -a -x llama-server >&2 || true
+    else
+        echo "an existing llama-server is running; stop it before benchmarking" >&2
+        pgrep -a -x llama-server >&2 || true
+        exit 2
+    fi
 fi
 if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"; then
     echo "comparison port is already in use: $port" >&2

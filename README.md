@@ -74,6 +74,17 @@ OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu_both.sh \
   .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
 ```
 
+The comparison and paired-profile scripts refuse to start when another
+`llama-server` is already running. If a protected production server must stay
+up, an explicit override starts the temporary CPU comparison on its own port;
+these results are labelled shared-service measurements and are not a fair
+performance-gate result:
+
+```bash
+FORTAI_ALLOW_EXISTING_LLAMA_SERVER=1 LLAMA_PORT=18081 \
+  benchmark/compare_qwen35_cpu_llama.sh MODEL.gguf 9419 128 128
+```
+
 The local Lazy Fortran workflow is also supported:
 
 ```bash

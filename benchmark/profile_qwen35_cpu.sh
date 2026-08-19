@@ -21,6 +21,9 @@ steps="${3:-${FORTAI_PROFILE_STEPS:-128}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 threads="${OMP_NUM_THREADS:-$(nproc)}"
 frequency="${FORTAI_PERF_FREQUENCY:-999}"
+delay_ms="${FORTAI_PERF_DELAY_MS:-0}"
+perf_mmap="${FORTAI_PERF_MMAP:-64}"
+perf_call_graph="${FORTAI_PERF_CALL_GRAPH:-dwarf,32}"
 base=$(basename "$model_path" .gguf)
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 profile_dir="$root_dir/benchmark/profiles/${base}_${stamp}"
@@ -40,6 +43,9 @@ native_flags="${FORTAI_NATIVE_FLAGS:--O3 -march=native -mtune=native -funroll-lo
     printf 'omp_num_threads=%s\n' "$OMP_NUM_THREADS"
     printf 'omp_proc_bind=%s\n' "$OMP_PROC_BIND"
     printf 'omp_places=%s\n' "$OMP_PLACES"
+    printf 'perf_mmap=%s\n' "$perf_mmap"
+    printf 'perf_call_graph=%s\n' "$perf_call_graph"
+    printf 'perf_delay_ms=%s\n' "$delay_ms"
 } >"$profile_dir/provenance.txt"
 
 (cd "$root_dir" && fo build --flag "$native_flags") >"$profile_dir/build.log"
@@ -47,15 +53,21 @@ run=(fo exec --no-build --cwd "$root_dir" fortai_cpu_run "$model_path" "$token_i
 events="task-clock,context-switches,cpu-migrations,cycles,instructions,branches,branch-misses,cache-references,cache-misses"
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf stat -x, -e "$events" -o "$profile_dir/perf-stat.csv" -- \
+    perf stat -D "$delay_ms" -x, -e "$events" -o "$profile_dir/perf-stat.csv" -- \
     "${run[@]}" >"$profile_dir/stat-run.log" 2>&1
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf record -F "$frequency" -g --call-graph dwarf -o "$profile_dir/perf.data" -- \
+    perf record -D "$delay_ms" -F "$frequency" -m "$perf_mmap" --call-graph "$perf_call_graph" \
+    -o "$profile_dir/perf.data" -- \
     "${run[@]}" >"$profile_dir/record-run.log" 2>&1
 
 perf report --stdio --no-children --sort symbol,dso -i "$profile_dir/perf.data" \
     >"$profile_dir/perf-report.txt"
+
+if rg -q '^# Total Lost Samples: [1-9]' "$profile_dir/perf-report.txt"; then
+    echo "profile contains lost samples: $profile_dir/perf-report.txt" >&2
+    exit 1
+fi
 
 printf 'profile_dir=%s\nstat=%s\nreport=%s\n' \
     "$profile_dir" "$profile_dir/perf-stat.csv" "$profile_dir/perf-report.txt"

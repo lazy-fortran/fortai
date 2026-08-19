@@ -82,6 +82,17 @@ static inline float half_to_float(uint16_t value)
     }
 }
 
+/* Matches llama.cpp's CPU FP16 decode table. */
+static float fortai_f16_table[1u << 16];
+
+__attribute__((constructor))
+static void fortai_init_f16_table(void)
+{
+    uint32_t value;
+    for (value = 0; value < (1u << 16); ++value)
+        fortai_f16_table[value] = half_to_float((uint16_t)value);
+}
+
 static inline uint16_t float_to_half(float value)
 {
     uint32_t bits;
@@ -130,6 +141,7 @@ static void q8_quantize_scalar(const float *__restrict input,
 {
     int64_t offset;
     for (offset = 0; offset < count; offset += 32) {
+        const int64_t output_offset = (offset / 32) * 34;
         float maximum = 0.0f;
         int i;
         for (i = 0; i < 32; ++i) {
@@ -139,9 +151,12 @@ static void q8_quantize_scalar(const float *__restrict input,
         }
         const float scale = maximum / 127.0f;
         const float inverse = maximum != 0.0f ? 127.0f / maximum : 0.0f;
-        scales[offset / 32] = half_to_float(float_to_half(scale));
+        const uint16_t scale_bits = float_to_half(scale);
+        scales[offset / 32] = half_to_float(scale_bits);
+        __builtin_memcpy(output + output_offset, &scale_bits, sizeof(scale_bits));
         for (i = 0; i < 32; ++i)
-            output[offset + i] = (int8_t)roundf(input[offset + i] * inverse);
+            output[output_offset + 2 + i] =
+                (int8_t)roundf(input[offset + i] * inverse);
     }
 }
 
@@ -151,6 +166,7 @@ static void q8_quantize_avx2(const float *__restrict input,
 {
     int64_t offset;
     for (offset = 0; offset < count; offset += 32) {
+        const int64_t output_offset = (offset / 32) * 34;
         const __m256 sign_bit = _mm256_set1_ps(-0.0f);
         __m256 v0 = _mm256_loadu_ps(input + offset);
         __m256 v1 = _mm256_loadu_ps(input + offset + 8);
@@ -187,7 +203,8 @@ static void q8_quantize_avx2(const float *__restrict input,
         __m256i packed = _mm256_packs_epi16(packed01, packed23);
         const __m256i permutation = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
         packed = _mm256_permutevar8x32_epi32(packed, permutation);
-        _mm256_storeu_si256((__m256i *)(output + offset), packed);
+        __builtin_memcpy(output + output_offset, &scale_bits, sizeof(scale_bits));
+        _mm256_storeu_si256((__m256i *)(output + output_offset + 2), packed);
     }
 }
 
@@ -215,15 +232,20 @@ static float q8_dot_scalar(const int8_t *__restrict weights,
 
     for (block = 0; block < block_count; ++block) {
         const int64_t offset = (row * block_count + block) * 34;
+        const int64_t activation_offset = block * 34;
         const uint16_t scale_bits = (uint16_t)(uint8_t)weights[offset] |
             ((uint16_t)(uint8_t)weights[offset + 1] << 8);
+        const uint16_t activation_scale_bits =
+            (uint16_t)(uint8_t)quantized[activation_offset] |
+            ((uint16_t)(uint8_t)quantized[activation_offset + 1] << 8);
         int32_t dot = 0;
         int i;
 
         for (i = 0; i < 32; ++i)
             dot += (int32_t)weights[offset + 2 + i] *
-                (int32_t)quantized[block * 32 + i];
-        result += half_to_float(scale_bits) * scales[block] * (float)dot;
+                (int32_t)quantized[activation_offset + 2 + i];
+        result += half_to_float(scale_bits) * half_to_float(activation_scale_bits) *
+            (float)dot;
     }
     return result;
 }
@@ -235,29 +257,36 @@ static float q8_dot_avx2(const int8_t *__restrict weights,
 {
     __m256 accumulator = _mm256_setzero_ps();
     const int8_t *row_weights = weights + row * block_count * 34 + 2;
-    const int8_t *activation_values = quantized;
-    const float *activation_scales = scales;
-    int64_t block;
+    const int8_t *activation_values = quantized + 2;
+    const int32_t blocks = (int32_t)block_count;
+    int32_t block;
 
-    for (block = 0; block < block_count; ++block) {
+    for (block = 0; block < blocks; ++block) {
+#if defined(__GNUC__)
+        /* Keep the integer induction variable live; GCC otherwise folds the
+         * block counter into a 64-bit pointer-end comparison. */
+        __asm__ volatile("" : "+r"(block));
+#endif
         const uint16_t scale_bits = load_u16(row_weights - 2);
+        const uint16_t activation_scale_bits = load_u16(activation_values - 2);
         const __m256i weight = _mm256_loadu_si256(
             (const __m256i *)row_weights);
         const __m256i activation = _mm256_loadu_si256(
             (const __m256i *)activation_values);
-        const __m256i absolute_weight = _mm256_abs_epi8(weight);
+        const __m256 scale = _mm256_set1_ps(fortai_f16_table[scale_bits] *
+            fortai_f16_table[activation_scale_bits]);
+        /* psignb(x, x) is the exact full-width sequence used by llama.cpp
+         * for saturating int8 absolute values, without a separate pabsb. */
+        const __m256i absolute_weight = _mm256_sign_epi8(weight, weight);
         const __m256i signed_activation = _mm256_sign_epi8(activation, weight);
         const __m256i products = _mm256_maddubs_epi16(absolute_weight,
             signed_activation);
         const __m256i pairs = _mm256_madd_epi16(products,
             _mm256_set1_epi16(1));
         const __m256 dot = _mm256_cvtepi32_ps(pairs);
-        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) *
-            activation_scales[0]);
         accumulator = _mm256_fmadd_ps(scale, dot, accumulator);
         row_weights += 34;
-        activation_values += 32;
-        ++activation_scales;
+        activation_values += 34;
     }
     {
         const __m128 lower = _mm256_castps256_ps128(accumulator);

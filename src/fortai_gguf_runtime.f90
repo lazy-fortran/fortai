@@ -428,7 +428,8 @@ contains
             end if
             if (size(vector) /= self%shape(1) .or. size(values) /= self%shape(2) .or. &
                 mod(size(vector), 32) /= 0 .or. &
-                size(quantized) < size(vector) .or. size(scales) < (size(vector) + 31) / 32) then
+                size(quantized) < size(vector) + 2 * ((size(vector) + 31) / 32) .or. &
+                size(scales) < (size(vector) + 31) / 32) then
                 call stat%set(FORTAI_INVALID, 'activation Q8 matvec dimensions do not agree')
                 return
             end if
@@ -472,7 +473,8 @@ contains
             if (self%shape(1) /= other%shape(1) .or. self%shape(2) /= other%shape(2) .or. &
                 size(vector) /= self%shape(1) .or. size(values) /= self%shape(2) .or. &
                 size(other_values) /= other%shape(2) .or. mod(size(vector), 32) /= 0 .or. &
-                size(quantized) < size(vector) .or. size(scales) < (size(vector) + 31) / 32) then
+                size(quantized) < size(vector) + 2 * ((size(vector) + 31) / 32) .or. &
+                size(scales) < (size(vector) + 31) / 32) then
                 call stat%set(FORTAI_INVALID, 'paired activation matvec dimensions do not agree')
                 return
             end if
@@ -524,7 +526,7 @@ contains
                 size(vector) /= self%shape(1) .or. size(values) /= self%shape(2) .or. &
                 size(second_values) /= second%shape(2) .or. &
                 size(third_values) /= third%shape(2) .or. mod(size(vector), 32) /= 0 .or. &
-                size(quantized) < size(vector) .or. &
+                size(quantized) < size(vector) + 2 * ((size(vector) + 31) / 32) .or. &
                 size(scales) < (size(vector) + 31) / 32) then
                 call stat%set(FORTAI_INVALID, 'triplet matvec dimensions do not agree')
                 return

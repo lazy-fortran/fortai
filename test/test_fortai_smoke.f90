@@ -214,7 +214,7 @@ contains
         integer, intent(inout) :: failures
         type(gguf_tensor_t) :: tensor, second, third
         type(status_t) :: stat
-        integer(int8) :: quantized(32)
+        integer(int8) :: quantized(34)
         real(real32) :: scales(1), vector(32), output(1), second_output(2), third_output(1)
         integer :: i, row
 
