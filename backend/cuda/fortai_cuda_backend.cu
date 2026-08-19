@@ -521,6 +521,160 @@ __global__ void qwen_rms_norm_float(const float *input, const float *weights,
         output[index] = input[index] * inverse * weights[index];
 }
 
+__device__ __forceinline__ void qwen_rope_pair(float *values, int dimension,
+    int index, int position, float base) {
+    const float angle = static_cast<float>(position) /
+        powf(base, static_cast<float>(2 * index) / static_cast<float>(dimension));
+    const float cosine = cosf(angle);
+    const float sine = sinf(angle);
+    const float first = values[index];
+    const float second = values[index + dimension / 2];
+    values[index] = first * cosine - second * sine;
+    values[index + dimension / 2] = first * sine + second * cosine;
+}
+
+__global__ void qwen_attention_prepare(float *query, float *key, const float *value,
+    const float *query_norm, const float *key_norm, __half *key_cache,
+    __half *value_cache, int heads, int key_value_heads, int head_size,
+    int value_size, int max_context, int position, int rope_dimension,
+    float rope_base, float epsilon) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (head >= heads) return;
+    extern __shared__ double attention_partial[];
+    const int query_offset = head * 2 * head_size;
+    double query_sum = 0.0;
+    for (int i = tid; i < head_size; i += blockDim.x) {
+        const float x = query[query_offset + i];
+        query_sum += static_cast<double>(x) * static_cast<double>(x);
+    }
+    attention_partial[tid] = query_sum;
+    const int group = heads / key_value_heads;
+    const int kv_head = head / group;
+    const bool writes_kv = (head % group) == 0;
+    double key_sum = 0.0;
+    const int key_offset = kv_head * head_size;
+    if (writes_kv) {
+        for (int i = tid; i < head_size; i += blockDim.x) {
+            const float x = key[key_offset + i];
+            key_sum += static_cast<double>(x) * static_cast<double>(x);
+        }
+    }
+    attention_partial[blockDim.x + tid] = key_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            attention_partial[tid] += attention_partial[tid + stride];
+            attention_partial[blockDim.x + tid] += attention_partial[blockDim.x + tid + stride];
+        }
+        __syncthreads();
+    }
+    const float query_inverse = 1.0f / sqrtf(
+        static_cast<float>(attention_partial[0] / static_cast<double>(head_size)) + epsilon);
+    for (int i = tid; i < head_size; i += blockDim.x)
+        query[query_offset + i] *= query_inverse * query_norm[i];
+    __syncthreads();
+    if (rope_dimension > 0) {
+        for (int i = tid; i < rope_dimension / 2; i += blockDim.x)
+            qwen_rope_pair(query + query_offset, rope_dimension, i, position, rope_base);
+    }
+    if (writes_kv) {
+        const float key_inverse = 1.0f / sqrtf(
+            static_cast<float>(attention_partial[blockDim.x] / static_cast<double>(head_size)) + epsilon);
+        for (int i = tid; i < head_size; i += blockDim.x)
+            key[key_offset + i] *= key_inverse * key_norm[i];
+        __syncthreads();
+        if (rope_dimension > 0) {
+            for (int i = tid; i < rope_dimension / 2; i += blockDim.x)
+                qwen_rope_pair(key + key_offset, rope_dimension, i, position, rope_base);
+        }
+        for (int i = tid; i < head_size; i += blockDim.x)
+            key_cache[position * key_value_heads * head_size + key_offset + i] =
+                __float2half_rn(key[key_offset + i]);
+        for (int i = tid; i < value_size; i += blockDim.x)
+            value_cache[position * key_value_heads * value_size + kv_head * value_size + i] =
+                __float2half_rn(value[kv_head * value_size + i]);
+    }
+}
+
+__global__ void qwen_attention_apply(const float *query, const __half *key_cache,
+    const __half *value_cache, float *attention, int heads, int key_value_heads,
+    int head_size, int value_size, int max_context, int position) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (head >= heads) return;
+    extern __shared__ float shared[];
+    float *warps = shared;
+    float *scores = shared + 8;
+    const int group = heads / key_value_heads;
+    const int kv_head = head / group;
+    const int query_offset = head * 2 * head_size;
+    for (int previous = 0; previous <= position; ++previous) {
+        float dot = 0.0f;
+        const int key_offset = (previous * key_value_heads + kv_head) * head_size;
+        for (int i = tid; i < head_size; i += blockDim.x)
+            dot += query[query_offset + i] * __half2float(key_cache[key_offset + i]);
+        for (int offset = 16; offset; offset >>= 1)
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        if (lane == 0) warps[warp] = dot;
+        __syncthreads();
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int i = 0; i < (blockDim.x + 31) / 32; ++i) total += warps[i];
+            scores[previous] = total / sqrtf(static_cast<float>(head_size));
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float maximum = -3.402823466e+38f;
+        for (int previous = 0; previous <= position; ++previous)
+            maximum = fmaxf(maximum, scores[previous]);
+        float normalizer = 0.0f;
+        for (int previous = 0; previous <= position; ++previous) {
+            scores[previous] = expf(scores[previous] - maximum);
+            normalizer += scores[previous];
+        }
+        for (int previous = 0; previous <= position; ++previous)
+            scores[previous] /= normalizer;
+    }
+    __syncthreads();
+    const float *gate = query + query_offset + head_size;
+    for (int i = tid; i < value_size; i += blockDim.x) {
+        float total = 0.0f;
+        for (int previous = 0; previous <= position; ++previous) {
+            const int value_offset = (previous * key_value_heads + kv_head) * value_size;
+            total += scores[previous] * __half2float(value_cache[value_offset + i]);
+        }
+        attention[head * value_size + i] = total * qwen_sigmoid(gate[i]);
+    }
+}
+
+struct fortai_cuda_qwen35_attention_impl {
+    fortai_cuda_q8_context_impl *context = nullptr;
+    fortai_cuda_q8_weights_impl *query_weights = nullptr;
+    fortai_cuda_q8_weights_impl *key_weights = nullptr;
+    fortai_cuda_q8_weights_impl *value_weights = nullptr;
+    fortai_cuda_q8_weights_impl *output_weights = nullptr;
+    float *query_norm = nullptr;
+    float *key_norm = nullptr;
+    __half *key_cache = nullptr;
+    __half *value_cache = nullptr;
+    float *query = nullptr;
+    float *key = nullptr;
+    float *value = nullptr;
+    float *attention = nullptr;
+    int heads = 0;
+    int key_value_heads = 0;
+    int head_size = 0;
+    int value_size = 0;
+    int max_context = 0;
+    int rope_dimension = 0;
+    float rope_base = 1.0f;
+    float norm_epsilon = 1.0e-6f;
+};
+
 struct fortai_cuda_qwen35_recurrent_impl {
     fortai_cuda_q8_context_impl *context = nullptr;
     fortai_cuda_q8_weights_impl *qkv_weights = nullptr;
@@ -584,6 +738,35 @@ static cudaError_t allocate_and_copy_float(fortai_cuda_qwen35_recurrent_impl *la
     return error;
 }
 
+static void free_attention_device_buffers(fortai_cuda_qwen35_attention_impl *layer) {
+    if (!layer) return;
+    cudaFree(layer->query_norm);
+    cudaFree(layer->key_norm);
+    cudaFree(layer->key_cache);
+    cudaFree(layer->value_cache);
+    cudaFree(layer->query);
+    cudaFree(layer->key);
+    cudaFree(layer->value);
+    cudaFree(layer->attention);
+    layer->query_norm = nullptr;
+    layer->key_norm = nullptr;
+    layer->key_cache = nullptr;
+    layer->value_cache = nullptr;
+    layer->query = nullptr;
+    layer->key = nullptr;
+    layer->value = nullptr;
+    layer->attention = nullptr;
+}
+
+static cudaError_t allocate_and_copy_float_attention(fortai_cuda_qwen35_attention_impl *layer,
+    float **destination, const void *source, size_t bytes) {
+    cudaError_t error = cudaMalloc(reinterpret_cast<void **>(destination), bytes);
+    if (error == cudaSuccess)
+        error = cudaMemcpyAsync(*destination, source, bytes, cudaMemcpyHostToDevice,
+            layer->context->stream);
+    return error;
+}
+
 } // namespace
 
 struct fortai_cuda_q8_context {
@@ -596,6 +779,10 @@ struct fortai_cuda_q8_weights {
 
 struct fortai_cuda_qwen35_recurrent {
     fortai_cuda_qwen35_recurrent_impl impl;
+};
+
+struct fortai_cuda_qwen35_attention {
+    fortai_cuda_qwen35_attention_impl impl;
 };
 
 extern "C" int fortai_cuda_q8_context_create(int device,
@@ -1255,6 +1442,175 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_device(
     }
     return error == cudaSuccess ? FORTAI_CUDA_OK :
         fail(context, FORTAI_CUDA_RUNTIME_ERROR, "Qwen recurrent device run", error);
+}
+
+extern "C" int fortai_cuda_qwen35_attention_create(
+    fortai_cuda_q8_context *context, const fortai_cuda_q8_weights *query_weights,
+    const fortai_cuda_q8_weights *key_weights, const fortai_cuda_q8_weights *value_weights,
+    const fortai_cuda_q8_weights *output_weights, const void *query_norm,
+    size_t query_norm_bytes, const void *key_norm, size_t key_norm_bytes,
+    int heads, int key_value_heads, int head_size, int value_size, int max_context,
+    int rope_dimension, float rope_base, float norm_epsilon,
+    fortai_cuda_qwen35_attention **layer) {
+    if (!context || !layer || !query_weights || !key_weights || !value_weights ||
+        !output_weights || !query_norm || !key_norm || heads <= 0 || key_value_heads <= 0 ||
+        head_size <= 0 || value_size <= 0 || max_context <= 0 ||
+        heads % key_value_heads != 0 || rope_dimension < 0 ||
+        (rope_dimension > 0 && (rope_dimension > head_size || rope_dimension % 2 != 0)) ||
+        rope_base <= 0.0f || norm_epsilon <= 0.0f)
+        return FORTAI_CUDA_INVALID;
+    auto *query = const_cast<fortai_cuda_q8_weights_impl *>(&query_weights->impl);
+    auto *key = const_cast<fortai_cuda_q8_weights_impl *>(&key_weights->impl);
+    auto *value = const_cast<fortai_cuda_q8_weights_impl *>(&value_weights->impl);
+    auto *output = const_cast<fortai_cuda_q8_weights_impl *>(&output_weights->impl);
+    if (query->context != &context->impl || key->context != &context->impl ||
+        value->context != &context->impl || output->context != &context->impl ||
+        query->rows != heads * 2 * head_size || key->rows != key_value_heads * head_size ||
+        value->rows != key_value_heads * value_size ||
+        output->blocks * q8_block_width != heads * value_size ||
+        query_norm_bytes < static_cast<size_t>(head_size) * sizeof(float) ||
+        key_norm_bytes < static_cast<size_t>(head_size) * sizeof(float))
+        return FORTAI_CUDA_INVALID;
+    *layer = nullptr;
+    auto *created = new (std::nothrow) fortai_cuda_qwen35_attention;
+    if (!created) return FORTAI_CUDA_RUNTIME_ERROR;
+    created->impl.context = &context->impl;
+    created->impl.query_weights = query;
+    created->impl.key_weights = key;
+    created->impl.value_weights = value;
+    created->impl.output_weights = output;
+    created->impl.heads = heads;
+    created->impl.key_value_heads = key_value_heads;
+    created->impl.head_size = head_size;
+    created->impl.value_size = value_size;
+    created->impl.max_context = max_context;
+    created->impl.rope_dimension = rope_dimension;
+    created->impl.rope_base = rope_base;
+    created->impl.norm_epsilon = norm_epsilon;
+    cudaSetDevice(context->impl.device);
+    cudaError_t error = allocate_and_copy_float_attention(&created->impl,
+        &created->impl.query_norm, query_norm, static_cast<size_t>(head_size) * sizeof(float));
+    if (error == cudaSuccess) error = allocate_and_copy_float_attention(&created->impl,
+        &created->impl.key_norm, key_norm, static_cast<size_t>(head_size) * sizeof(float));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.key_cache),
+        static_cast<size_t>(max_context) * key_value_heads * head_size * sizeof(__half));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.value_cache),
+        static_cast<size_t>(max_context) * key_value_heads * value_size * sizeof(__half));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.query),
+        static_cast<size_t>(heads) * 2 * head_size * sizeof(float));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.key),
+        static_cast<size_t>(key_value_heads) * head_size * sizeof(float));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.value),
+        static_cast<size_t>(key_value_heads) * value_size * sizeof(float));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.attention),
+        static_cast<size_t>(heads) * value_size * sizeof(float));
+    if (error == cudaSuccess) error = cudaMemsetAsync(created->impl.key_cache, 0,
+        static_cast<size_t>(max_context) * key_value_heads * head_size * sizeof(__half),
+        context->impl.stream);
+    if (error == cudaSuccess) error = cudaMemsetAsync(created->impl.value_cache, 0,
+        static_cast<size_t>(max_context) * key_value_heads * value_size * sizeof(__half),
+        context->impl.stream);
+    if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+    if (error != cudaSuccess) {
+        free_attention_device_buffers(&created->impl);
+        delete created;
+        return fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "Qwen attention create", error);
+    }
+    *layer = created;
+    return FORTAI_CUDA_OK;
+}
+
+extern "C" int fortai_cuda_qwen35_attention_destroy(fortai_cuda_qwen35_attention *layer) {
+    if (!layer) return FORTAI_CUDA_OK;
+    if (layer->impl.context) {
+        cudaSetDevice(layer->impl.context->device);
+        free_attention_device_buffers(&layer->impl);
+    }
+    delete layer;
+    return FORTAI_CUDA_OK;
+}
+
+extern "C" int fortai_cuda_qwen35_attention_reset(fortai_cuda_qwen35_attention *layer) {
+    if (!layer || !layer->impl.context) return FORTAI_CUDA_INVALID;
+    auto *context = layer->impl.context;
+    cudaSetDevice(context->device);
+    cudaError_t error = cudaMemsetAsync(layer->impl.key_cache, 0,
+        static_cast<size_t>(layer->impl.max_context) * layer->impl.key_value_heads *
+            layer->impl.head_size * sizeof(__half), context->stream);
+    if (error == cudaSuccess) error = cudaMemsetAsync(layer->impl.value_cache, 0,
+        static_cast<size_t>(layer->impl.max_context) * layer->impl.key_value_heads *
+            layer->impl.value_size * sizeof(__half), context->stream);
+    if (error == cudaSuccess) error = cudaStreamSynchronize(context->stream);
+    return error == cudaSuccess ? FORTAI_CUDA_OK :
+        fail(context, FORTAI_CUDA_RUNTIME_ERROR, "Qwen attention reset", error);
+}
+
+extern "C" int fortai_cuda_qwen35_attention_run_device(
+    fortai_cuda_qwen35_attention *layer, const void *device_activation,
+    size_t activation_elements, int position, void *device_output, size_t output_elements) {
+    if (!layer || !layer->impl.context || !device_activation || !device_output ||
+        position < 0 || position >= layer->impl.max_context)
+        return FORTAI_CUDA_INVALID;
+    auto *context = layer->impl.context;
+    auto *query = layer->impl.query_weights;
+    auto *key = layer->impl.key_weights;
+    auto *value = layer->impl.value_weights;
+    auto *output = layer->impl.output_weights;
+    const size_t expected_input = static_cast<size_t>(query->blocks) * q8_block_width;
+    const size_t attention_elements = static_cast<size_t>(layer->impl.heads) * layer->impl.value_size;
+    if (activation_elements != expected_input || output_elements < static_cast<size_t>(output->rows) ||
+        query->blocks != key->blocks || query->blocks != value->blocks ||
+        output->blocks * q8_block_width != static_cast<int>(attention_elements))
+        return FORTAI_CUDA_INVALID;
+    const size_t input_bytes = static_cast<size_t>(query->blocks) * q8_block_bytes;
+    const size_t output_bytes = static_cast<size_t>(output->blocks) * q8_block_bytes;
+    cudaSetDevice(context->device);
+    cudaError_t error = ensure_host_matvec_scratch(context,
+        std::max(input_bytes, output_bytes),
+        static_cast<size_t>(output->rows) * sizeof(float));
+    if (error == cudaSuccess) {
+        qwen_quantize_q8<<<(query->blocks + 31) / 32, 32, 0, context->stream>>>(
+            static_cast<const float *>(device_activation), context->scratch_activation,
+            query->blocks);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        const host_matvec_request requests[] = {
+            {query, layer->impl.query, static_cast<size_t>(query->rows) * sizeof(float)},
+            {key, layer->impl.key, static_cast<size_t>(key->rows) * sizeof(float)},
+            {value, layer->impl.value, static_cast<size_t>(value->rows) * sizeof(float)}};
+        launch_q8_grouped(requests, 3, context->scratch_activation, context->stream);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        qwen_attention_prepare<<<layer->impl.heads, 256, 512 * sizeof(double), context->stream>>>(
+            layer->impl.query, layer->impl.key, layer->impl.value, layer->impl.query_norm,
+            layer->impl.key_norm, layer->impl.key_cache, layer->impl.value_cache,
+            layer->impl.heads, layer->impl.key_value_heads, layer->impl.head_size,
+            layer->impl.value_size, layer->impl.max_context, position,
+            layer->impl.rope_dimension, layer->impl.rope_base, layer->impl.norm_epsilon);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        qwen_attention_apply<<<layer->impl.heads, 256,
+            static_cast<size_t>(8 + layer->impl.max_context) * sizeof(float), context->stream>>>(
+            layer->impl.query, layer->impl.key_cache, layer->impl.value_cache,
+            layer->impl.attention, layer->impl.heads, layer->impl.key_value_heads,
+            layer->impl.head_size, layer->impl.value_size, layer->impl.max_context, position);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        qwen_quantize_q8<<<(output->blocks + 31) / 32, 32, 0, context->stream>>>(
+            layer->impl.attention, context->scratch_activation, output->blocks);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        launch_q8(output, context->scratch_activation, static_cast<float *>(device_output),
+            context->stream);
+        error = cudaGetLastError();
+    }
+    return error == cudaSuccess ? FORTAI_CUDA_OK :
+        fail(context, FORTAI_CUDA_RUNTIME_ERROR, "Qwen attention device run", error);
 }
 
 extern "C" const char *fortai_cuda_q8_last_error(

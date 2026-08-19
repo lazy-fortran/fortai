@@ -303,6 +303,59 @@ int FORTAI_WEAK fortai_cuda_qwen35_recurrent_run_device(
     return unavailable();
 }
 
+int FORTAI_WEAK fortai_cuda_qwen35_attention_create(
+    fortai_cuda_q8_context *context, const fortai_cuda_q8_weights *query_weights,
+    const fortai_cuda_q8_weights *key_weights, const fortai_cuda_q8_weights *value_weights,
+    const fortai_cuda_q8_weights *output_weights, const void *query_norm,
+    size_t query_norm_bytes, const void *key_norm, size_t key_norm_bytes,
+    int heads, int key_value_heads, int head_size, int value_size, int max_context,
+    int rope_dimension, float rope_base, float norm_epsilon,
+    fortai_cuda_qwen35_attention **layer) {
+    (void)context;
+    (void)query_weights;
+    (void)key_weights;
+    (void)value_weights;
+    (void)output_weights;
+    (void)query_norm;
+    (void)query_norm_bytes;
+    (void)key_norm;
+    (void)key_norm_bytes;
+    (void)heads;
+    (void)key_value_heads;
+    (void)head_size;
+    (void)value_size;
+    (void)max_context;
+    (void)rope_dimension;
+    (void)rope_base;
+    (void)norm_epsilon;
+    if (layer) *layer = NULL;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_attention_destroy(
+    fortai_cuda_qwen35_attention *layer) {
+    (void)layer;
+    return FORTAI_CUDA_OK;
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_attention_reset(
+    fortai_cuda_qwen35_attention *layer) {
+    (void)layer;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_attention_run_device(
+    fortai_cuda_qwen35_attention *layer, const void *device_activation,
+    size_t activation_elements, int position, void *device_output, size_t output_elements) {
+    (void)layer;
+    (void)device_activation;
+    (void)activation_elements;
+    (void)position;
+    (void)device_output;
+    (void)output_elements;
+    return unavailable();
+}
+
 const char * FORTAI_WEAK fortai_cuda_q8_last_error(
     const fortai_cuda_q8_context *context) {
     (void)context;

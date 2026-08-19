@@ -38,6 +38,15 @@ module fortai_backend_cuda
         procedure :: run_device => cuda_qwen35_recurrent_run_device
     end type cuda_qwen35_recurrent_t
 
+    type, public :: cuda_qwen35_attention_t
+        type(c_ptr) :: handle = c_null_ptr
+    contains
+        procedure :: create => cuda_qwen35_attention_create
+        procedure :: destroy => cuda_qwen35_attention_destroy
+        procedure :: reset => cuda_qwen35_attention_reset
+        procedure :: run_device => cuda_qwen35_attention_run_device
+    end type cuda_qwen35_attention_t
+
     public :: cuda_q8_matvec_host
     public :: cuda_q8_matvec_host_pair
     public :: cuda_q8_matvec_host_triplet
@@ -305,6 +314,45 @@ module fortai_backend_cuda
             integer(c_size_t), value :: activation_elements, output_elements
             integer(c_int) :: code
         end function c_qwen35_recurrent_run_device
+
+        function c_qwen35_attention_create(context, query_weights, key_weights, value_weights, &
+                output_weights, query_norm, query_norm_bytes, key_norm, key_norm_bytes, heads, &
+                key_value_heads, head_size, value_size, max_context, rope_dimension, rope_base, &
+                norm_epsilon, layer) bind(C, name='fortai_cuda_qwen35_attention_create') result(code)
+            import c_float, c_int, c_int8_t, c_ptr, c_size_t
+            type(c_ptr), value :: context, query_weights, key_weights, value_weights, output_weights
+            integer(c_int8_t), target, intent(in) :: query_norm(*), key_norm(*)
+            integer(c_size_t), value :: query_norm_bytes, key_norm_bytes
+            integer(c_int), value :: heads, key_value_heads, head_size, value_size, max_context
+            integer(c_int), value :: rope_dimension
+            real(c_float), value :: rope_base, norm_epsilon
+            type(c_ptr) :: layer
+            integer(c_int) :: code
+        end function c_qwen35_attention_create
+
+        function c_qwen35_attention_destroy(layer) &
+                bind(C, name='fortai_cuda_qwen35_attention_destroy') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: layer
+            integer(c_int) :: code
+        end function c_qwen35_attention_destroy
+
+        function c_qwen35_attention_reset(layer) &
+                bind(C, name='fortai_cuda_qwen35_attention_reset') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: layer
+            integer(c_int) :: code
+        end function c_qwen35_attention_reset
+
+        function c_qwen35_attention_run_device(layer, device_activation, activation_elements, position, &
+                device_output, output_elements) bind(C, name='fortai_cuda_qwen35_attention_run_device') &
+                result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: layer, device_activation, device_output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int), value :: position
+            integer(c_int) :: code
+        end function c_qwen35_attention_run_device
 
         function c_last_error(context) bind(C, name='fortai_cuda_q8_last_error') result(message)
             import c_ptr
@@ -829,6 +877,85 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'Qwen3.5 CUDA recurrent device run failed')
     end subroutine cuda_qwen35_recurrent_run_device
+
+    subroutine cuda_qwen35_attention_create(self, context, query_weights, key_weights, value_weights, &
+            output_weights, query_norm, query_norm_bytes, key_norm, key_norm_bytes, heads, &
+            key_value_heads, head_size, value_size, max_context, rope_dimension, rope_base, &
+            norm_epsilon, stat)
+        class(cuda_qwen35_attention_t), intent(inout) :: self
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: query_weights, key_weights, value_weights, output_weights
+        integer(c_int8_t), contiguous, target, intent(in) :: query_norm(:), key_norm(:)
+        integer(c_size_t), intent(in) :: query_norm_bytes, key_norm_bytes
+        integer, intent(in) :: heads, key_value_heads, head_size, value_size, max_context, rope_dimension
+        real(c_float), intent(in) :: rope_base, norm_epsilon
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(query_weights%handle) .or. &
+            .not. c_associated(key_weights%handle) .or. .not. c_associated(value_weights%handle) .or. &
+            .not. c_associated(output_weights%handle) .or. size(query_norm) <= 0 .or. size(key_norm) <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA attention creation arguments')
+            return
+        end if
+        if (c_associated(self%handle)) call self%destroy(stat)
+        code = c_qwen35_attention_create(context%handle, query_weights%handle, key_weights%handle, &
+            value_weights%handle, output_weights%handle, query_norm, query_norm_bytes, key_norm, &
+            key_norm_bytes, int(heads, c_int), int(key_value_heads, c_int), int(head_size, c_int), &
+            int(value_size, c_int), int(max_context, c_int), int(rope_dimension, c_int), rope_base, &
+            norm_epsilon, self%handle)
+        if (code /= FORTAI_CUDA_OK) then
+            self%handle = c_null_ptr
+            call stat%set(FORTAI_UNSUPPORTED, 'CUDA Qwen attention creation failed')
+        end if
+    end subroutine cuda_qwen35_attention_create
+
+    subroutine cuda_qwen35_attention_destroy(self, stat)
+        class(cuda_qwen35_attention_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle)) return
+        code = c_qwen35_attention_destroy(self%handle)
+        self%handle = c_null_ptr
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Qwen attention destruction failed')
+    end subroutine cuda_qwen35_attention_destroy
+
+    subroutine cuda_qwen35_attention_reset(self, stat)
+        class(cuda_qwen35_attention_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle)) return
+        code = c_qwen35_attention_reset(self%handle)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Qwen attention reset failed')
+    end subroutine cuda_qwen35_attention_reset
+
+    subroutine cuda_qwen35_attention_run_device(self, device_activation, activation_elements, position, &
+            device_output, output_elements, stat)
+        class(cuda_qwen35_attention_t), intent(in) :: self
+        type(c_ptr), intent(in) :: device_activation, device_output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        integer, intent(in) :: position
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle) .or. .not. c_associated(device_activation) .or. &
+            .not. c_associated(device_output) .or. position < 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Qwen attention execution arguments')
+            return
+        end if
+        code = c_qwen35_attention_run_device(self%handle, device_activation, activation_elements, &
+            int(position, c_int), device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Qwen attention device execution failed')
+    end subroutine cuda_qwen35_attention_run_device
 
     function cuda_q8_last_error(self) result(message)
         class(cuda_q8_context_t), intent(in) :: self

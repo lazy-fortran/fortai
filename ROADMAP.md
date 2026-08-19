@@ -1,8 +1,8 @@
 # Roadmap
 
 The current delivery target is a CPU reference path plus a measured resident
-CUDA kernel, with native compilation, OpenMP parallelism, SIMD directives, and
-reproducible benchmark tooling.
+CUDA model path, with native compilation, OpenMP parallelism, SIMD directives,
+and reproducible benchmark tooling.
 
 ## CPU path
 
@@ -24,8 +24,10 @@ math flags belong to measured candidate builds, not the correctness oracle.
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
-| FAI-CUDA-001 | single-device CUDA backend | in progress (Q8 GEMV) | independent oracle and matched resident llama.cpp operation; full model wiring remains open |
+| FAI-CUDA-001 | single-device CUDA backend | experimental, device-resident Qwen path | independent ABI oracle, model trace parity, and paired llama.cpp benchmark |
 | FAI-CUDA-001A | host-controlled Qwen3.5 CUDA integration slice | experimental, measured slower | weights resident, model correctness smoke, persistent transfer/launch profile; cannot be promoted |
+| FAI-CUDA-001B | device-resident Qwen3.5 recurrent, attention, KV, and FFN path | experimental, measured slower | 0.8B/2B/4B smoke, CUDA trace parity, and fewer host activation round trips |
+| FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | open | matched Nsight profile and end-to-end speed at least equal to llama.cpp |
 | FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | deferred | two-device placement, transfer accounting, and stable generation |
 | FAI-CUDA-002 | Q4 repack and fused GDN kernels | deferred | validated kernel tournament on named GPUs |
 | FAI-CUDA-003 | CUDA MTP and speculative decoding | deferred | acceptance rate and end-to-end throughput |
@@ -58,7 +60,10 @@ token benchmarks must remain separate.
 The tracked trace verifier matches the 0.8B Q8_0 fixture for the eight-token
 oracle run beginning at token 9419. Current CPU evidence covers 0.8B, 2B, and
 4B Q8_0 model-level runs with the server stopped and sequential execution.
-The CUDA evidence is deliberately scoped to a resident Q8 GEMV operation; it
-does not claim a complete Qwen model backend. Nsight Compute is attempted and
-its permission result is retained; Nsight Systems remains the fallback timing
-profile when GPU performance-counter access is unavailable.
+The CUDA evidence now includes an experimental device-resident Qwen3.5 path
+for the 0.8B, 2B, and 4B fixtures. The 0.8B eight-token CUDA trace matches
+llama.cpp, and the paired 64-token result is 272.34 tok/s versus 299.99
+tok/s (0.908x), so it remains unpromoted. The remaining measured gap includes
+uncaptured launches and slower specialized Q8/GDN kernels. Nsight Compute is
+attempted and its permission result is retained; Nsight Systems remains the
+fallback timing profile when GPU performance-counter access is unavailable.

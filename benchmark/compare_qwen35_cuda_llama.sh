@@ -66,12 +66,16 @@ for attempt in $(seq 1 120); do
     sleep 1
     if [[ "$attempt" == 120 ]]; then echo "llama-server did not become healthy" >&2; exit 1; fi
 done
-request=$(TOKEN_ID="$token_id" STEPS="$steps" python3 - <<'PY'
+request=$(TOKEN_ID="$token_id" STEPS="$steps" ORACLE_PROBS="${FORTAI_LLAMA_ORACLE_PROBS:-0}" python3 - <<'PY'
 import json
 import os
-print(json.dumps({"prompt": [int(os.environ["TOKEN_ID"])],
-                  "n_predict": int(os.environ["STEPS"]),
-                  "temperature": 0.0, "seed": 42}))
+request = {"prompt": [int(os.environ["TOKEN_ID"])],
+           "n_predict": int(os.environ["STEPS"]),
+           "temperature": 0.0, "seed": 42}
+if os.environ["ORACLE_PROBS"] == "1":
+    request["n_probs"] = 1
+    request["post_sampling_probs"] = True
+print(json.dumps(request))
 PY
 )
 llama_result="$result_file.llama"
@@ -106,8 +110,8 @@ if int(values.get("steps", -1)) != int(os.environ["STEPS"]):
 if int(timings.get("predicted_n", -1)) != int(os.environ["STEPS"]):
     raise SystemExit("llama.cpp did not execute the requested step count")
 result = {
-    "scope": "qwen35_model_host_controlled_cuda_q8",
-    "production_gate": "not_promoted_host_transfers",
+    "scope": "qwen35_model_device_resident_cuda_q8" if values.get("device_pipeline") == "T" else "qwen35_model_host_controlled_cuda_q8",
+    "production_gate": "not_promoted_cuda_graph_or_full_parity" if values.get("device_pipeline") == "T" else "not_promoted_host_transfers",
     "fortai_commit": os.environ["COMMIT"],
     "fortai_patch_digest": os.environ["PATCH_DIGEST"],
     "fortai_tracked_tree_digest": os.environ["TREE_DIGEST"],

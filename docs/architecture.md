@@ -18,7 +18,7 @@ path can be delivered before the complete backend matrix exists.
 | `fortai_sampler` | reference greedy token selection |
 | `fortai_speculative` | accepted-prefix contract for draft verification |
 | `fortai_backend_cpu` | independent CPU reference matvec |
-| `backend/cuda` | resident Q8 GEMV kernel and reusable C ABI boundary |
+| `backend/cuda` | resident Q8 GEMV, recurrent, attention/KV, FFN kernels, and reusable C ABI boundary |
 
 The public `fortai` module exports the stable entry points. Model-specific
 modules live below `src/models`, and device code lives below
@@ -59,7 +59,7 @@ and error propagation. Unsupported features return an explicit status.
 | 0 | tensor, GGUF, ModelIR, PlanIR, and CPU reference | build, independent tests, exact metadata checks |
 | 1 | pure CPU model path | logits agree with an independent oracle |
 | 2 | NVIDIA CUDA backend | resident kernel results agree with CPU and a reference runtime |
-| 3 | Q4 repack, fused recurrent path, and attention candidates | validated kernel tournament on named hardware |
+| 3 | Q4 repack, fused recurrent path, attention candidates, and CUDA Graph plan | validated kernel tournament on named hardware |
 | 4 | MTP verification | accepted-token rate and end-to-end throughput |
 | 5 | DFlash2 integration | independent acceptance and latency measurements |
 | 6 | MLX backend | Apple device correctness and memory evidence |

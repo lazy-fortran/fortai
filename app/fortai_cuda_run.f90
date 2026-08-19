@@ -74,7 +74,7 @@ program fortai_cuda_run
     elapsed = real(clock_end - clock_start, real32) / real(clock_rate, real32)
     tokens_per_second = real(steps, real32) / max(forward_seconds, 1.0e-6_real32)
     if (model%cuda_device_pipeline) then
-        print '(a)', 'backend=fortai-cuda-device-recurrent-host-attention-q8'
+        print '(a)', 'backend=fortai-cuda-device-recurrent-attention-q8'
     else
         print '(a)', 'backend=fortai-cuda-host-q8'
     end if

@@ -6,7 +6,7 @@ module fortai_qwen35_cpu
         cuda_q8_ffn_host, cuda_q8_ffn_device, cuda_q8_matvec_host_pair, &
         cuda_q8_matvec_host_triplet, cuda_q8_matvec_host_triplet_contiguous, cuda_q8_weights_t, &
         cuda_qwen35_add_device, cuda_qwen35_copy_device, cuda_qwen35_rms_norm_device
-    use fortai_backend_cuda, only: cuda_qwen35_recurrent_t
+    use fortai_backend_cuda, only: cuda_qwen35_attention_t, cuda_qwen35_recurrent_t
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_fp16_to_real, gguf_tensor_t
     use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
     implicit none
@@ -79,6 +79,7 @@ module fortai_qwen35_cpu
         real(real32), allocatable :: key_cache(:)
         real(real32), allocatable :: value_cache(:)
         type(cuda_qwen35_recurrent_t) :: cuda_recurrent
+        type(cuda_qwen35_attention_t) :: cuda_attention
     end type qwen35_cpu_layer_t
 
     type, public :: qwen35_cpu_model_t
@@ -295,6 +296,7 @@ contains
             if (allocated(self%layers)) then
                 do i = 1, size(self%layers)
                     call self%layers(i)%cuda_recurrent%destroy(cleanup_stat)
+                    call self%layers(i)%cuda_attention%destroy(cleanup_stat)
                 end do
             end if
             do i = 1, size(self%cuda_weights)
@@ -343,6 +345,7 @@ contains
             if (.not. stat%is_ok()) then
                 do j = 1, size(self%layers)
                     call self%layers(j)%cuda_recurrent%destroy(cleanup_stat)
+                    call self%layers(j)%cuda_attention%destroy(cleanup_stat)
                 end do
                 do j = 1, size(self%cuda_weights)
                     call self%cuda_weights(j)%destroy(cleanup_stat)
@@ -351,6 +354,24 @@ contains
                 call self%cuda%destroy(cleanup_stat)
                 return
             end if
+        end do
+        do i = 1, size(self%layers)
+            if (self%layers(i)%recurrent) cycle
+            if (size(self%file%tensors(self%layers(i)%q_norm)%bytes) /= &
+                self%attention_head_size * storage_size(self%x(1)) / 8) cycle
+            if (size(self%file%tensors(self%layers(i)%k_norm)%bytes) /= &
+                self%attention_head_size * storage_size(self%x(1)) / 8) cycle
+            call self%layers(i)%cuda_attention%create(self%cuda, &
+                self%cuda_weights(self%layers(i)%attn_q), self%cuda_weights(self%layers(i)%attn_k), &
+                self%cuda_weights(self%layers(i)%attn_v), self%cuda_weights(self%layers(i)%attn_out), &
+                self%file%tensors(self%layers(i)%q_norm)%bytes, &
+                int(size(self%file%tensors(self%layers(i)%q_norm)%bytes), c_size_t), &
+                self%file%tensors(self%layers(i)%k_norm)%bytes, &
+                int(size(self%file%tensors(self%layers(i)%k_norm)%bytes), c_size_t), &
+                self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
+                self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
+                self%norm_epsilon, cleanup_stat)
+            if (.not. cleanup_stat%is_ok()) call cleanup_stat%clear()
         end do
         self%cuda_enabled = .true.
         call setup_cuda_device_pipeline(self, cleanup_stat)
@@ -371,10 +392,16 @@ contains
             return
         end if
         do i = 1, size(self%layers)
-            if (.not. self%layers(i)%recurrent) cycle
-            if (.not. c_associated(self%layers(i)%cuda_recurrent%handle)) then
-                call stat%set(FORTAI_UNSUPPORTED, 'CUDA recurrent layer is not device resident')
-                return
+            if (self%layers(i)%recurrent) then
+                if (.not. c_associated(self%layers(i)%cuda_recurrent%handle)) then
+                    call stat%set(FORTAI_UNSUPPORTED, 'CUDA recurrent layer is not device resident')
+                    return
+                end if
+            else
+                if (.not. c_associated(self%layers(i)%cuda_attention%handle)) then
+                    call stat%set(FORTAI_UNSUPPORTED, 'CUDA attention layer is not device resident')
+                    return
+                end if
             end if
             if (.not. cuda_ffn_ready(self, self%layers(i))) then
                 call stat%set(FORTAI_UNSUPPORTED, 'CUDA FFN layer is not device resident')
@@ -406,7 +433,6 @@ contains
         call self%cuda%allocate_buffer(hidden_bytes, self%cuda_hidden, stat)
         if (.not. stat%is_ok()) return
         do i = 1, size(self%layers)
-            if (.not. self%layers(i)%recurrent) cycle
             call self%cuda%allocate_buffer(hidden_bytes, self%cuda_attn_norm(i), stat)
             if (.not. stat%is_ok()) return
             call self%cuda%upload(self%cuda_attn_norm(i), &
@@ -458,6 +484,7 @@ contains
             if (allocated(self%layers)) then
                 do i = 1, size(self%layers)
                     call self%layers(i)%cuda_recurrent%destroy(cuda_stat)
+                    call self%layers(i)%cuda_attention%destroy(cuda_stat)
                 end do
             end if
             do i = 1, size(self%cuda_weights)
@@ -520,6 +547,7 @@ contains
                 if (allocated(self % layers(i) % key_cache)) self % layers(i) % key_cache = 0.0_real32
                 if (allocated(self%layers(i)%value_cache)) self%layers(i)%value_cache = 0.0_real32
                 if (self%cuda_enabled) call self%layers(i)%cuda_recurrent%reset(cuda_stat)
+                if (self%cuda_enabled) call self%layers(i)%cuda_attention%reset(cuda_stat)
             end do
         end if
     end subroutine qwen35_cpu_reset
@@ -558,8 +586,9 @@ contains
                     if (.not. stat%is_ok()) return
                     cycle
                 end if
-                call self%cuda%download_real(self%cuda_x, self%x, stat)
+                call forward_attention_device(self, i, position, stat)
                 if (.not. stat%is_ok()) return
+                cycle
             end if
             self % residual = self % x
             call rms_norm(self % x, self % file % tensors(self % layers(i) % attn_norm), &
@@ -646,6 +675,43 @@ contains
         call cuda_qwen35_add_device(self%cuda, self%cuda_hidden, self%cuda_residual, self%cuda_x, &
             hidden_elements, stat)
     end subroutine forward_recurrent_device
+
+    subroutine forward_attention_device(self, layer_index, position, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: layer_index
+        integer(int64), intent(in) :: position
+        type(status_t), intent(out) :: stat
+        integer(c_size_t) :: hidden_elements, hidden_bytes
+
+        call stat%clear()
+        hidden_elements = int(size(self%x), c_size_t)
+        hidden_bytes = hidden_elements * int(storage_size(self%x(1)) / 8, c_size_t)
+        call cuda_qwen35_copy_device(self%cuda, self%cuda_x, self%cuda_residual, hidden_bytes, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
+            self%cuda_attn_norm(layer_index), self%cuda_normalized, hidden_elements, &
+            self%norm_epsilon, stat)
+        if (.not. stat%is_ok()) return
+        call self%layers(layer_index)%cuda_attention%run_device(self%cuda_normalized, hidden_elements, &
+            int(position), self%cuda_hidden, hidden_elements, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_add_device(self%cuda, self%cuda_hidden, self%cuda_residual, self%cuda_x, &
+            hidden_elements, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_copy_device(self%cuda, self%cuda_x, self%cuda_residual, hidden_bytes, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
+            self%cuda_post_norm(layer_index), self%cuda_normalized, hidden_elements, &
+            self%norm_epsilon, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_q8_ffn_device(self%cuda, self%cuda_weights(self%layers(layer_index)%ffn_gate), &
+            self%cuda_weights(self%layers(layer_index)%ffn_up), &
+            self%cuda_weights(self%layers(layer_index)%ffn_down), self%cuda_normalized, &
+            hidden_elements, self%cuda_hidden, hidden_elements, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_qwen35_add_device(self%cuda, self%cuda_hidden, self%cuda_residual, self%cuda_x, &
+            hidden_elements, stat)
+    end subroutine forward_attention_device
 
     subroutine forward_recurrent(self, layer, layer_index, input, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self

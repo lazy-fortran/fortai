@@ -10,6 +10,7 @@ extern "C" {
 typedef struct fortai_cuda_q8_context fortai_cuda_q8_context;
 typedef struct fortai_cuda_q8_weights fortai_cuda_q8_weights;
 typedef struct fortai_cuda_qwen35_recurrent fortai_cuda_qwen35_recurrent;
+typedef struct fortai_cuda_qwen35_attention fortai_cuda_qwen35_attention;
 
 enum {
     FORTAI_CUDA_OK = 0,
@@ -119,6 +120,22 @@ int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *layer,
     size_t output_bytes, float *elapsed_ms);
 int fortai_cuda_qwen35_recurrent_run_device(fortai_cuda_qwen35_recurrent *layer,
     const void *device_activation, size_t activation_elements,
+    void *device_output, size_t output_elements);
+
+int fortai_cuda_qwen35_attention_create(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *query_weights,
+    const fortai_cuda_q8_weights *key_weights,
+    const fortai_cuda_q8_weights *value_weights,
+    const fortai_cuda_q8_weights *output_weights,
+    const void *query_norm, size_t query_norm_bytes,
+    const void *key_norm, size_t key_norm_bytes,
+    int heads, int key_value_heads, int head_size, int value_size,
+    int max_context, int rope_dimension, float rope_base, float norm_epsilon,
+    fortai_cuda_qwen35_attention **layer);
+int fortai_cuda_qwen35_attention_destroy(fortai_cuda_qwen35_attention *layer);
+int fortai_cuda_qwen35_attention_reset(fortai_cuda_qwen35_attention *layer);
+int fortai_cuda_qwen35_attention_run_device(fortai_cuda_qwen35_attention *layer,
+    const void *device_activation, size_t activation_elements, int position,
     void *device_output, size_t output_elements);
 
 const char *fortai_cuda_q8_last_error(const fortai_cuda_q8_context *context);

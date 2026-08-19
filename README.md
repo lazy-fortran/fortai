@@ -3,12 +3,14 @@
 FortAI is a Fortran-native AI runtime for model loading, execution planning,
 sampling, and architecture-specialized accelerator backends.
 
-The first delivery is a buildable Qwen3.5 CPU reference path. It contains the
+The first delivery is a buildable Qwen3.5 CPU reference path and an
+experimental device-resident CUDA path. It contains the
 public runtime types, GGUF Q8_0 loading, Qwen3.5 hybrid recurrent/full-attention
 execution for the 0.8B, 2B, and 4B model family, native OpenMP/SIMD matvecs,
-and persistent benchmark/provenance tooling. The first CUDA Q8 resident GEMV
-kernel is now measured on RTX 5060 Ti; the complete model backends remain
-staged behind explicit acceptance gates.
+and persistent benchmark/provenance tooling. The CUDA path keeps recurrent
+state, attention KV caches, activations, and FFN execution on the RTX 5060 Ti;
+CUDA Graph replay, Q4 repacking, and multi-GPU 27B execution remain staged
+behind explicit acceptance gates.
 
 ## Design
 
@@ -74,8 +76,12 @@ OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu.sh \
 OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu_both.sh \
   .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
 
-# build and compare the resident CUDA Q8 GEMV kernel with llama.cpp ggml-cuda
-benchmark/compare_cuda_q8.sh
+# build and compare the device-resident Qwen3.5 CUDA path with llama.cpp
+benchmark/compare_qwen35_cuda_llama.sh \
+  .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
+
+benchmark/check_qwen35_cuda_trace.sh \
+  .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
 
 # retain Nsight Compute (when GPU counters are permitted) and Nsight Systems data
 benchmark/profile_cuda_q8.sh
@@ -109,14 +115,12 @@ and their provenance logic are tracked.
 ## Status
 
 Version 0.1.0 includes an experimental model-level Qwen3.5 CPU runtime for
-Q8_0 GGUF and a resident CUDA Q8 GEMV kernel. The CPU path is benchmarked
-against llama.cpp on the 0.8B, 2B, and 4B fixtures; the CUDA kernel is matched
-against llama.cpp's ggml-cuda operation on identical resident data. Neither
-is promoted as a complete production model backend until the named workload
-gate passes. The experimental host-controlled Qwen3.5 CUDA slice is retained
-for integration profiling and is explicitly not promoted. Full CUDA
-Qwen3.8-27B and its required multi-GPU split remain on the roadmap. See
-[ROADMAP.md](ROADMAP.md).
+Q8_0 GGUF and a device-resident CUDA Qwen3.5 path. The CPU path is benchmarked
+against llama.cpp on the 0.8B, 2B, and 4B fixtures; the CUDA path has matched
+trace tests on 0.8B and smoke coverage on all three fixtures. Neither is
+promoted until the named workload gate passes. CUDA Graph replay, Q4
+repacking, and full CUDA Qwen3.8-27B with its required multi-GPU split remain
+on the roadmap. See [ROADMAP.md](ROADMAP.md).
 
 FortAI will only promote a production candidate for a named workload after it
 matches or beats the fastest fair competing harness under the same conditions.
