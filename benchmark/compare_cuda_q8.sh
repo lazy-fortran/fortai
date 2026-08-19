@@ -21,6 +21,7 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 "$root_dir/tools/build_cuda.sh" >"$base.build-fortai.log"
+"$root_dir/tools/build_cuda_backend.sh" >"$base.build-backend.log"
 "$root_dir/tools/build_llama_cuda_q8.sh" >"$base.build-llama.log"
 "$root_dir/tools/worktree_digest.sh" >"$base.worktree.txt"
 {

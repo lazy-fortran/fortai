@@ -13,8 +13,10 @@ bash -n "$root_dir/benchmark/profile_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/check_qwen35_cpu_trace.sh"
 bash -n "$root_dir/benchmark/compare_cuda_q8.sh"
 bash -n "$root_dir/benchmark/profile_cuda_q8.sh"
+bash -n "$root_dir/benchmark/check_cuda_backend.sh"
 bash -n "$root_dir/tools/build_cuda.sh"
 bash -n "$root_dir/tools/build_llama_cuda_q8.sh"
+bash -n "$root_dir/tools/build_cuda_backend.sh"
 bash -n "$root_dir/.provenance/fetch_models.sh"
 "$root_dir/tools/worktree_digest.sh" >/dev/null
 if rg -n '(^|[[:space:]])fpm (run|test|build)' "$root_dir/benchmark" "$root_dir/tools" >/dev/null; then

@@ -18,7 +18,7 @@ path can be delivered before the complete backend matrix exists.
 | `fortai_sampler` | reference greedy token selection |
 | `fortai_speculative` | accepted-prefix contract for draft verification |
 | `fortai_backend_cpu` | independent CPU reference matvec |
-| `backend/cuda` | resident Q8 GEMV candidate and CUDA benchmark boundary |
+| `backend/cuda` | resident Q8 GEMV kernel and reusable C ABI boundary |
 
 The public `fortai` module exports the stable entry points. Model-specific
 modules live below `src/models`, and device code lives below
