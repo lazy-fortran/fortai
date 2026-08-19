@@ -1,10 +1,11 @@
 program test_fortai_smoke
-    use, intrinsic :: iso_fortran_env, only: int32, int64, real64
+    use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
     use fortai_arena, only: arena_t
     use fortai_backend_cpu, only: cpu_matvec, cpu_matvec_inplace
     use fortai_cache, only: cache_path, pack_key_t
     use fortai_device, only: device_cpu, device_t
     use fortai_gguf, only: gguf_validate_header
+    use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_tensor_t
     use fortai_model_ir, only: model_ir_t
     use fortai_plan_ir, only: plan_ir_t
     use fortai_qwen35, only: qwen35_config_t
@@ -30,6 +31,7 @@ program test_fortai_smoke
     call test_ir_contracts(failures)
     call test_device_and_arena(failures)
     call test_gguf_cache_qwen(failures)
+    call test_gguf_q8_matvec(failures)
     if (failures > 0) error stop 1
     print '(a)', 'FortAI smoke tests passed'
 
@@ -185,5 +187,28 @@ contains
         call require(.not. qwen35_vision_available(), &
             'vision is explicit pending work', failures)
     end subroutine test_gguf_cache_qwen
+
+    subroutine test_gguf_q8_matvec(failures)
+        integer, intent(inout) :: failures
+        type(gguf_tensor_t) :: tensor
+        type(status_t) :: stat
+        integer(int8) :: quantized(32)
+        real(real32) :: scales(1), vector(32), output(1)
+        integer :: i
+
+        tensor%value_type = GGML_TYPE_Q8_0
+        tensor%shape = [32_int64, 1_int64]
+        allocate (tensor%bytes(34))
+        tensor%bytes = 0_int8
+        tensor%bytes(2) = int(z'3c', int8)
+        do i = 1, 32
+            tensor%bytes(i + 2) = int(i, int8)
+        end do
+        vector = 1.0_real32
+        call tensor%matvec_q8(vector, output, quantized, scales, stat)
+        call require(stat%is_ok(), 'Q8 activation matvec status', failures)
+        call require(abs(real(output(1), real64) - 528.0_real64) < 1.0e-4_real64, &
+            'Q8 activation matvec independent oracle', failures)
+    end subroutine test_gguf_q8_matvec
 
 end program test_fortai_smoke

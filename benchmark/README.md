@@ -22,11 +22,14 @@ flags are candidates for measurement, not the independent correctness oracle.
 `run_llama_cpp.sh` starts a temporary llama.cpp server on a dedicated port,
 runs one completion, stores the JSON response and server log, and shuts the
 server down. It refuses to use a port that is already occupied. Set
-`FORTAI_LLAMA_MODEL` to select a different GGUF file.
+`FORTAI_LLAMA_MODEL` to select a different GGUF file. The model-level CPU
+runner and fair comparison wrapper are `run_qwen35_cpu.sh` and
+`compare_qwen35_cpu_llama.sh`.
 
-The current repository has no model-level FortAI forward or decode path, so a
-token-throughput comparison is deliberately deferred. The roadmap records the
-matching conditions required before comparing FortAI with llama.cpp.
+The comparison wrapper uses the same initial token ID, context, decode budget,
+CPU thread count, and Q8_0 GGUF for both programs. It always terminates the
+temporary server. Results are evidence, not promotion: a slower FortAI result
+is explicitly retained as experimental.
 
 ## Promotion rule
 

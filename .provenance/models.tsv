@@ -1,0 +1,4 @@
+# name<TAB>repository<TAB>filename<TAB>revision<TAB>license
+qwen35-0.8b	lmstudio-community/Qwen3.5-0.8B-GGUF	Qwen3.5-0.8B-Q8_0.gguf	main	Apache-2.0
+qwen35-2b	lmstudio-community/Qwen3.5-2B-GGUF	Qwen3.5-2B-Q8_0.gguf	main	Apache-2.0
+qwen35-4b	lmstudio-community/Qwen3.5-4B-GGUF	Qwen3.5-4B-Q8_0.gguf	main	Apache-2.0
