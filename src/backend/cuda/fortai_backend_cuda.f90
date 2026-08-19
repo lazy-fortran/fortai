@@ -1,5 +1,5 @@
 module fortai_backend_cuda
-    use, intrinsic :: iso_c_binding, only: c_float, c_int, c_int8_t, c_loc, c_ptr, &
+    use, intrinsic :: iso_c_binding, only: c_float, c_int, c_int8_t, c_int64_t, c_loc, c_ptr, &
         c_null_ptr, c_size_t, c_associated
     use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
     implicit none
@@ -12,6 +12,10 @@ module fortai_backend_cuda
     contains
         procedure :: create => cuda_q8_context_create
         procedure :: destroy => cuda_q8_context_destroy
+        procedure :: set_position => cuda_q8_context_set_position
+        procedure :: capture_begin => cuda_q8_context_capture_begin
+        procedure :: capture_end => cuda_q8_context_capture_end
+        procedure :: graph_launch => cuda_q8_context_graph_launch
         procedure :: allocate_buffer => cuda_q8_allocate_buffer
         procedure :: free_buffer => cuda_q8_free_buffer
         procedure :: upload => cuda_q8_upload
@@ -57,6 +61,8 @@ module fortai_backend_cuda
     public :: cuda_qwen35_add_device
     public :: cuda_qwen35_rms_norm_device
     public :: cuda_q8_matvec_resident
+    public :: cuda_q8_matvec_device_f32
+    public :: cuda_qwen35_embedding_device
 
     interface
         function c_context_create(device, context) bind(C, name='fortai_cuda_q8_context_create') &
@@ -73,6 +79,35 @@ module fortai_backend_cuda
             type(c_ptr), value :: context
             integer(c_int) :: code
         end function c_context_destroy
+
+        function c_context_set_position(context, position) &
+                bind(C, name='fortai_cuda_q8_context_set_position') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: context
+            integer(c_int), value :: position
+            integer(c_int) :: code
+        end function c_context_set_position
+
+        function c_context_capture_begin(context) &
+                bind(C, name='fortai_cuda_q8_context_capture_begin') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: context
+            integer(c_int) :: code
+        end function c_context_capture_begin
+
+        function c_context_capture_end(context) &
+                bind(C, name='fortai_cuda_q8_context_capture_end') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: context
+            integer(c_int) :: code
+        end function c_context_capture_end
+
+        function c_context_graph_launch(context) &
+                bind(C, name='fortai_cuda_q8_context_graph_launch') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: context
+            integer(c_int) :: code
+        end function c_context_graph_launch
 
         function c_weights_upload(context, host_weights, weight_bytes, rows, width, weights) &
                 bind(C, name='fortai_cuda_q8_weights_upload') result(code)
@@ -149,6 +184,23 @@ module fortai_backend_cuda
             real(c_float), intent(out) :: kernel_ms
             integer(c_int) :: code
         end function c_matvec_resident
+
+        function c_matvec_device_f32(context, weights, activation, activation_elements, &
+                output, output_elements) bind(C, name='fortai_cuda_q8_matvec_device_f32') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, activation, output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int) :: code
+        end function c_matvec_device_f32
+
+        function c_embedding_device(context, weights, token_id, output, output_elements) &
+                bind(C, name='fortai_cuda_qwen35_embedding_device') result(code)
+            import c_int, c_int64_t, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, output
+            integer(c_int64_t), value :: token_id
+            integer(c_size_t), value :: output_elements
+            integer(c_int) :: code
+        end function c_embedding_device
 
         function c_qwen35_copy_device(context, device_input, device_output, bytes) &
                 bind(C, name='fortai_cuda_qwen35_copy_device') result(code)
@@ -391,6 +443,67 @@ contains
             'CUDA Q8 context destruction failed')
     end subroutine cuda_q8_context_destroy
 
+    subroutine cuda_q8_context_set_position(self, position, stat)
+        class(cuda_q8_context_t), intent(in) :: self
+        integer, intent(in) :: position
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle) .or. position < 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA device position')
+            return
+        end if
+        code = c_context_set_position(self%handle, int(position, c_int))
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA device position update failed')
+    end subroutine cuda_q8_context_set_position
+
+    subroutine cuda_q8_context_capture_begin(self, stat)
+        class(cuda_q8_context_t), intent(in) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA graph context')
+            return
+        end if
+        code = c_context_capture_begin(self%handle)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA graph capture begin failed')
+    end subroutine cuda_q8_context_capture_begin
+
+    subroutine cuda_q8_context_capture_end(self, stat)
+        class(cuda_q8_context_t), intent(in) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA graph context')
+            return
+        end if
+        code = c_context_capture_end(self%handle)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA graph capture end failed')
+    end subroutine cuda_q8_context_capture_end
+
+    subroutine cuda_q8_context_graph_launch(self, stat)
+        class(cuda_q8_context_t), intent(in) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA graph context')
+            return
+        end if
+        code = c_context_graph_launch(self%handle)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA graph launch failed')
+    end subroutine cuda_q8_context_graph_launch
+
     subroutine cuda_q8_weights_upload(self, context, host_weights, weight_bytes, rows, width, stat)
         class(cuda_q8_weights_t), intent(inout) :: self
         class(cuda_q8_context_t), intent(in) :: context
@@ -557,6 +670,48 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA Q8 resident matvec failed')
     end subroutine cuda_q8_matvec_resident
+
+    subroutine cuda_q8_matvec_device_f32(context, weights, activation, activation_elements, &
+            output, output_elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: weights
+        type(c_ptr), intent(in) :: activation, output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
+            .not. c_associated(activation) .or. .not. c_associated(output) .or. &
+            activation_elements <= 0_c_size_t .or. output_elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA device F32 matvec')
+            return
+        end if
+        code = c_matvec_device_f32(context%handle, weights%handle, activation, activation_elements, &
+            output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA device F32 matvec failed')
+    end subroutine cuda_q8_matvec_device_f32
+
+    subroutine cuda_qwen35_embedding_device(context, weights, token_id, output, output_elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: weights
+        integer(c_int64_t), intent(in) :: token_id
+        type(c_ptr), intent(in) :: output
+        integer(c_size_t), intent(in) :: output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
+            .not. c_associated(output) .or. token_id < 0_c_int64_t .or. output_elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q8 embedding')
+            return
+        end if
+        code = c_embedding_device(context%handle, weights%handle, token_id, output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q8 embedding lookup failed')
+    end subroutine cuda_qwen35_embedding_device
 
     subroutine cuda_qwen35_copy_device(context, device_input, device_output, bytes, stat)
         class(cuda_q8_context_t), intent(in) :: context

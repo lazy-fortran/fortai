@@ -5,7 +5,8 @@ module fortai_qwen35_cpu
     use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, &
         cuda_q8_ffn_host, cuda_q8_ffn_device, cuda_q8_matvec_host_pair, &
         cuda_q8_matvec_host_triplet, cuda_q8_matvec_host_triplet_contiguous, cuda_q8_weights_t, &
-        cuda_qwen35_add_device, cuda_qwen35_copy_device, cuda_qwen35_rms_norm_device
+        cuda_q8_matvec_device_f32, cuda_qwen35_add_device, cuda_qwen35_copy_device, &
+        cuda_qwen35_embedding_device, cuda_qwen35_rms_norm_device
     use fortai_backend_cuda, only: cuda_qwen35_attention_t, cuda_qwen35_recurrent_t
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_fp16_to_real, gguf_tensor_t
     use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
@@ -138,8 +139,11 @@ module fortai_qwen35_cpu
         type(c_ptr) :: cuda_residual = c_null_ptr
         type(c_ptr) :: cuda_normalized = c_null_ptr
         type(c_ptr) :: cuda_hidden = c_null_ptr
+        type(c_ptr) :: cuda_output_norm = c_null_ptr
+        type(c_ptr) :: cuda_logits = c_null_ptr
         logical :: cuda_enabled = .false.
         logical :: cuda_device_pipeline = .false.
+        logical :: cuda_graph_ready = .false.
     contains
         procedure :: close => qwen35_cpu_close
         procedure :: enable_cuda => qwen35_cpu_enable_cuda
@@ -386,9 +390,14 @@ contains
 
         call stat%clear()
         self%cuda_device_pipeline = .false.
+        self%cuda_graph_ready = .false.
         if (.not. self%cuda_enabled) return
         if (.not. allocated(self%layers)) then
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA device pipeline has no layers')
+            return
+        end if
+        if (.not. c_associated(self%cuda_weights(self%token_embedding)%handle)) then
+            call stat%set(FORTAI_UNSUPPORTED, 'CUDA token embedding is not device resident')
             return
         end if
         do i = 1, size(self%layers)
@@ -418,6 +427,11 @@ contains
                 return
             end if
         end do
+        if (size(self%file%tensors(self%output_norm)%bytes) /= &
+            size(self%x) * storage_size(self%x(1)) / 8) then
+            call stat%set(FORTAI_UNSUPPORTED, 'CUDA output norm weights are not F32')
+            return
+        end if
         allocate (self%cuda_attn_norm(size(self%layers)), self%cuda_post_norm(size(self%layers)))
         do i = 1, size(self%layers)
             self%cuda_attn_norm(i) = c_null_ptr
@@ -431,6 +445,14 @@ contains
         call self%cuda%allocate_buffer(hidden_bytes, self%cuda_normalized, stat)
         if (.not. stat%is_ok()) return
         call self%cuda%allocate_buffer(hidden_bytes, self%cuda_hidden, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(hidden_bytes, self%cuda_output_norm, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%upload(self%cuda_output_norm, self%file%tensors(self%output_norm)%bytes, &
+            hidden_bytes, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(int(size(self%logits) * storage_size(self%logits(1)) / 8, c_size_t), &
+            self%cuda_logits, stat)
         if (.not. stat%is_ok()) return
         do i = 1, size(self%layers)
             call self%cuda%allocate_buffer(hidden_bytes, self%cuda_attn_norm(i), stat)
@@ -454,6 +476,7 @@ contains
 
         call stat%clear()
         self%cuda_device_pipeline = .false.
+        self%cuda_graph_ready = .false.
         if (allocated(self%cuda_attn_norm)) then
             do i = 1, size(self%cuda_attn_norm)
                 if (.not. c_associated(self%cuda_attn_norm(i))) cycle
@@ -472,6 +495,8 @@ contains
         if (c_associated(self%cuda_residual)) call self%cuda%free_buffer(self%cuda_residual, stat)
         if (c_associated(self%cuda_normalized)) call self%cuda%free_buffer(self%cuda_normalized, stat)
         if (c_associated(self%cuda_hidden)) call self%cuda%free_buffer(self%cuda_hidden, stat)
+        if (c_associated(self%cuda_output_norm)) call self%cuda%free_buffer(self%cuda_output_norm, stat)
+        if (c_associated(self%cuda_logits)) call self%cuda%free_buffer(self%cuda_logits, stat)
     end subroutine cuda_device_pipeline_cleanup
 
     subroutine qwen35_cpu_close(self)
@@ -558,6 +583,7 @@ contains
         real(real32), contiguous, intent(out) :: logits(:)
         type(status_t), intent(out) :: stat
         integer :: i
+        logical :: capture_graph
 
         call stat % clear()
         if (.not. allocated(self % x) .or. size(logits) /= self % vocabulary_size) then
@@ -572,67 +598,98 @@ contains
             call stat % set(FORTAI_INVALID, 'Qwen3.5 position exceeds the CPU context')
             return
         end if
-        call self%file%tensors(self%token_embedding)%get_row(token_id + 1_int64, self%x, stat)
-        if (.not. stat % is_ok()) return
         if (self%cuda_device_pipeline) then
-            call self%cuda%upload_real(self%cuda_x, self%x, stat)
+            call cuda_qwen35_embedding_device(self%cuda, self%cuda_weights(self%token_embedding), &
+                int(token_id, c_int64_t), self%cuda_x, int(size(self%x), c_size_t), stat)
             if (.not. stat%is_ok()) return
+            call self%cuda%set_position(int(position), stat)
+            if (.not. stat%is_ok()) return
+        else
+            call self%file%tensors(self%token_embedding)%get_row(token_id + 1_int64, self%x, stat)
+            if (.not. stat % is_ok()) return
+        end if
+        capture_graph = .false.
+        if (self%cuda_device_pipeline) then
+            if (self%cuda_graph_ready) then
+                call self%cuda%graph_launch(stat)
+                if (.not. stat%is_ok()) return
+            else if (position > 0_int64) then
+                call self%cuda%capture_begin(stat)
+                if (.not. stat%is_ok()) return
+                capture_graph = .true.
+            end if
         end if
 
-        do i = 1, self % layer_count
-            if (self%cuda_device_pipeline) then
-                if (self%layers(i)%recurrent) then
-                    call forward_recurrent_device(self, i, stat)
+        if (.not. self%cuda_device_pipeline .or. .not. self%cuda_graph_ready) then
+            do i = 1, self % layer_count
+                if (self%cuda_device_pipeline) then
+                    if (self%layers(i)%recurrent) then
+                        call forward_recurrent_device(self, i, stat)
+                        if (.not. stat%is_ok()) return
+                        cycle
+                    end if
+                    call forward_attention_device(self, i, position, stat)
                     if (.not. stat%is_ok()) return
                     cycle
                 end if
-                call forward_attention_device(self, i, position, stat)
-                if (.not. stat%is_ok()) return
-                cycle
-            end if
-            self % residual = self % x
-            call rms_norm(self % x, self % file % tensors(self % layers(i) % attn_norm), &
-                self % norm_epsilon, self % normalized, stat)
-            if (.not. stat % is_ok()) return
-            if (self % layers(i) % recurrent) then
-                call forward_recurrent(self, self % layers(i), i, self % normalized, stat)
-            else
-                call forward_attention(self, self % layers(i), position, stat)
-            end if
-            if (.not. stat % is_ok()) return
-            self % x = self % hidden_work + self % residual
-            self % residual = self % x
-            call rms_norm(self % x, self % file % tensors(self % layers(i) % post_norm), &
-                self % norm_epsilon, self % normalized, stat)
-            if (.not. stat % is_ok()) return
-            if (cuda_ffn_ready(self, self%layers(i))) then
-                if (mod(size(self%normalized), 32) /= 0) then
-                    call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA FFN input is not block aligned')
-                    return
-                end if
-                call fortai_q8_quantize(self%normalized, self%quantized_input, self%quantized_scales, &
-                    int(size(self%normalized), c_int64_t))
-                call cuda_model_ffn_quantized(self, self%layers(i), size(self%normalized), &
-                    self%hidden_work, stat)
-            else
-                call model_matvec_pair(self, self%layers(i)%ffn_gate, self%layers(i)%ffn_up, &
-                    self%normalized, self%ffn_gate_work, self%ffn_up_work, stat)
+                self % residual = self % x
+                call rms_norm(self % x, self % file % tensors(self % layers(i) % attn_norm), &
+                    self % norm_epsilon, self % normalized, stat)
                 if (.not. stat % is_ok()) return
-                call silu_product(self % ffn_gate_work, self % ffn_up_work)
-                call model_matvec(self, self % layers(i) % ffn_down, self % ffn_gate_work, &
-                    self % hidden_work, stat)
-            end if
-            if (.not. stat % is_ok()) return
-            self % x = self % hidden_work + self % residual
-            if (self%cuda_device_pipeline .and. .not. self%layers(i)%recurrent) then
-                call self%cuda%upload_real(self%cuda_x, self%x, stat)
-                if (.not. stat%is_ok()) return
-            end if
-        end do
+                if (self % layers(i) % recurrent) then
+                    call forward_recurrent(self, self % layers(i), i, self % normalized, stat)
+                else
+                    call forward_attention(self, self % layers(i), position, stat)
+                end if
+                if (.not. stat % is_ok()) return
+                self % x = self % hidden_work + self % residual
+                self % residual = self % x
+                call rms_norm(self % x, self % file % tensors(self % layers(i) % post_norm), &
+                    self % norm_epsilon, self % normalized, stat)
+                if (.not. stat % is_ok()) return
+                if (cuda_ffn_ready(self, self%layers(i))) then
+                    if (mod(size(self%normalized), 32) /= 0) then
+                        call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA FFN input is not block aligned')
+                        return
+                    end if
+                    call fortai_q8_quantize(self%normalized, self%quantized_input, self%quantized_scales, &
+                        int(size(self%normalized), c_int64_t))
+                    call cuda_model_ffn_quantized(self, self%layers(i), size(self%normalized), &
+                        self%hidden_work, stat)
+                else
+                    call model_matvec_pair(self, self%layers(i)%ffn_gate, self%layers(i)%ffn_up, &
+                        self%normalized, self%ffn_gate_work, self%ffn_up_work, stat)
+                    if (.not. stat % is_ok()) return
+                    call silu_product(self % ffn_gate_work, self % ffn_up_work)
+                    call model_matvec(self, self % layers(i) % ffn_down, self % ffn_gate_work, &
+                        self % hidden_work, stat)
+                end if
+                if (.not. stat % is_ok()) return
+                self % x = self % hidden_work + self % residual
+                if (self%cuda_device_pipeline .and. .not. self%layers(i)%recurrent) then
+                    call self%cuda%upload_real(self%cuda_x, self%x, stat)
+                    if (.not. stat%is_ok()) return
+                end if
+            end do
+        end if
+
+        if (self%cuda_device_pipeline .and. .not. self%cuda_graph_ready) then
+            call forward_output_device(self, stat)
+            if (.not. stat%is_ok()) return
+        end if
+
+        if (capture_graph) then
+            call self%cuda%capture_end(stat)
+            if (.not. stat%is_ok()) return
+            self%cuda_graph_ready = .true.
+            call self%cuda%graph_launch(stat)
+            if (.not. stat%is_ok()) return
+        end if
 
         if (self%cuda_device_pipeline) then
-            call self%cuda%download_real(self%cuda_x, self%x, stat)
+            call self%cuda%download_real(self%cuda_logits, logits, stat)
             if (.not. stat%is_ok()) return
+            return
         end if
         call rms_norm(self%x, self%file%tensors(self%output_norm), self%norm_epsilon, &
             self % normalized, stat)
@@ -675,6 +732,21 @@ contains
         call cuda_qwen35_add_device(self%cuda, self%cuda_hidden, self%cuda_residual, self%cuda_x, &
             hidden_elements, stat)
     end subroutine forward_recurrent_device
+
+    subroutine forward_output_device(self, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_size_t) :: hidden_elements, logits_elements
+
+        call stat%clear()
+        hidden_elements = int(size(self%x), c_size_t)
+        logits_elements = int(size(self%logits), c_size_t)
+        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, self%cuda_output_norm, &
+            self%cuda_normalized, hidden_elements, self%norm_epsilon, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_q8_matvec_device_f32(self%cuda, self%cuda_weights(self%output), &
+            self%cuda_normalized, hidden_elements, self%cuda_logits, logits_elements, stat)
+    end subroutine forward_output_device
 
     subroutine forward_attention_device(self, layer_index, position, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self

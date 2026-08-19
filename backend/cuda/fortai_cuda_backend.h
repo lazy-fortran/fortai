@@ -2,6 +2,7 @@
 #define FORTAI_CUDA_BACKEND_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,10 @@ enum {
 
 int fortai_cuda_q8_context_create(int device, fortai_cuda_q8_context **context);
 int fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context);
+int fortai_cuda_q8_context_set_position(fortai_cuda_q8_context *context, int position);
+int fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context);
+int fortai_cuda_q8_context_capture_end(fortai_cuda_q8_context *context);
+int fortai_cuda_q8_context_graph_launch(fortai_cuda_q8_context *context);
 
 int fortai_cuda_q8_weights_upload(fortai_cuda_q8_context *context,
     const void *host_weights, size_t weight_bytes, int rows, int width,
@@ -44,6 +49,12 @@ int fortai_cuda_q8_device_buffer_download(fortai_cuda_q8_context *context,
 int fortai_cuda_q8_matvec_resident(fortai_cuda_q8_context *context,
     const fortai_cuda_q8_weights *weights, const void *device_activation,
     void *device_output, float *kernel_ms);
+int fortai_cuda_q8_matvec_device_f32(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements);
+int fortai_cuda_qwen35_embedding_device(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *weights, int64_t token_id, void *device_output,
+    size_t output_elements);
 
 int fortai_cuda_qwen35_copy_device(fortai_cuda_q8_context *context,
     const void *device_input, void *device_output, size_t bytes);

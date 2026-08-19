@@ -22,6 +22,27 @@ int FORTAI_WEAK fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context) 
     return FORTAI_CUDA_OK;
 }
 
+int FORTAI_WEAK fortai_cuda_q8_context_set_position(fortai_cuda_q8_context *context, int position) {
+    (void)context;
+    (void)position;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context) {
+    (void)context;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q8_context_capture_end(fortai_cuda_q8_context *context) {
+    (void)context;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q8_context_graph_launch(fortai_cuda_q8_context *context) {
+    (void)context;
+    return unavailable();
+}
+
 int FORTAI_WEAK fortai_cuda_q8_weights_upload(fortai_cuda_q8_context *context,
     const void *host_weights, size_t weight_bytes, int rows, int width,
     fortai_cuda_q8_weights **weights) {
@@ -89,6 +110,29 @@ int FORTAI_WEAK fortai_cuda_q8_matvec_resident(fortai_cuda_q8_context *context,
     (void)device_activation;
     (void)device_output;
     if (kernel_ms) *kernel_ms = 0.0f;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q8_matvec_device_f32(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements) {
+    (void)context;
+    (void)weights;
+    (void)device_activation;
+    (void)activation_elements;
+    (void)device_output;
+    (void)output_elements;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_embedding_device(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *weights, int64_t token_id, void *device_output,
+    size_t output_elements) {
+    (void)context;
+    (void)weights;
+    (void)token_id;
+    (void)device_output;
+    (void)output_elements;
     return unavailable();
 }
 
