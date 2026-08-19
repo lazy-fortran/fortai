@@ -31,6 +31,9 @@ result_file="$result_dir/compare_${base}_${stamp}.json"
 export OMP_NUM_THREADS="$threads"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-spread}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
+# The CPU comparison must never touch CUDA even though llama-server links
+# libggml-cuda.so: hide every GPU so backend init finds zero devices.
+export CUDA_VISIBLE_DEVICES=""
 
 if [[ ! -x "$llama_server" ]]; then
     echo "llama-server not found: $llama_server" >&2
@@ -87,6 +90,14 @@ for attempt in $(seq 1 120); do
     fi
 done
 
+if command -v nvidia-smi >/dev/null 2>&1; then
+    if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
+        | grep -Eq "^[[:space:]]*${server_pid}[[:space:]]*$"; then
+        echo "llama-server $server_pid appeared as a GPU compute process" >&2
+        exit 1
+    fi
+fi
+
 curl -fsS "http://127.0.0.1:${port}/completion" \
     -H 'Content-Type: application/json' --data-binary "$request" >"$result_file.llama"
 
@@ -107,6 +118,7 @@ for line in Path(os.environ["FORTAI_LOG"]).read_text().splitlines():
         runner[key] = value.strip()
 result = {
     "fortai_commit": os.environ["COMMIT"],
+    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
     "compiler": os.environ["COMPILER"],
     "omp_num_threads": int(os.environ["OMP_NUM_THREADS"]),
     "model": os.environ["MODEL_PATH"],

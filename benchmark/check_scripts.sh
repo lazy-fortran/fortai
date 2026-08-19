@@ -7,6 +7,9 @@ bash -n "$root_dir/benchmark/run_cpu_reference.sh"
 bash -n "$root_dir/benchmark/run_llama_cpp.sh"
 bash -n "$root_dir/benchmark/run_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/compare_qwen35_cpu_llama.sh"
+bash -n "$root_dir/benchmark/repeat_compare_qwen35_cpu.sh"
+bash -n "$root_dir/benchmark/tune_qwen35_cpu.sh"
+bash -n "$root_dir/benchmark/profile_qwen35_cpu.sh"
 bash -n "$root_dir/.provenance/fetch_models.sh"
 "$root_dir/benchmark/run_llama_cpp.sh" --dry-run >/dev/null
 "$root_dir/.provenance/fetch_models.sh" --dry-run >/dev/null
