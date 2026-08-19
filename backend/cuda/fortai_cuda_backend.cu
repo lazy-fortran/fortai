@@ -18,6 +18,10 @@ struct fortai_cuda_q8_context_impl {
     cudaStream_t stream = nullptr;
     cudaEvent_t start = nullptr;
     cudaEvent_t stop = nullptr;
+    int8_t *scratch_activation = nullptr;
+    size_t scratch_activation_bytes = 0;
+    float *scratch_output = nullptr;
+    size_t scratch_output_bytes = 0;
     char error[256] = {};
 };
 
@@ -137,6 +141,29 @@ static void launch_q8(fortai_cuda_q8_weights_impl *weights,
             activation, weights->rows, weights->blocks, output);
 }
 
+static cudaError_t ensure_host_matvec_scratch(fortai_cuda_q8_context_impl *context,
+    size_t activation_bytes, size_t output_bytes) {
+    if (activation_bytes > context->scratch_activation_bytes) {
+        cudaError_t error = cudaFree(context->scratch_activation);
+        if (error != cudaSuccess) return error;
+        context->scratch_activation = nullptr;
+        error = cudaMalloc(reinterpret_cast<void **>(&context->scratch_activation),
+            activation_bytes);
+        if (error != cudaSuccess) return error;
+        context->scratch_activation_bytes = activation_bytes;
+    }
+    if (output_bytes > context->scratch_output_bytes) {
+        cudaError_t error = cudaFree(context->scratch_output);
+        if (error != cudaSuccess) return error;
+        context->scratch_output = nullptr;
+        error = cudaMalloc(reinterpret_cast<void **>(&context->scratch_output),
+            output_bytes);
+        if (error != cudaSuccess) return error;
+        context->scratch_output_bytes = output_bytes;
+    }
+    return cudaSuccess;
+}
+
 } // namespace
 
 struct fortai_cuda_q8_context {
@@ -171,6 +198,8 @@ extern "C" int fortai_cuda_q8_context_create(int device,
 extern "C" int fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context) {
     if (!context) return FORTAI_CUDA_OK;
     cudaSetDevice(context->impl.device);
+    cudaFree(context->impl.scratch_activation);
+    cudaFree(context->impl.scratch_output);
     cudaEventDestroy(context->impl.start);
     cudaEventDestroy(context->impl.stop);
     cudaStreamDestroy(context->impl.stream);
@@ -296,31 +325,26 @@ extern "C" int fortai_cuda_q8_matvec_host(fortai_cuda_q8_context *context,
         return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);
     const size_t output_size = static_cast<size_t>(weights->impl.rows) * sizeof(float);
-    int8_t *device_activation = nullptr;
-    float *device_output = nullptr;
-    cudaError_t error = cudaMalloc(reinterpret_cast<void **>(&device_activation),
-        static_cast<size_t>(weights->impl.blocks) * q8_block_bytes);
-    if (error == cudaSuccess)
-        error = cudaMalloc(reinterpret_cast<void **>(&device_output), output_size);
+    const size_t activation_size = static_cast<size_t>(weights->impl.blocks) * q8_block_bytes;
+    cudaError_t error = ensure_host_matvec_scratch(&context->impl, activation_size, output_size);
     if (error == cudaSuccess) error = cudaEventRecord(context->impl.start, context->impl.stream);
     if (error == cudaSuccess)
-        error = cudaMemcpyAsync(device_activation, host_activation,
-            static_cast<size_t>(weights->impl.blocks) * q8_block_bytes,
+        error = cudaMemcpyAsync(context->impl.scratch_activation, host_activation,
+            activation_size,
             cudaMemcpyHostToDevice, context->impl.stream);
     if (error == cudaSuccess) {
         launch_q8(const_cast<fortai_cuda_q8_weights_impl *>(&weights->impl),
-            device_activation, device_output, context->impl.stream);
+            context->impl.scratch_activation, context->impl.scratch_output,
+            context->impl.stream);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess)
-        error = cudaMemcpyAsync(host_output, device_output, output_size,
+        error = cudaMemcpyAsync(host_output, context->impl.scratch_output, output_size,
             cudaMemcpyDeviceToHost, context->impl.stream);
     if (error == cudaSuccess) error = cudaEventRecord(context->impl.stop, context->impl.stream);
     if (error == cudaSuccess) error = cudaEventSynchronize(context->impl.stop);
     if (error == cudaSuccess) error = cudaEventElapsedTime(elapsed_ms,
         context->impl.start, context->impl.stop);
-    cudaFree(device_activation);
-    cudaFree(device_output);
     return error == cudaSuccess ? FORTAI_CUDA_OK :
         fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "host matvec", error);
 }

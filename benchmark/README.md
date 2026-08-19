@@ -65,6 +65,21 @@ reports. `ERR_NVGPUCTRPERM` is recorded when the host denies performance
 counter access; it does not invalidate the CUDA-event timing or correctness
 gate.
 
+The experimental model-level CUDA slice can be built and compared with:
+
+```bash
+downloads=/mnt/storage/code/lazy-fortran/fortai/.provenance/downloads
+OMP_NUM_THREADS=2 benchmark/compare_qwen35_cuda_llama.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
+benchmark/profile_qwen35_cuda.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
+```
+
+This path uploads Q8 weights once but still transfers each activation and
+output around each matvec. Its results are retained as integration evidence
+and explicitly marked `not_promoted_host_transfers`; the production CUDA gate
+requires device-resident activations and fused recurrent/attention work.
+
 ## Repeated runs, medians, and variance
 
 Single measurements are not evidence. `repeat_compare_qwen35_cpu.sh` runs the

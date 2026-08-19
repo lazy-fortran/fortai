@@ -113,8 +113,10 @@ Q8_0 GGUF and a resident CUDA Q8 GEMV kernel. The CPU path is benchmarked
 against llama.cpp on the 0.8B, 2B, and 4B fixtures; the CUDA kernel is matched
 against llama.cpp's ggml-cuda operation on identical resident data. Neither
 is promoted as a complete production model backend until the named workload
-gate passes. Full CUDA Qwen3.8-27B and its required multi-GPU split remain on
-the roadmap. See [ROADMAP.md](ROADMAP.md).
+gate passes. The experimental host-controlled Qwen3.5 CUDA slice is retained
+for integration profiling and is explicitly not promoted. Full CUDA
+Qwen3.8-27B and its required multi-GPU split remain on the roadmap. See
+[ROADMAP.md](ROADMAP.md).
 
 FortAI will only promote a production candidate for a named workload after it
 matches or beats the fastest fair competing harness under the same conditions.

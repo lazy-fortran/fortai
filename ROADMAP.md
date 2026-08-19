@@ -25,6 +25,7 @@ math flags belong to measured candidate builds, not the correctness oracle.
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
 | FAI-CUDA-001 | single-device CUDA backend | in progress (Q8 GEMV) | independent oracle and matched resident llama.cpp operation; full model wiring remains open |
+| FAI-CUDA-001A | host-controlled Qwen3.5 CUDA integration slice | experimental, measured slower | weights resident, model correctness smoke, persistent transfer/launch profile; cannot be promoted |
 | FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | deferred | two-device placement, transfer accounting, and stable generation |
 | FAI-CUDA-002 | Q4 repack and fused GDN kernels | deferred | validated kernel tournament on named GPUs |
 | FAI-CUDA-003 | CUDA MTP and speculative decoding | deferred | acceptance rate and end-to-end throughput |

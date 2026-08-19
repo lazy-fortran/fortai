@@ -1,6 +1,7 @@
 module fortai_qwen35_cpu
-    use, intrinsic :: iso_c_binding, only: c_float, c_int16_t, c_int64_t
+    use, intrinsic :: iso_c_binding, only: c_float, c_int16_t, c_int64_t, c_int8_t, c_size_t
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
+    use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, cuda_q8_weights_t
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_fp16_to_real, gguf_tensor_t
     use fortai_status, only: FORTAI_INVALID, status_t
     implicit none
@@ -12,6 +13,15 @@ module fortai_qwen35_cpu
             real(c_float), value, intent(in) :: value
             integer(c_int16_t) :: bits
         end function fortai_float_to_half
+
+        subroutine fortai_q8_quantize(vector, quantized, scales, count) &
+                bind(C, name='fortai_q8_quantize')
+            import c_float, c_int8_t, c_int64_t
+            real(c_float), intent(in) :: vector(*)
+            integer(c_int8_t), intent(out) :: quantized(*)
+            real(c_float), intent(out) :: scales(*)
+            integer(c_int64_t), value, intent(in) :: count
+        end subroutine fortai_q8_quantize
 
         subroutine fortai_gdn_step(state, key, value, query, decay, beta, head_size, &
                 output_scale, output) bind(C, name='fortai_gdn_step')
@@ -112,8 +122,12 @@ module fortai_qwen35_cpu
         real(real32), allocatable :: logits(:)
         integer(int8), allocatable :: quantized_input(:)
         real(real32), allocatable :: quantized_scales(:)
+        type(cuda_q8_context_t) :: cuda
+        type(cuda_q8_weights_t), allocatable :: cuda_weights(:)
+        logical :: cuda_enabled = .false.
     contains
         procedure :: close => qwen35_cpu_close
+        procedure :: enable_cuda => qwen35_cpu_enable_cuda
         procedure :: forward => qwen35_cpu_forward
         procedure :: gdn_state_add => qwen35_cpu_model_gdn_state_add
         procedure :: gdn_state_value => qwen35_cpu_model_gdn_state_value
@@ -249,9 +263,61 @@ contains
         call self % reset()
     end subroutine qwen35_cpu_open
 
+    subroutine qwen35_cpu_enable_cuda(self, device, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: device
+        type(status_t), intent(out) :: stat
+        type(status_t) :: cleanup_stat
+        integer :: i, j, rows, width
+
+        call stat%clear()
+        if (.not. allocated(self%file%tensors)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA model is not open')
+            return
+        end if
+        if (allocated(self%cuda_weights)) then
+            do i = 1, size(self%cuda_weights)
+                call self%cuda_weights(i)%destroy(cleanup_stat)
+            end do
+            deallocate(self%cuda_weights)
+        end if
+        call self%cuda%destroy(cleanup_stat)
+        call self%cuda%create(device, stat)
+        if (.not. stat%is_ok()) return
+
+        allocate(self%cuda_weights(size(self%file%tensors)))
+        do i = 1, size(self%file%tensors)
+            if (self%file%tensors(i)%value_type /= GGML_TYPE_Q8_0) cycle
+            if (size(self%file%tensors(i)%shape) /= 2) cycle
+            width = int(self%file%tensors(i)%shape(1))
+            rows = int(self%file%tensors(i)%shape(2))
+            call self%cuda_weights(i)%upload(self%cuda, self%file%tensors(i)%bytes, &
+                int(size(self%file%tensors(i)%bytes), c_size_t), rows, width, stat)
+            if (.not. stat%is_ok()) then
+                do j = 1, i - 1
+                    call self%cuda_weights(j)%destroy(cleanup_stat)
+                end do
+                deallocate(self%cuda_weights)
+                call self%cuda%destroy(cleanup_stat)
+                return
+            end if
+        end do
+        self%cuda_enabled = .true.
+    end subroutine qwen35_cpu_enable_cuda
+
     subroutine qwen35_cpu_close(self)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer :: i
+        type(status_t) :: cuda_stat
+
+        if (allocated(self%cuda_weights)) then
+            do i = 1, size(self%cuda_weights)
+                call self%cuda_weights(i)%destroy(cuda_stat)
+            end do
+            deallocate(self%cuda_weights)
+        end if
+        call self%cuda%destroy(cuda_stat)
+        self%cuda_enabled = .false.
 
         if (allocated(self % layers)) then
             do i = 1, size(self % layers)
@@ -594,6 +660,16 @@ contains
             return
         end if
         if (self % file % tensors(tensor_index) % value_type == GGML_TYPE_Q8_0) then
+            if (self%cuda_enabled .and. size(self%file%tensors(tensor_index)%shape) == 2) then
+                if (mod(size(input), 32) /= 0) then
+                    call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA Q8 input is not block aligned')
+                    return
+                end if
+                call fortai_q8_quantize(input, self%quantized_input, self%quantized_scales, &
+                    int(size(input), c_int64_t))
+                call cuda_model_matvec_quantized(self, tensor_index, size(input), output, stat)
+                return
+            end if
             call self % file % tensors(tensor_index) % matvec_q8(input, output, &
                 self % quantized_input, self % quantized_scales, stat)
         else
@@ -616,6 +692,22 @@ contains
         end if
         if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &
             self%file%tensors(second_index)%value_type == GGML_TYPE_Q8_0) then
+            if (self%cuda_enabled) then
+                if (size(self%file%tensors(first_index)%shape) == 2) then
+                    if (size(self%file%tensors(second_index)%shape) == 2) then
+                        if (mod(size(input), 32) /= 0) then
+                            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA Q8 input is not block aligned')
+                            return
+                        end if
+                        call fortai_q8_quantize(input, self%quantized_input, self%quantized_scales, &
+                            int(size(input), c_int64_t))
+                        call cuda_model_matvec_quantized(self, first_index, size(input), first_output, stat)
+                        if (.not. stat%is_ok()) return
+                        call cuda_model_matvec_quantized(self, second_index, size(input), second_output, stat)
+                        return
+                    end if
+                end if
+            end if
             call self%file%tensors(first_index)%matvec_pair_q8( &
                 self%file%tensors(second_index), input, first_output, second_output, &
                 self%quantized_input, self%quantized_scales, stat)
@@ -642,6 +734,26 @@ contains
         if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &
             self%file%tensors(second_index)%value_type == GGML_TYPE_Q8_0 .and. &
             self%file%tensors(third_index)%value_type == GGML_TYPE_Q8_0) then
+            if (self%cuda_enabled) then
+                if (size(self%file%tensors(first_index)%shape) == 2) then
+                    if (size(self%file%tensors(second_index)%shape) == 2) then
+                        if (size(self%file%tensors(third_index)%shape) == 2) then
+                            if (mod(size(input), 32) /= 0) then
+                                call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA Q8 input is not block aligned')
+                                return
+                            end if
+                            call fortai_q8_quantize(input, self%quantized_input, self%quantized_scales, &
+                                int(size(input), c_int64_t))
+                            call cuda_model_matvec_quantized(self, first_index, size(input), first_output, stat)
+                            if (.not. stat%is_ok()) return
+                            call cuda_model_matvec_quantized(self, second_index, size(input), second_output, stat)
+                            if (.not. stat%is_ok()) return
+                            call cuda_model_matvec_quantized(self, third_index, size(input), third_output, stat)
+                            return
+                        end if
+                    end if
+                end if
+            end if
             call self%file%tensors(first_index)%matvec_triplet_q8( &
                 self%file%tensors(second_index), self%file%tensors(third_index), input, &
                 first_output, second_output, third_output, self%quantized_input, &
@@ -654,6 +766,39 @@ contains
             call model_matvec(self, third_index, input, third_output, stat)
         end if
     end subroutine model_matvec_triplet
+
+    subroutine cuda_model_matvec_quantized(self, tensor_index, input_size, output, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: tensor_index, input_size
+        real(real32), contiguous, intent(out) :: output(:)
+        type(status_t), intent(out) :: stat
+        integer :: block_count, activation_bytes
+        real(c_float) :: elapsed_ms
+
+        call stat%clear()
+        if (.not. allocated(self%cuda_weights)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (tensor_index <= 0 .or. tensor_index > size(self%cuda_weights)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (.not. allocated(self%file%tensors(tensor_index)%shape)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        block_count = input_size / 32
+        activation_bytes = input_size + 2 * block_count
+        if (size(self%quantized_input) < activation_bytes .or. &
+                size(output) /= int(self%file%tensors(tensor_index)%shape(2))) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
+            return
+        end if
+        call cuda_q8_matvec_host(self%cuda, self%cuda_weights(tensor_index), &
+            self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), &
+            output, int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms, stat)
+    end subroutine cuda_model_matvec_quantized
 
     subroutine rms_norm(input, weights, epsilon, output, stat)
         real(real32), intent(in) :: input(:), epsilon
