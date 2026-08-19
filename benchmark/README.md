@@ -76,9 +76,11 @@ benchmark/profile_qwen35_cuda.sh \
 ```
 
 This path uploads Q8 weights once but still transfers each activation and
-output around each matvec. Its results are retained as integration evidence
-and explicitly marked `not_promoted_host_transfers`; the production CUDA gate
-requires device-resident activations and fused recurrent/attention work.
+output around each matvec. Paired and triplet projections reuse one activation
+upload, reducing measured copy calls, but the path remains host-controlled.
+Its results are retained as integration evidence and explicitly marked
+`not_promoted_host_transfers`; the production CUDA gate requires device-resident
+activations and fused recurrent/attention work.
 
 ## Repeated runs, medians, and variance
 

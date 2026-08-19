@@ -49,6 +49,22 @@ int fortai_cuda_q8_matvec_host(fortai_cuda_q8_context *context,
     size_t activation_bytes, float *host_output, size_t output_bytes,
     float *elapsed_ms);
 
+/* Grouped host-controlled operations: the quantized activation is uploaded
+ * once, then each resident weight matrix is evaluated on the same stream. */
+int fortai_cuda_q8_matvec_host_pair(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *first_weights,
+    const fortai_cuda_q8_weights *second_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *elapsed_ms);
+
+int fortai_cuda_q8_matvec_host_triplet(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *first_weights,
+    const fortai_cuda_q8_weights *second_weights,
+    const fortai_cuda_q8_weights *third_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *third_output,
+    size_t third_output_bytes, float *elapsed_ms);
+
 const char *fortai_cuda_q8_last_error(const fortai_cuda_q8_context *context);
 
 #ifdef __cplusplus

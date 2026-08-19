@@ -1,7 +1,8 @@
 module fortai_qwen35_cpu
     use, intrinsic :: iso_c_binding, only: c_float, c_int16_t, c_int64_t, c_int8_t, c_size_t
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
-    use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, cuda_q8_weights_t
+    use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, &
+        cuda_q8_matvec_host_pair, cuda_q8_matvec_host_triplet, cuda_q8_weights_t
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_fp16_to_real, gguf_tensor_t
     use fortai_status, only: FORTAI_INVALID, status_t
     implicit none
@@ -701,9 +702,8 @@ contains
                         end if
                         call fortai_q8_quantize(input, self%quantized_input, self%quantized_scales, &
                             int(size(input), c_int64_t))
-                        call cuda_model_matvec_quantized(self, first_index, size(input), first_output, stat)
-                        if (.not. stat%is_ok()) return
-                        call cuda_model_matvec_quantized(self, second_index, size(input), second_output, stat)
+                        call cuda_model_matvec_pair_quantized(self, first_index, second_index, size(input), &
+                            first_output, second_output, stat)
                         return
                     end if
                 end if
@@ -744,11 +744,8 @@ contains
                             end if
                             call fortai_q8_quantize(input, self%quantized_input, self%quantized_scales, &
                                 int(size(input), c_int64_t))
-                            call cuda_model_matvec_quantized(self, first_index, size(input), first_output, stat)
-                            if (.not. stat%is_ok()) return
-                            call cuda_model_matvec_quantized(self, second_index, size(input), second_output, stat)
-                            if (.not. stat%is_ok()) return
-                            call cuda_model_matvec_quantized(self, third_index, size(input), third_output, stat)
+                            call cuda_model_matvec_triplet_quantized(self, first_index, second_index, third_index, &
+                                size(input), first_output, second_output, third_output, stat)
                             return
                         end if
                     end if
@@ -799,6 +796,105 @@ contains
             self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), &
             output, int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms, stat)
     end subroutine cuda_model_matvec_quantized
+
+    subroutine cuda_model_matvec_pair_quantized(self, first_index, second_index, input_size, &
+            first_output, second_output, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: first_index, second_index, input_size
+        real(real32), contiguous, intent(out) :: first_output(:), second_output(:)
+        type(status_t), intent(out) :: stat
+        integer :: block_count, activation_bytes
+        real(c_float) :: elapsed_ms
+
+        call stat%clear()
+        if (.not. allocated(self%cuda_weights)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (first_index <= 0 .or. first_index > size(self%cuda_weights) .or. &
+                second_index <= 0 .or. second_index > size(self%cuda_weights)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (.not. allocated(self%file%tensors)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (.not. allocated(self%file%tensors(first_index)%shape)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (.not. allocated(self%file%tensors(second_index)%shape)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        block_count = input_size / 32
+        activation_bytes = input_size + 2 * block_count
+        if (size(self%quantized_input) < activation_bytes .or. &
+                size(first_output) /= int(self%file%tensors(first_index)%shape(2)) .or. &
+                size(second_output) /= int(self%file%tensors(second_index)%shape(2))) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
+            return
+        end if
+        call cuda_q8_matvec_host_pair(self%cuda, self%cuda_weights(first_index), &
+            self%cuda_weights(second_index), self%quantized_input(1:activation_bytes), &
+            int(activation_bytes, c_size_t), first_output, &
+            int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
+            int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), elapsed_ms, stat)
+    end subroutine cuda_model_matvec_pair_quantized
+
+    subroutine cuda_model_matvec_triplet_quantized(self, first_index, second_index, third_index, input_size, &
+            first_output, second_output, third_output, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: first_index, second_index, third_index, input_size
+        real(real32), contiguous, intent(out) :: first_output(:), second_output(:), third_output(:)
+        type(status_t), intent(out) :: stat
+        integer :: block_count, activation_bytes
+        real(c_float) :: elapsed_ms
+
+        call stat%clear()
+        if (.not. allocated(self%cuda_weights)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (first_index <= 0 .or. first_index > size(self%cuda_weights) .or. &
+                second_index <= 0 .or. second_index > size(self%cuda_weights) .or. &
+                third_index <= 0 .or. third_index > size(self%cuda_weights)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (.not. allocated(self%file%tensors)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (.not. allocated(self%file%tensors(first_index)%shape)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (.not. allocated(self%file%tensors(second_index)%shape)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        if (.not. allocated(self%file%tensors(third_index)%shape)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA weight binding is invalid')
+            return
+        end if
+        block_count = input_size / 32
+        activation_bytes = input_size + 2 * block_count
+        if (size(self%quantized_input) < activation_bytes .or. &
+                size(first_output) /= int(self%file%tensors(first_index)%shape(2)) .or. &
+                size(second_output) /= int(self%file%tensors(second_index)%shape(2)) .or. &
+                size(third_output) /= int(self%file%tensors(third_index)%shape(2))) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
+            return
+        end if
+        call cuda_q8_matvec_host_triplet(self%cuda, self%cuda_weights(first_index), &
+            self%cuda_weights(second_index), self%cuda_weights(third_index), &
+            self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), first_output, &
+            int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
+            int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), third_output, &
+            int(size(third_output) * storage_size(third_output(1)) / 8, c_size_t), elapsed_ms, stat)
+    end subroutine cuda_model_matvec_triplet_quantized
 
     subroutine rms_norm(input, weights, epsilon, output, stat)
         real(real32), intent(in) :: input(:), epsilon

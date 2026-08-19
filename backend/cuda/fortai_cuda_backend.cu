@@ -164,6 +164,53 @@ static cudaError_t ensure_host_matvec_scratch(fortai_cuda_q8_context_impl *conte
     return cudaSuccess;
 }
 
+struct host_matvec_request {
+    fortai_cuda_q8_weights_impl *weights;
+    float *output;
+    size_t output_bytes;
+};
+
+static int matvec_host_many(fortai_cuda_q8_context_impl *context,
+    const host_matvec_request *requests, int count, const void *host_activation,
+    size_t activation_bytes, float *elapsed_ms) {
+    if (!context || !requests || count <= 0 || !host_activation || !elapsed_ms)
+        return FORTAI_CUDA_INVALID;
+    const auto *first = requests[0].weights;
+    if (!first || !first->device_data) return FORTAI_CUDA_INVALID;
+    const size_t expected_activation = static_cast<size_t>(first->blocks) * q8_block_bytes;
+    size_t output_bytes = 0;
+    for (int i = 0; i < count; ++i) {
+        const auto *weights = requests[i].weights;
+        if (!weights || weights->context != context || weights->blocks != first->blocks ||
+            !weights->device_data || !requests[i].output) return FORTAI_CUDA_INVALID;
+        if (activation_bytes < static_cast<size_t>(weights->blocks) * q8_block_bytes ||
+            requests[i].output_bytes < static_cast<size_t>(weights->rows) * sizeof(float))
+            return FORTAI_CUDA_INVALID;
+        output_bytes = std::max(output_bytes, static_cast<size_t>(weights->rows) * sizeof(float));
+    }
+    cudaSetDevice(context->device);
+    cudaError_t error = ensure_host_matvec_scratch(context, expected_activation, output_bytes);
+    if (error == cudaSuccess) error = cudaEventRecord(context->start, context->stream);
+    if (error == cudaSuccess)
+        error = cudaMemcpyAsync(context->scratch_activation, host_activation,
+            expected_activation, cudaMemcpyHostToDevice, context->stream);
+    for (int i = 0; i < count && error == cudaSuccess; ++i) {
+        launch_q8(requests[i].weights, context->scratch_activation,
+            context->scratch_output, context->stream);
+        error = cudaGetLastError();
+        if (error == cudaSuccess)
+            error = cudaMemcpyAsync(requests[i].output, context->scratch_output,
+                static_cast<size_t>(requests[i].weights->rows) * sizeof(float),
+                cudaMemcpyDeviceToHost, context->stream);
+    }
+    if (error == cudaSuccess) error = cudaEventRecord(context->stop, context->stream);
+    if (error == cudaSuccess) error = cudaEventSynchronize(context->stop);
+    if (error == cudaSuccess) error = cudaEventElapsedTime(elapsed_ms,
+        context->start, context->stop);
+    return error == cudaSuccess ? FORTAI_CUDA_OK :
+        fail(context, FORTAI_CUDA_RUNTIME_ERROR, "grouped host matvec", error);
+}
+
 } // namespace
 
 struct fortai_cuda_q8_context {
@@ -347,6 +394,40 @@ extern "C" int fortai_cuda_q8_matvec_host(fortai_cuda_q8_context *context,
         context->impl.start, context->impl.stop);
     return error == cudaSuccess ? FORTAI_CUDA_OK :
         fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "host matvec", error);
+}
+
+extern "C" int fortai_cuda_q8_matvec_host_pair(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *first_weights,
+    const fortai_cuda_q8_weights *second_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *elapsed_ms) {
+    const host_matvec_request requests[] = {
+        {first_weights ? const_cast<fortai_cuda_q8_weights_impl *>(&first_weights->impl) : nullptr,
+            first_output, first_output_bytes},
+        {second_weights ? const_cast<fortai_cuda_q8_weights_impl *>(&second_weights->impl) : nullptr,
+            second_output, second_output_bytes}
+    };
+    return matvec_host_many(context ? &context->impl : nullptr, requests, 2,
+        host_activation, activation_bytes, elapsed_ms);
+}
+
+extern "C" int fortai_cuda_q8_matvec_host_triplet(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *first_weights,
+    const fortai_cuda_q8_weights *second_weights,
+    const fortai_cuda_q8_weights *third_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *third_output,
+    size_t third_output_bytes, float *elapsed_ms) {
+    const host_matvec_request requests[] = {
+        {first_weights ? const_cast<fortai_cuda_q8_weights_impl *>(&first_weights->impl) : nullptr,
+            first_output, first_output_bytes},
+        {second_weights ? const_cast<fortai_cuda_q8_weights_impl *>(&second_weights->impl) : nullptr,
+            second_output, second_output_bytes},
+        {third_weights ? const_cast<fortai_cuda_q8_weights_impl *>(&third_weights->impl) : nullptr,
+            third_output, third_output_bytes}
+    };
+    return matvec_host_many(context ? &context->impl : nullptr, requests, 3,
+        host_activation, activation_bytes, elapsed_ms);
 }
 
 extern "C" const char *fortai_cuda_q8_last_error(

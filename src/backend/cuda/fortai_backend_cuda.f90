@@ -28,6 +28,8 @@ module fortai_backend_cuda
     end type cuda_q8_weights_t
 
     public :: cuda_q8_matvec_host
+    public :: cuda_q8_matvec_host_pair
+    public :: cuda_q8_matvec_host_triplet
     public :: cuda_q8_matvec_resident
 
     interface
@@ -125,6 +127,40 @@ module fortai_backend_cuda
             real(c_float), intent(out) :: elapsed_ms
             integer(c_int) :: code
         end function c_matvec_host
+
+        function c_matvec_host_pair(context, first_weights, second_weights, activation, &
+                activation_bytes, first_output, first_output_bytes, second_output, &
+                second_output_bytes, elapsed_ms) bind(C, name='fortai_cuda_q8_matvec_host_pair') &
+                result(code)
+            import c_float, c_int, c_int8_t, c_ptr, c_size_t
+            type(c_ptr), value :: context, first_weights, second_weights
+            integer(c_int8_t), target, intent(in) :: activation(*)
+            integer(c_size_t), value :: activation_bytes
+            real(c_float), target, intent(out) :: first_output(*)
+            integer(c_size_t), value :: first_output_bytes
+            real(c_float), target, intent(out) :: second_output(*)
+            integer(c_size_t), value :: second_output_bytes
+            real(c_float), intent(out) :: elapsed_ms
+            integer(c_int) :: code
+        end function c_matvec_host_pair
+
+        function c_matvec_host_triplet(context, first_weights, second_weights, third_weights, &
+                activation, activation_bytes, first_output, first_output_bytes, second_output, &
+                second_output_bytes, third_output, third_output_bytes, elapsed_ms) &
+                bind(C, name='fortai_cuda_q8_matvec_host_triplet') result(code)
+            import c_float, c_int, c_int8_t, c_ptr, c_size_t
+            type(c_ptr), value :: context, first_weights, second_weights, third_weights
+            integer(c_int8_t), target, intent(in) :: activation(*)
+            integer(c_size_t), value :: activation_bytes
+            real(c_float), target, intent(out) :: first_output(*)
+            integer(c_size_t), value :: first_output_bytes
+            real(c_float), target, intent(out) :: second_output(*)
+            integer(c_size_t), value :: second_output_bytes
+            real(c_float), target, intent(out) :: third_output(*)
+            integer(c_size_t), value :: third_output_bytes
+            real(c_float), intent(out) :: elapsed_ms
+            integer(c_int) :: code
+        end function c_matvec_host_triplet
 
         function c_last_error(context) bind(C, name='fortai_cuda_q8_last_error') result(message)
             import c_ptr
@@ -334,6 +370,62 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA Q8 host matvec failed')
     end subroutine cuda_q8_matvec_host
+
+    subroutine cuda_q8_matvec_host_pair(context, first_weights, second_weights, activation, &
+            activation_bytes, first_output, first_output_bytes, second_output, second_output_bytes, &
+            elapsed_ms, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: first_weights, second_weights
+        integer(c_int8_t), contiguous, target, intent(in) :: activation(:)
+        integer(c_size_t), intent(in) :: activation_bytes, first_output_bytes, second_output_bytes
+        real(c_float), contiguous, target, intent(out) :: first_output(:), second_output(:)
+        real(c_float), intent(out) :: elapsed_ms
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        elapsed_ms = 0.0_c_float
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(second_weights%handle) .or. size(activation) <= 0 .or. &
+            size(first_output) <= 0 .or. size(second_output) <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q8 host matvec pair')
+            return
+        end if
+        code = c_matvec_host_pair(context%handle, first_weights%handle, second_weights%handle, &
+            activation, activation_bytes, first_output, first_output_bytes, second_output, &
+            second_output_bytes, elapsed_ms)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q8 host matvec pair failed')
+    end subroutine cuda_q8_matvec_host_pair
+
+    subroutine cuda_q8_matvec_host_triplet(context, first_weights, second_weights, third_weights, &
+            activation, activation_bytes, first_output, first_output_bytes, second_output, &
+            second_output_bytes, third_output, third_output_bytes, elapsed_ms, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: first_weights, second_weights, third_weights
+        integer(c_int8_t), contiguous, target, intent(in) :: activation(:)
+        integer(c_size_t), intent(in) :: activation_bytes
+        integer(c_size_t), intent(in) :: first_output_bytes, second_output_bytes, third_output_bytes
+        real(c_float), contiguous, target, intent(out) :: first_output(:), second_output(:), third_output(:)
+        real(c_float), intent(out) :: elapsed_ms
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        elapsed_ms = 0.0_c_float
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(second_weights%handle) .or. .not. c_associated(third_weights%handle) .or. &
+            size(activation) <= 0 .or. size(first_output) <= 0 .or. size(second_output) <= 0 .or. &
+            size(third_output) <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q8 host matvec triplet')
+            return
+        end if
+        code = c_matvec_host_triplet(context%handle, first_weights%handle, second_weights%handle, &
+            third_weights%handle, activation, activation_bytes, first_output, first_output_bytes, &
+            second_output, second_output_bytes, third_output, third_output_bytes, elapsed_ms)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q8 host matvec triplet failed')
+    end subroutine cuda_q8_matvec_host_triplet
 
     function cuda_q8_last_error(self) result(message)
         class(cuda_q8_context_t), intent(in) :: self

@@ -97,6 +97,47 @@ int FORTAI_WEAK fortai_cuda_q8_matvec_host(fortai_cuda_q8_context *context,
     return unavailable();
 }
 
+int FORTAI_WEAK fortai_cuda_q8_matvec_host_pair(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *first_weights,
+    const fortai_cuda_q8_weights *second_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *elapsed_ms) {
+    (void)context;
+    (void)first_weights;
+    (void)second_weights;
+    (void)host_activation;
+    (void)activation_bytes;
+    (void)first_output;
+    (void)first_output_bytes;
+    (void)second_output;
+    (void)second_output_bytes;
+    if (elapsed_ms) *elapsed_ms = 0.0f;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q8_matvec_host_triplet(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *first_weights,
+    const fortai_cuda_q8_weights *second_weights,
+    const fortai_cuda_q8_weights *third_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *third_output,
+    size_t third_output_bytes, float *elapsed_ms) {
+    (void)context;
+    (void)first_weights;
+    (void)second_weights;
+    (void)third_weights;
+    (void)host_activation;
+    (void)activation_bytes;
+    (void)first_output;
+    (void)first_output_bytes;
+    (void)second_output;
+    (void)second_output_bytes;
+    (void)third_output;
+    (void)third_output_bytes;
+    if (elapsed_ms) *elapsed_ms = 0.0f;
+    return unavailable();
+}
+
 const char * FORTAI_WEAK fortai_cuda_q8_last_error(
     const fortai_cuda_q8_context *context) {
     (void)context;

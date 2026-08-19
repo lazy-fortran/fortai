@@ -38,6 +38,8 @@ int main(int argc, char **argv) {
     const size_t activation_bytes = static_cast<size_t>(blocks) * q8_block_bytes;
     std::vector<uint8_t> weights(weight_bytes), activation(activation_bytes);
     std::vector<float> oracle(rows), host_output(rows), resident_output(rows);
+    std::vector<float> pair_first(rows), pair_second(rows);
+    std::vector<float> triplet_first(rows), triplet_second(rows), triplet_third(rows);
     fill_q8(weights, rows, blocks, 0x6f727461u, true);
     fill_q8(activation, 1, blocks, 0x6f727461u ^ 0x9e3779b9u, false);
     for (int block = 0; block < blocks; ++block) {
@@ -55,6 +57,15 @@ int main(int argc, char **argv) {
     float host_ms = 0.0f;
     check(fortai_cuda_q8_matvec_host(context, device_weights, activation.data(), activation.size(),
         host_output.data(), host_output.size() * sizeof(float), &host_ms), context, "host matvec");
+    float pair_ms = 0.0f;
+    check(fortai_cuda_q8_matvec_host_pair(context, device_weights, device_weights,
+        activation.data(), activation.size(), pair_first.data(), pair_first.size() * sizeof(float),
+        pair_second.data(), pair_second.size() * sizeof(float), &pair_ms), context, "host pair");
+    float triplet_ms = 0.0f;
+    check(fortai_cuda_q8_matvec_host_triplet(context, device_weights, device_weights, device_weights,
+        activation.data(), activation.size(), triplet_first.data(), triplet_first.size() * sizeof(float),
+        triplet_second.data(), triplet_second.size() * sizeof(float), triplet_third.data(),
+        triplet_third.size() * sizeof(float), &triplet_ms), context, "host triplet");
 
     void *device_activation = nullptr;
     void *device_output = nullptr;
@@ -71,6 +82,7 @@ int main(int argc, char **argv) {
         resident_output.size() * sizeof(float)), context, "output download");
 
     float host_abs = 0.0f, host_rel = 0.0f, resident_abs = 0.0f, resident_rel = 0.0f;
+    float grouped_abs = 0.0f, grouped_rel = 0.0f;
     for (int row = 0; row < rows; ++row) {
         const float host_error = std::fabs(host_output[row] - oracle[row]);
         const float resident_error = std::fabs(resident_output[row] - oracle[row]);
@@ -78,15 +90,27 @@ int main(int argc, char **argv) {
         resident_abs = std::max(resident_abs, resident_error);
         host_rel = std::max(host_rel, host_error / std::max(1.0f, std::fabs(oracle[row])));
         resident_rel = std::max(resident_rel, resident_error / std::max(1.0f, std::fabs(oracle[row])));
+        const float grouped_values[] = {
+            pair_first[row], pair_second[row], triplet_first[row], triplet_second[row], triplet_third[row]
+        };
+        for (const float value : grouped_values) {
+            const float error = std::fabs(value - oracle[row]);
+            grouped_abs = std::max(grouped_abs, error);
+            grouped_rel = std::max(grouped_rel, error / std::max(1.0f, std::fabs(oracle[row])));
+        }
     }
     const bool correct = host_abs <= 2.0e-3f && host_rel <= 1.0e-4f &&
-        resident_abs <= 2.0e-3f && resident_rel <= 1.0e-4f;
+        resident_abs <= 2.0e-3f && resident_rel <= 1.0e-4f &&
+        grouped_abs <= 2.0e-3f && grouped_rel <= 1.0e-4f;
     std::printf("{\"implementation\":\"fortai-cuda-q8-backend-abi\",\"device\":%d,"
         "\"rows\":%d,\"width\":%d,\"host_elapsed_ms\":%.6f,"
-        "\"resident_kernel_ms\":%.6f,\"host_max_abs_error\":%.9g,"
+        "\"resident_kernel_ms\":%.6f,\"grouped_pair_ms\":%.6f,\"grouped_triplet_ms\":%.6f,"
+        "\"host_max_abs_error\":%.9g,"
         "\"host_max_rel_error\":%.9g,\"resident_max_abs_error\":%.9g,"
-        "\"resident_max_rel_error\":%.9g,\"correct\":%s}\n", device, rows, width,
-        host_ms, resident_ms, host_abs, host_rel, resident_abs, resident_rel,
+        "\"resident_max_rel_error\":%.9g,\"grouped_max_abs_error\":%.9g,"
+        "\"grouped_max_rel_error\":%.9g,\"correct\":%s}\n", device, rows, width,
+        host_ms, resident_ms, pair_ms, triplet_ms, host_abs, host_rel, resident_abs, resident_rel,
+        grouped_abs, grouped_rel,
         correct ? "true" : "false");
 
     check(fortai_cuda_q8_device_buffer_destroy(context, device_output), context, "output free");
