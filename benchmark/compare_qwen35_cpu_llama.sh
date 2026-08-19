@@ -68,7 +68,8 @@ if [[ -n "$llama_library_dir" ]]; then
     export LD_LIBRARY_PATH="$llama_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 "$llama_server" -m "$model_path" --host 127.0.0.1 --port "$port" \
-    -c "$context" -ngl 0 -t "$threads" -tb "$threads" --no-webui >"$llama_log" 2>&1 &
+    -c "$context" -ngl 0 --device none --no-op-offload \
+    -t "$threads" -tb "$threads" --no-webui >"$llama_log" 2>&1 &
 server_pid=$!
 
 for attempt in $(seq 1 120); do
