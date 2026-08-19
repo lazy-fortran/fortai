@@ -15,6 +15,7 @@ module fortai_gguf_runtime
             integer(c_int64_t), value, intent(in) :: row, block_count
             real(c_float) :: value
         end function fortai_q8_dot
+
     end interface
 
     integer(int32), parameter, public :: GGML_TYPE_F32 = 0_int32
@@ -438,13 +439,15 @@ contains
             end do
             if (self%shape(2) < 128_int64) then
                 do row = 1, self%shape(2)
-                    values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
+                    values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
                 end do
             else
                 !$omp parallel do default(none) shared(self, quantized, scales, values, block_count) &
                 !$omp& private(row) schedule(static)
                 do row = 1, self%shape(2)
-                    values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
+                    values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
                 end do
                 !$omp end parallel do
             end if
@@ -493,29 +496,23 @@ contains
             end do
             if (self%shape(2) < 128_int64) then
                 do row = 1, self%shape(2)
-                    values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
-                    other_values(row) = gguf_tensor_dot_q8_quantized(other, row, quantized, scales, block_count)
+                    values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    other_values(row) = fortai_q8_dot(other%bytes, quantized, scales, &
+                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
                 end do
             else
                 !$omp parallel do default(none) shared(self, other, quantized, scales, values, &
                 !$omp& other_values, block_count) private(row) schedule(static)
                 do row = 1, self%shape(2)
-                    values(row) = gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
-                    other_values(row) = gguf_tensor_dot_q8_quantized(other, row, quantized, scales, block_count)
+                    values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    other_values(row) = fortai_q8_dot(other%bytes, quantized, scales, &
+                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
                 end do
                 !$omp end parallel do
             end if
         end subroutine gguf_tensor_matvec_pair_q8
-
-        real(real32) function gguf_tensor_dot_q8_quantized(self, row, quantized, scales, block_count)
-            class(gguf_tensor_t), intent(in) :: self
-            integer(int64), intent(in) :: row, block_count
-            integer(int8), contiguous, intent(in) :: quantized(:)
-            real(real32), contiguous, intent(in) :: scales(:)
-
-            gguf_tensor_dot_q8_quantized = fortai_q8_dot(self%bytes, quantized, scales, &
-                int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
-        end function gguf_tensor_dot_q8_quantized
 
         subroutine read_metadata_value(unit, value_type, value, io_status)
             integer, intent(in) :: unit

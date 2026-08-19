@@ -6,8 +6,49 @@
 #pragma GCC optimize("O3")
 #endif
 
-extern __m256 fortai_expf_avx2(__m256 value) __asm__("_ZGVdN8v_expf")
-    __attribute__((weak));
+__attribute__((target("avx2,fma")))
+static inline __m256 expf_avx2(__m256 value)
+{
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 ln2_hi = _mm256_set1_ps(0.693359375f);
+    const __m256 ln2_lo = _mm256_set1_ps(-2.12194440e-4f);
+    const __m256 max_input = _mm256_set1_ps(88.3762626647949f);
+    const __m256 min_input = _mm256_set1_ps(-88.3762626647949f);
+    const __m256 c1 = _mm256_set1_ps(1.9875691500e-4f);
+    const __m256 c2 = _mm256_set1_ps(1.3981999507e-3f);
+    const __m256 c3 = _mm256_set1_ps(8.3334519073e-3f);
+    const __m256 c4 = _mm256_set1_ps(4.1665795894e-2f);
+    const __m256 c5 = _mm256_set1_ps(1.6666665459e-1f);
+    const __m256 c6 = _mm256_set1_ps(5.0000001201e-1f);
+    __m256 fx, truncated, z, polynomial;
+    __m256i exponent;
+
+    value = _mm256_min_ps(value, max_input);
+    value = _mm256_max_ps(value, min_input);
+    fx = _mm256_add_ps(_mm256_mul_ps(value, log2e), half);
+    exponent = _mm256_cvttps_epi32(fx);
+    truncated = _mm256_cvtepi32_ps(exponent);
+    exponent = _mm256_sub_epi32(exponent, _mm256_and_si256(
+        _mm256_castps_si256(_mm256_cmp_ps(truncated, fx, _CMP_GT_OQ)),
+        _mm256_set1_epi32(1)));
+    fx = _mm256_cvtepi32_ps(exponent);
+    value = _mm256_sub_ps(value, _mm256_mul_ps(fx, ln2_hi));
+    value = _mm256_sub_ps(value, _mm256_mul_ps(fx, ln2_lo));
+    z = _mm256_mul_ps(value, value);
+    polynomial = c1;
+    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c2);
+    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c3);
+    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c4);
+    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c5);
+    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c6);
+    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, z), value);
+    polynomial = _mm256_add_ps(polynomial, one);
+    exponent = _mm256_add_epi32(exponent, _mm256_set1_epi32(0x7f));
+    exponent = _mm256_slli_epi32(exponent, 23);
+    return _mm256_mul_ps(polynomial, _mm256_castsi256_ps(exponent));
+}
 
 static inline float half_to_float(uint16_t value)
 {
@@ -67,13 +108,14 @@ static float q8_dot_avx2(const int8_t *weights, const int8_t *quantized,
     const float *scales, int64_t row, int64_t block_count)
 {
     const __m256i ones = _mm256_set1_epi16(1);
-    __m256 accumulator = _mm256_setzero_ps();
+    __m256 accumulator0 = _mm256_setzero_ps();
+    __m256 accumulator1 = _mm256_setzero_ps();
     const int8_t *row_weights = weights + row * block_count * 34 + 2;
     const int8_t *activation_values = quantized;
     const float *activation_scales = scales;
     int64_t block;
 
-    for (block = 0; block < block_count; ++block) {
+    for (block = 0; block + 1 < block_count; block += 2) {
         const uint16_t scale_bits = (uint16_t)(uint8_t)row_weights[-2] |
             ((uint16_t)(uint8_t)row_weights[-1] << 8);
         const __m256i weight = _mm256_loadu_si256(
@@ -87,12 +129,51 @@ static float q8_dot_avx2(const int8_t *weights, const int8_t *quantized,
         const __m256i pairs = _mm256_madd_epi16(products, ones);
         const __m256 dot = _mm256_cvtepi32_ps(pairs);
         const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) * activation_scales[0]);
-        accumulator = _mm256_fmadd_ps(scale, dot, accumulator);
+        accumulator0 = _mm256_fmadd_ps(scale, dot, accumulator0);
         row_weights += 34;
         activation_values += 32;
         ++activation_scales;
+
+        {
+            const uint16_t next_scale_bits = (uint16_t)(uint8_t)row_weights[-2] |
+                ((uint16_t)(uint8_t)row_weights[-1] << 8);
+            const __m256i next_weight = _mm256_loadu_si256(
+                (const __m256i *)row_weights);
+            const __m256i next_activation = _mm256_loadu_si256(
+                (const __m256i *)activation_values);
+            const __m256i next_absolute_weight = _mm256_abs_epi8(next_weight);
+            const __m256i next_signed_activation = _mm256_sign_epi8(
+                next_activation, next_weight);
+            const __m256i next_products = _mm256_maddubs_epi16(
+                next_absolute_weight, next_signed_activation);
+            const __m256i next_pairs = _mm256_madd_epi16(next_products, ones);
+            const __m256 next_dot = _mm256_cvtepi32_ps(next_pairs);
+            const __m256 next_scale = _mm256_set1_ps(
+                _cvtsh_ss(next_scale_bits) * activation_scales[0]);
+            accumulator1 = _mm256_fmadd_ps(next_scale, next_dot, accumulator1);
+            row_weights += 34;
+            activation_values += 32;
+            ++activation_scales;
+        }
+    }
+    if (block < block_count) {
+        const uint16_t scale_bits = (uint16_t)(uint8_t)row_weights[-2] |
+            ((uint16_t)(uint8_t)row_weights[-1] << 8);
+        const __m256i weight = _mm256_loadu_si256(
+            (const __m256i *)row_weights);
+        const __m256i activation = _mm256_loadu_si256(
+            (const __m256i *)activation_values);
+        const __m256i absolute_weight = _mm256_abs_epi8(weight);
+        const __m256i signed_activation = _mm256_sign_epi8(activation, weight);
+        const __m256i products = _mm256_maddubs_epi16(absolute_weight,
+            signed_activation);
+        const __m256i pairs = _mm256_madd_epi16(products, ones);
+        const __m256 dot = _mm256_cvtepi32_ps(pairs);
+        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) * activation_scales[0]);
+        accumulator0 = _mm256_fmadd_ps(scale, dot, accumulator0);
     }
     {
+        const __m256 accumulator = _mm256_add_ps(accumulator0, accumulator1);
         const __m128 lower = _mm256_castps256_ps128(accumulator);
         const __m128 upper = _mm256_extractf128_ps(accumulator, 1);
         __m128 sum = _mm_add_ps(lower, upper);
@@ -214,7 +295,7 @@ static void silu_array_avx2(float *values, int64_t count)
 
     for (index = 0; index + 8 <= count; index += 8) {
         const __m256 input = _mm256_loadu_ps(values + index);
-        const __m256 exponent = fortai_expf_avx2(_mm256_sub_ps(
+        const __m256 exponent = expf_avx2(_mm256_sub_ps(
             _mm256_setzero_ps(), input));
         __m256 result = _mm256_div_ps(input, _mm256_add_ps(one, exponent));
         result = _mm256_blendv_ps(result, _mm256_setzero_ps(),
@@ -238,7 +319,7 @@ static void silu_array_scalar(float *values, int64_t count)
 void fortai_silu(float *values, int64_t count)
 {
 #if defined(__GNUC__)
-    if (__builtin_cpu_supports("avx2") && fortai_expf_avx2 != 0 && count >= 8) {
+    if (__builtin_cpu_supports("avx2") && count >= 8) {
         silu_array_avx2(values, count);
         return;
     }
@@ -256,7 +337,7 @@ static void silu_product_avx2(float *left, const float *right, int64_t count)
 
     for (index = 0; index + 8 <= count; index += 8) {
         const __m256 input = _mm256_loadu_ps(left + index);
-        const __m256 exponent = fortai_expf_avx2(_mm256_sub_ps(
+        const __m256 exponent = expf_avx2(_mm256_sub_ps(
             _mm256_setzero_ps(), input));
         __m256 result = _mm256_div_ps(input, _mm256_add_ps(one, exponent));
         result = _mm256_blendv_ps(result, _mm256_setzero_ps(),
@@ -281,7 +362,7 @@ static void silu_product_scalar(float *left, const float *right, int64_t count)
 void fortai_silu_product(float *left, const float *right, int64_t count)
 {
 #if defined(__GNUC__)
-    if (__builtin_cpu_supports("avx2") && fortai_expf_avx2 != 0 && count >= 8) {
+    if (__builtin_cpu_supports("avx2") && count >= 8) {
         silu_product_avx2(left, right, count);
         return;
     }

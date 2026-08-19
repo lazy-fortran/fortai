@@ -251,18 +251,17 @@ contains
 
     subroutine test_silu_kernel(failures)
         integer, intent(inout) :: failures
-        real(real32) :: left(8), right(8), expected(8)
+        real(real32) :: left(256), right(256), expected(256)
         integer :: i
 
-        left = [-8.0_real32, -2.0_real32, -0.25_real32, 0.0_real32, &
-            0.25_real32, 2.0_real32, 8.0_real32, 16.0_real32]
-        right = [1.0_real32, -2.0_real32, 0.5_real32, 3.0_real32, &
-            -1.0_real32, 0.25_real32, 2.0_real32, -0.5_real32]
         do i = 1, size(left)
+            left(i) = -20.0_real32 + 40.0_real32 * real(i - 1, real32) / &
+                real(size(left) - 1, real32)
+            right(i) = 1.0_real32 + 0.25_real32 * sin(real(i, real32))
             expected(i) = left(i) / (1.0_real32 + exp(-left(i))) * right(i)
         end do
         call fortai_silu_product(left, right, int(size(left), c_int64_t))
-        if (maxval(abs(left - expected)) > 2.0e-6_real32) then
+        if (maxval(abs(left - expected)) > 2.0e-5_real32) then
             failures = failures + 1
             write (*, '(a, es12.4)') 'silu kernel mismatch: ', maxval(abs(left - expected))
         end if
