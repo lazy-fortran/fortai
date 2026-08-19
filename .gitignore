@@ -1,0 +1,9 @@
+.fpm/
+build/
+*.mod
+*.o
+*.a
+fortai
+*.gcda
+*.gcno
+*.profraw
