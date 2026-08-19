@@ -271,16 +271,13 @@ static float q8_dot_scalar(const int8_t *__restrict weights,
         const int64_t activation_offset = block * 34;
         const uint16_t scale_bits = (uint16_t)(uint8_t)weights[offset] |
             ((uint16_t)(uint8_t)weights[offset + 1] << 8);
-        const uint16_t activation_scale_bits =
-            (uint16_t)(uint8_t)quantized[activation_offset] |
-            ((uint16_t)(uint8_t)quantized[activation_offset + 1] << 8);
         int32_t dot = 0;
         int i;
 
         for (i = 0; i < 32; ++i)
             dot += (int32_t)weights[offset + 2 + i] *
                 (int32_t)quantized[activation_offset + 2 + i];
-        result += half_to_float(scale_bits) * half_to_float(activation_scale_bits) *
+        result += half_to_float(scale_bits) * scales[block] *
             (float)dot;
     }
     return result;
@@ -298,20 +295,19 @@ static float q8_dot_avx2(const int8_t *__restrict weights,
     int64_t offset = 0;
     int32_t block;
 
+    #if defined(__GNUC__)
+    #pragma GCC unroll 2
+    #endif
     for (block = 0; block < blocks; ++block) {
-#if defined(__GNUC__)
-        /* Keep the integer induction variable live; GCC otherwise folds the
-         * block counter into a 64-bit pointer-end comparison. */
-        __asm__ volatile("" : "+r"(block));
-#endif
         const uint16_t scale_bits = load_u16(row_start + offset);
-        const uint16_t activation_scale_bits = load_u16(activation_start + offset);
         const __m256i weight = _mm256_loadu_si256(
             (const __m256i *)(row_start + offset + 2));
         const __m256i activation = _mm256_loadu_si256(
             (const __m256i *)(activation_start + offset + 2));
-        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) *
-            _cvtsh_ss(activation_scale_bits));
+        /* The quantizer has already converted this activation scale to the
+         * exact FP32 value in scales[]. Reusing it avoids a second FP16
+         * conversion for every weight block in every matvec. */
+        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) * scales[block]);
         /* psignb(x, x) is the exact full-width sequence used by llama.cpp
          * for saturating int8 absolute values, without a separate pabsb. */
         const __m256i absolute_weight = _mm256_sign_epi8(weight, weight);
