@@ -117,31 +117,23 @@ run_llama_profile() {
     local server_log="$profile_dir/llama-${mode}-server.log"
     local output_file="$profile_dir/llama-${mode}-perf.data"
     local stat_file="$profile_dir/llama-${mode}-perf-stat.csv"
-    local -a command
-
-    if [[ "$mode" == stat ]]; then
-        command=(perf stat -D "$llama_delay_ms" -x, -e "$events" -o "$stat_file" -- "$llama_server")
-    else
-        command=(perf record -D "$llama_delay_ms" -F "$frequency" -m "$perf_mmap" \
-            --call-graph "$perf_call_graph" -o "$output_file" -- "$llama_server")
-    fi
+    local -a profiler
     if [[ -n "$llama_library_dir" ]]; then
         export LD_LIBRARY_PATH="$llama_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
 
     env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" \
         OMP_PLACES="$OMP_PLACES" CUDA_VISIBLE_DEVICES="" \
-        "${command[@]}" -m "$model_path" --host 127.0.0.1 --port "$profile_port" \
+        "$llama_server" -m "$model_path" --host 127.0.0.1 --port "$profile_port" \
         -c "$context" -ngl 0 --device none --no-op-offload \
         -t "$threads" -tb "$threads" --no-webui >"$server_log" 2>&1 &
-    active_perf_pid=$!
+    active_llama_pid=$!
 
     for attempt in $(seq 1 120); do
-        active_llama_pid=$(pgrep -P "$active_perf_pid" -x llama-server | head -n 1 || true)
         if curl -fsS "http://127.0.0.1:${profile_port}/health" >/dev/null 2>&1; then
             break
         fi
-        if ! kill -0 "$active_perf_pid" 2>/dev/null; then
+        if ! kill -0 "$active_llama_pid" 2>/dev/null; then
             echo "llama profiler exited during startup ($mode)" >&2
             return 1
         fi
@@ -151,6 +143,19 @@ run_llama_profile() {
             return 1
         fi
     done
+
+    if [[ "$mode" == stat ]]; then
+        profiler=(perf stat -x, -e "$events" -o "$stat_file" -p "$active_llama_pid")
+    else
+        profiler=(perf record -F "$frequency" -m "$perf_mmap" \
+            --call-graph "$perf_call_graph" -o "$output_file" -p "$active_llama_pid")
+    fi
+    if [[ "$llama_delay_ms" != 0 ]]; then
+        profiler=(perf "${profiler[@]:1}" -D "$llama_delay_ms")
+    fi
+    "${profiler[@]}" >"$profile_dir/llama-${mode}-perf.log" 2>&1 &
+    active_perf_pid=$!
+    sleep 1
 
     curl -fsS "http://127.0.0.1:${profile_port}/completion" \
         -H 'Content-Type: application/json' \
@@ -166,6 +171,9 @@ print(json.dumps({
 PY
 )" >"$response"
 
+    kill -INT "$active_perf_pid" 2>/dev/null || true
+    wait "$active_perf_pid" 2>/dev/null || true
+    active_perf_pid=""
     cleanup
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${profile_port}$"; then
         echo "llama cleanup failed on port $profile_port" >&2
@@ -197,6 +205,10 @@ if [[ -n "$llama_cpu_library" ]]; then
 fi
 
 for report in "$profile_dir/fortai-perf-report.txt" "$profile_dir/llama-perf-report.txt"; do
+    if ! rg -q '^# Samples: [1-9]' "$report"; then
+        echo "profile contains no samples: $report" >&2
+        exit 1
+    fi
     if rg -q '^# Total Lost Samples: [1-9]' "$report"; then
         echo "profile contains lost samples: $report" >&2
         exit 1
