@@ -4,10 +4,10 @@ FortAI is a Fortran-native AI runtime for model loading, execution planning,
 sampling, and architecture-specialized accelerator backends.
 
 The first release is a small, buildable foundation. It contains the public
-runtime types, a deterministic byte tokenizer, a greedy sampler, a CPU
-reference matvec, a minimal GGUF header reader, and contracts for model and
-execution plans. CUDA, Metal, MLX, HIP, SYCL, Vulkan, and TinyGPU backends are
-reserved for measured implementations.
+runtime types, a deterministic byte tokenizer, a greedy sampler, an OpenMP and
+SIMD-enabled CPU reference matvec, a minimal GGUF header reader, and contracts
+for model and execution plans. CUDA, Metal, MLX, HIP, SYCL, Vulkan, and TinyGPU
+backends are reserved for measured implementations.
 
 ## Design
 
@@ -46,6 +46,13 @@ fpm test
 fpm run -- --version
 ```
 
+For the native CPU candidate build:
+
+```bash
+tools/build_native.sh
+benchmark/run_cpu_reference.sh
+```
+
 The local Lazy Fortran workflow is also supported:
 
 ```bash
@@ -60,8 +67,11 @@ path.
 
 Version 0.1.0 is an API and reference-kernel seed. It is suitable for building
 the contracts around GGUF, ModelIR, PlanIR, CPU execution, and independent
-tests. It is not yet a production LLM runtime and it does not claim accelerator
-performance.
+tests. It is not yet a model-level LLM runtime and it does not claim
+accelerator or llama.cpp performance. See [ROADMAP.md](ROADMAP.md).
+
+FortAI will only promote a production candidate for a named workload after it
+matches or beats the fastest fair competing harness under the same conditions.
 
 ## License
 

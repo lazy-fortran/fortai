@@ -1,0 +1,8 @@
+# name<TAB>url<TAB>ref<TAB>license
+llama.cpp	https://github.com/ggml-org/llama.cpp.git	master	MIT
+transformers	https://github.com/huggingface/transformers.git	main	Apache-2.0
+mlx	https://github.com/ml-explore/mlx.git	main	MIT
+tinygrad	https://github.com/tinygrad/tinygrad.git	master	MIT
+hipfort	https://github.com/ROCm/hipfort.git	develop	MIT-X11
+occa	https://github.com/libocca/occa.git	main	MIT
+Qwen3	https://github.com/QwenLM/Qwen3.git	main	Apache-2.0

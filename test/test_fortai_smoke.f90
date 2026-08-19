@@ -1,7 +1,7 @@
 program test_fortai_smoke
     use, intrinsic :: iso_fortran_env, only: int32, int64, real64
     use fortai_arena, only: arena_t
-    use fortai_backend_cpu, only: cpu_matvec
+    use fortai_backend_cpu, only: cpu_matvec, cpu_matvec_inplace
     use fortai_cache, only: cache_path, pack_key_t
     use fortai_device, only: device_cpu, device_t
     use fortai_gguf, only: gguf_validate_header
@@ -63,6 +63,7 @@ contains
     subroutine test_cpu_matvec(failures)
         integer, intent(inout) :: failures
         real(real64) :: matrix(2, 2), vector(2)
+        real(real64) :: inplace_result(2)
         real(real64), allocatable :: result(:)
         type(status_t) :: stat
 
@@ -75,6 +76,10 @@ contains
             'CPU matvec first row', failures)
         call require(abs(result(2) - 39.0_real64) < 1.0e-12_real64, &
             'CPU matvec second row', failures)
+        call cpu_matvec_inplace(matrix, vector, inplace_result, stat)
+        call require(stat%is_ok(), 'in-place CPU matvec status', failures)
+        call require(maxval(abs(inplace_result - result)) < 1.0e-12_real64, &
+            'in-place CPU matvec agrees with allocating path', failures)
     end subroutine test_cpu_matvec
 
     subroutine test_tokenizer(failures)

@@ -7,3 +7,8 @@ fortai
 *.gcda
 *.gcno
 *.profraw
+benchmark/results/
+benchmark/logs/
+.provenance/src/
+.provenance/downloads/
+.provenance/records/

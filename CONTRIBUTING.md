@@ -38,6 +38,11 @@ The runtime must return an explicit unsupported status when a backend cannot
 execute a requested operation. Silent host fallback obscures performance and
 correctness evidence.
 
+Production promotion requires a fair competitor measurement. Record the exact
+model, quantization, device, context, batch, prompt workload, compiler, and
+runtime versions. A candidate that is slower than the fastest reproducible
+competitor remains experimental.
+
 ## Provenance
 
 Original FortAI code is MIT licensed. Copied code and generated bindings need a

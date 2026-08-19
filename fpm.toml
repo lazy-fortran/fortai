@@ -9,6 +9,12 @@ copyright = "Copyright 2026, lazy-fortran contributors"
 [build]
 auto-tests = true
 
+[profiles]
+native = ["native"]
+
+[features]
+native.flags = "-O3 -march=native -mtune=native -funroll-loops -fopenmp -ffast-math -fno-math-errno -flto"
+
 [fortran]
 implicit-typing = false
 implicit-external = false
