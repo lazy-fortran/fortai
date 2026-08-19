@@ -9,6 +9,7 @@ extern "C" {
 
 typedef struct fortai_cuda_q8_context fortai_cuda_q8_context;
 typedef struct fortai_cuda_q8_weights fortai_cuda_q8_weights;
+typedef struct fortai_cuda_qwen35_recurrent fortai_cuda_qwen35_recurrent;
 
 enum {
     FORTAI_CUDA_OK = 0,
@@ -64,6 +65,41 @@ int fortai_cuda_q8_matvec_host_triplet(fortai_cuda_q8_context *context,
     size_t activation_bytes, float *first_output, size_t first_output_bytes,
     float *second_output, size_t second_output_bytes, float *third_output,
     size_t third_output_bytes, float *elapsed_ms);
+
+int fortai_cuda_q8_matvec_host_triplet_contiguous(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *first_weights,
+    const fortai_cuda_q8_weights *second_weights,
+    const fortai_cuda_q8_weights *third_weights, const void *host_activation,
+    size_t activation_bytes, float *host_output, size_t host_output_bytes,
+    float *elapsed_ms);
+
+int fortai_cuda_q8_ffn_host(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *gate_weights,
+    const fortai_cuda_q8_weights *up_weights,
+    const fortai_cuda_q8_weights *down_weights, const void *host_activation,
+    size_t activation_bytes, float *host_output, size_t output_bytes,
+    float *elapsed_ms);
+
+/* A Qwen3.5 recurrent layer keeps its convolution and GDN state on-device.
+ * The run call accepts one host Q8 activation and returns only the layer
+ * output after the recurrent projection; all intermediate projections,
+ * convolution, GDN update, and ssm output GEMV stay on the CUDA stream. */
+int fortai_cuda_qwen35_recurrent_create(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *qkv_weights,
+    const fortai_cuda_q8_weights *gate_weights,
+    const fortai_cuda_q8_weights *alpha_weights,
+    const fortai_cuda_q8_weights *beta_weights,
+    const fortai_cuda_q8_weights *output_weights,
+    const void *conv_weights, size_t conv_weight_bytes, int conv_size, int conv_kernel,
+    const void *ssm_a, size_t ssm_a_bytes, const void *ssm_dt, size_t ssm_dt_bytes,
+    const void *ssm_norm, size_t ssm_norm_bytes, int state_size, int key_heads,
+    int value_heads, int head_size, int inner_size, float norm_epsilon,
+    fortai_cuda_qwen35_recurrent **layer);
+int fortai_cuda_qwen35_recurrent_destroy(fortai_cuda_qwen35_recurrent *layer);
+int fortai_cuda_qwen35_recurrent_reset(fortai_cuda_qwen35_recurrent *layer);
+int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *layer,
+    const void *host_activation, size_t activation_bytes, float *host_output,
+    size_t output_bytes, float *elapsed_ms);
 
 const char *fortai_cuda_q8_last_error(const fortai_cuda_q8_context *context);
 

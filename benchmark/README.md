@@ -79,7 +79,11 @@ benchmark/profile_qwen35_cuda_llama.sh \
 
 This path uploads Q8 weights once but still transfers each activation and
 output around each matvec. Paired and triplet projections reuse one activation
-upload, reducing measured copy calls, but the path remains host-controlled.
+upload, and attention Q/K/V triplets use one contiguous device-to-host copy.
+Recurrent layers keep convolution/GDN state and their projections resident;
+the FFN path fuses gate/up projection, SiLU-product, requantization, and the
+down projection on the device. The path remains host-controlled at layer
+boundaries.
 Its results are retained as integration evidence and explicitly marked
 `not_promoted_host_transfers`; the production CUDA gate requires device-resident
 activations and fused recurrent/attention work.
@@ -89,6 +93,17 @@ summaries for FortAI and llama.cpp under one provenance directory. The current
 paired profile shows FortAI making thousands of activation/output copies while
 llama.cpp keeps the graph resident and uses fused `mul_mat_vec_q` and
 `gated_delta_net_cuda` work; that is the actionable CUDA gap.
+
+The standalone recurrent-kernel harness uses an independent scalar CPU oracle,
+checks both state and output, and compares a four-launch decomposition with a
+one-launch fused recurrence:
+
+```bash
+FORTAI_CUDA_DEVICE=0 benchmark/run_cuda_gdn_ar_bench.sh
+```
+
+It records device-only CUDA-event timing, source/worktree digests, compiler,
+driver, GPU identity, and fixture metadata under `benchmark/results`.
 
 ## Repeated runs, medians, and variance
 
