@@ -25,6 +25,14 @@ module fortai_gguf_runtime
             integer(c_int64_t), value, intent(in) :: count
         end subroutine fortai_q8_quantize
 
+        subroutine fortai_q8_dequantize_row(weights, values, block_count) &
+                bind(C, name='fortai_q8_dequantize_row')
+            import c_float, c_int8_t, c_int64_t
+            integer(c_int8_t), intent(in) :: weights(*)
+            real(c_float), intent(out) :: values(*)
+            integer(c_int64_t), value, intent(in) :: block_count
+        end subroutine fortai_q8_dequantize_row
+
     end interface
 
     integer(int32), parameter, public :: GGML_TYPE_F32 = 0_int32
@@ -316,7 +324,7 @@ contains
         subroutine gguf_tensor_get_row(self, row, values, stat)
             class(gguf_tensor_t), intent(in) :: self
             integer(int64), intent(in) :: row
-            real(real32), intent(out) :: values(:)
+            real(real32), contiguous, intent(out) :: values(:)
             type(status_t), intent(out) :: stat
             integer(int64) :: i, width
 
@@ -328,6 +336,11 @@ contains
             width = self%shape(1)
             if (row < 1_int64 .or. row > self%shape(2) .or. size(values) /= width) then
                 call stat%set(FORTAI_INVALID, 'GGUF tensor row has the wrong shape')
+                return
+            end if
+            if (self%value_type == GGML_TYPE_Q8_0) then
+                call fortai_q8_dequantize_row(self%bytes((row - 1_int64) * &
+                    (width / 32_int64) * 34_int64 + 1_int64:), values, width / 32_int64)
                 return
             end if
             do i = 1, width

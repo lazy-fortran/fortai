@@ -215,7 +215,7 @@ contains
         type(gguf_tensor_t) :: tensor, second, third
         type(status_t) :: stat
         integer(int8) :: quantized(34)
-        real(real32) :: scales(1), vector(32), output(1), second_output(2), third_output(1)
+        real(real32) :: scales(1), vector(32), output(1), second_output(2), third_output(1), row_values(32)
         integer :: i, row
 
         tensor%value_type = GGML_TYPE_Q8_0
@@ -232,6 +232,10 @@ contains
         ! Q8_0 activation scales are stored as FP16, matching llama.cpp.
         call require(abs(real(output(1), real64) - 527.9677734375_real64) < 1.0e-4_real64, &
             'Q8 activation matvec independent oracle', failures)
+        call tensor%get_row(1_int64, row_values, stat)
+        call require(stat%is_ok(), 'Q8 row dequantization status', failures)
+        call require(maxval(abs(real(row_values, real64) - real([(i, i = 1, 32)], real64))) < &
+            1.0e-5_real64, 'Q8 row dequantization independent oracle', failures)
 
         second%value_type = GGML_TYPE_Q8_0
         second%shape = [32_int64, 2_int64]

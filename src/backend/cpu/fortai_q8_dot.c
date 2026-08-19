@@ -82,17 +82,6 @@ static inline float half_to_float(uint16_t value)
     }
 }
 
-/* Matches llama.cpp's CPU FP16 decode table. */
-static float fortai_f16_table[1u << 16];
-
-__attribute__((constructor))
-static void fortai_init_f16_table(void)
-{
-    uint32_t value;
-    for (value = 0; value < (1u << 16); ++value)
-        fortai_f16_table[value] = half_to_float((uint16_t)value);
-}
-
 static inline uint16_t float_to_half(float value)
 {
     uint32_t bits;
@@ -223,6 +212,53 @@ void fortai_q8_quantize(const float *__restrict input,
     q8_quantize_scalar(input, output, scales, count);
 }
 
+static void q8_dequantize_row_scalar(const int8_t *__restrict weights,
+    float *__restrict output, int64_t block_count)
+{
+    int64_t block;
+    for (block = 0; block < block_count; ++block) {
+        const int64_t offset = block * 34;
+        const uint16_t scale_bits = load_u16(weights + offset);
+        const float scale = half_to_float(scale_bits);
+        int i;
+        for (i = 0; i < 32; ++i)
+            output[block * 32 + i] = scale * (float)weights[offset + 2 + i];
+    }
+}
+
+__attribute__((target("avx2,f16c,fma")))
+static void q8_dequantize_row_avx2(const int8_t *__restrict weights,
+    float *__restrict output, int64_t block_count)
+{
+    int64_t block;
+    for (block = 0; block < block_count; ++block) {
+        const int64_t input_offset = block * 34;
+        const int64_t output_offset = block * 32;
+        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(
+            load_u16(weights + input_offset)));
+        int part;
+        for (part = 0; part < 4; ++part) {
+            const __m128i q8 = _mm_loadl_epi64((const __m128i *)
+                (weights + input_offset + 2 + part * 8));
+            const __m256i q32 = _mm256_cvtepi8_epi32(q8);
+            const __m256 values = _mm256_mul_ps(scale, _mm256_cvtepi32_ps(q32));
+            _mm256_storeu_ps(output + output_offset + part * 8, values);
+        }
+    }
+}
+
+void fortai_q8_dequantize_row(const int8_t *__restrict weights,
+    float *__restrict output, int64_t block_count)
+{
+#if defined(__GNUC__)
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c")) {
+        q8_dequantize_row_avx2(weights, output, block_count);
+        return;
+    }
+#endif
+    q8_dequantize_row_scalar(weights, output, block_count);
+}
+
 static float q8_dot_scalar(const int8_t *__restrict weights,
     const int8_t *__restrict quantized, const float *__restrict scales,
     int64_t row, int64_t block_count)
@@ -274,8 +310,8 @@ static float q8_dot_avx2(const int8_t *__restrict weights,
             (const __m256i *)(row_start + offset + 2));
         const __m256i activation = _mm256_loadu_si256(
             (const __m256i *)(activation_start + offset + 2));
-        const __m256 scale = _mm256_set1_ps(fortai_f16_table[scale_bits] *
-            fortai_f16_table[activation_scale_bits]);
+        const __m256 scale = _mm256_set1_ps(_cvtsh_ss(scale_bits) *
+            _cvtsh_ss(activation_scale_bits));
         /* psignb(x, x) is the exact full-width sequence used by llama.cpp
          * for saturating int8 absolute values, without a separate pabsb. */
         const __m256i absolute_weight = _mm256_sign_epi8(weight, weight);
@@ -303,7 +339,7 @@ float fortai_q8_dot(const int8_t *__restrict weights,
     int64_t row, int64_t block_count)
 {
 #if defined(__GNUC__)
-    if (__builtin_cpu_supports("avx2"))
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c"))
         return q8_dot_avx2(weights, quantized, scales, row, block_count);
 #endif
     return q8_dot_scalar(weights, quantized, scales, row, block_count);
@@ -333,6 +369,9 @@ static void gdn_step_avx2(float *state, const float *key, const float *value,
         __m256 key_dot = _mm256_setzero_ps();
         int64_t column;
 
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
         for (column = 0; column < head_size; column += 8) {
             const __m256 state_values = _mm256_loadu_ps(state_row + column);
             const __m256 key_values = _mm256_loadu_ps(key + column);
@@ -346,6 +385,9 @@ static void gdn_step_avx2(float *state, const float *key, const float *value,
             const __m256 delta_vector = _mm256_set1_ps(delta);
             __m256 query_dot = _mm256_setzero_ps();
 
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
             for (column = 0; column < head_size; column += 8) {
                 __m256 state_values = _mm256_loadu_ps(state_row + column);
                 const __m256 key_values = _mm256_loadu_ps(key + column);
