@@ -439,19 +439,34 @@ contains
         real(real32) :: accumulator, beta, decay, decay_factor, norm_factor
 
         call stat % clear()
-        call layer_matvec(self, layer%attn_qkv, input, self%qkv_work(1:self%recurrent_conv_size), &
-            self % recurrent_conv_size, stat)
-        if (.not. stat % is_ok()) return
-        call layer_matvec(self, layer%attn_gate, input, self%gate_work(1:self%recurrent_inner_size), &
-            self % recurrent_inner_size, stat)
-        if (.not. stat % is_ok()) return
+        if (cuda_recurrent_projection_ready(self, layer)) then
+            if (mod(size(input), 32) /= 0) then
+                call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA Q8 input is not block aligned')
+                return
+            end if
+            call fortai_q8_quantize(input, self%quantized_input, self%quantized_scales, &
+                int(size(input), c_int64_t))
+            call cuda_model_matvec_pair_quantized(self, layer%attn_qkv, layer%attn_gate, size(input), &
+                self%qkv_work(1:self%recurrent_conv_size), self%gate_work(1:self%recurrent_inner_size), stat)
+            if (.not. stat%is_ok()) return
+            call cuda_model_matvec_pair_quantized(self, layer%ssm_alpha, layer%ssm_beta, size(input), &
+                self%alpha_work, self%beta_work, stat)
+            if (.not. stat%is_ok()) return
+        else
+            call layer_matvec(self, layer%attn_qkv, input, self%qkv_work(1:self%recurrent_conv_size), &
+                self % recurrent_conv_size, stat)
+            if (.not. stat % is_ok()) return
+            call layer_matvec(self, layer%attn_gate, input, self%gate_work(1:self%recurrent_inner_size), &
+                self % recurrent_inner_size, stat)
+            if (.not. stat % is_ok()) return
+            call layer_matvec(self, layer % ssm_alpha, input, self % alpha_work, &
+                self % recurrent_value_heads, stat)
+            if (.not. stat % is_ok()) return
+            call layer_matvec(self, layer % ssm_beta, input, self % beta_work, &
+                self % recurrent_value_heads, stat)
+            if (.not. stat % is_ok()) return
+        end if
         call fortai_silu(self % gate_work, int(self % recurrent_inner_size, c_int64_t))
-        call layer_matvec(self, layer % ssm_alpha, input, self % alpha_work, &
-            self % recurrent_value_heads, stat)
-        if (.not. stat % is_ok()) return
-        call layer_matvec(self, layer % ssm_beta, input, self % beta_work, &
-            self % recurrent_value_heads, stat)
-        if (.not. stat % is_ok()) return
 
         do channel = 1, self % recurrent_conv_size
             accumulator = 0.0_real32
@@ -516,6 +531,30 @@ contains
         end do
         call model_matvec(self, layer%ssm_out, self%attention_work, self%hidden_work, stat)
     end subroutine forward_recurrent
+
+    logical function cuda_recurrent_projection_ready(self, layer)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        type(qwen35_cpu_layer_t), intent(in) :: layer
+
+        cuda_recurrent_projection_ready = .false.
+        if (.not. self%cuda_enabled) return
+        if (.not. allocated(self%file%tensors)) return
+        if (layer%attn_qkv <= 0 .or. layer%attn_gate <= 0 .or. layer%ssm_alpha <= 0 .or. &
+                layer%ssm_beta <= 0) return
+        if (self%file%tensors(layer%attn_qkv)%value_type /= GGML_TYPE_Q8_0) return
+        if (self%file%tensors(layer%attn_gate)%value_type /= GGML_TYPE_Q8_0) return
+        if (self%file%tensors(layer%ssm_alpha)%value_type /= GGML_TYPE_Q8_0) return
+        if (self%file%tensors(layer%ssm_beta)%value_type /= GGML_TYPE_Q8_0) return
+        if (.not. allocated(self%file%tensors(layer%attn_qkv)%shape)) return
+        if (.not. allocated(self%file%tensors(layer%attn_gate)%shape)) return
+        if (.not. allocated(self%file%tensors(layer%ssm_alpha)%shape)) return
+        if (.not. allocated(self%file%tensors(layer%ssm_beta)%shape)) return
+        if (size(self%file%tensors(layer%attn_qkv)%shape) /= 2) return
+        if (size(self%file%tensors(layer%attn_gate)%shape) /= 2) return
+        if (size(self%file%tensors(layer%ssm_alpha)%shape) /= 2) return
+        if (size(self%file%tensors(layer%ssm_beta)%shape) /= 2) return
+        cuda_recurrent_projection_ready = .true.
+    end function cuda_recurrent_projection_ready
 
     subroutine forward_attention(self, layer, position, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
