@@ -1,7 +1,8 @@
 # Roadmap
 
-The current delivery target is a CPU reference path with native compilation,
-OpenMP parallelism, SIMD directives, and reproducible benchmark tooling.
+The current delivery target is a CPU reference path plus a measured resident
+CUDA kernel, with native compilation, OpenMP parallelism, SIMD directives, and
+reproducible benchmark tooling.
 
 ## CPU path
 
@@ -11,7 +12,7 @@ OpenMP parallelism, SIMD directives, and reproducible benchmark tooling.
 | FAI-CPU-001B | Qwen3.5-2B CPU scaling path | experimental | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-001C | Qwen3.5-4B CPU scaling path | experimental | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-002 | CPU logits parity and tokenizer path | open | token-by-token logits agree with an independent oracle |
-| FAI-CPU-003 | native CPU candidate tournament | open | compiler flags, thread count, and winner recorded |
+| FAI-CPU-003 | native CPU candidate tournament | in progress | compiler flags, thread count, and winner recorded |
 | FAI-CPU-MOE-001 | CPU MoE execution for Qwen3.6-35B | deferred | expert routing, resident weights, and llama.cpp comparison |
 
 The CPU implementation should use the available compiler features for the
@@ -23,7 +24,7 @@ math flags belong to measured candidate builds, not the correctness oracle.
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
-| FAI-CUDA-001 | single-device CUDA backend | deferred | CPU parity and resident-device benchmark |
+| FAI-CUDA-001 | single-device CUDA backend | in progress (Q8 GEMV) | independent oracle and matched resident llama.cpp operation; full model wiring remains open |
 | FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | deferred | two-device placement, transfer accounting, and stable generation |
 | FAI-CUDA-002 | Q4 repack and fused GDN kernels | deferred | validated kernel tournament on named GPUs |
 | FAI-CUDA-003 | CUDA MTP and speculative decoding | deferred | acceptance rate and end-to-end throughput |
@@ -53,7 +54,10 @@ No FortAI versus llama.cpp performance claim is valid until FortAI has a
 model-level forward and decode path. Kernel microbenchmarks and model-level
 token benchmarks must remain separate.
 
-The tracked trace verifier currently matches the 0.8B Q8_0 fixture for the
-eight-token oracle run beginning at token 9419. Throughput remains diagnostic
-until the named workload performance gate is passed; the current CPU profile
-shows a real gap against llama.cpp that is being optimized under FAI-CPU-003.
+The tracked trace verifier matches the 0.8B Q8_0 fixture for the eight-token
+oracle run beginning at token 9419. Current CPU evidence covers 0.8B, 2B, and
+4B Q8_0 model-level runs with the server stopped and sequential execution.
+The CUDA evidence is deliberately scoped to a resident Q8 GEMV operation; it
+does not claim a complete Qwen model backend. Nsight Compute is attempted and
+its permission result is retained; Nsight Systems remains the fallback timing
+profile when GPU performance-counter access is unavailable.

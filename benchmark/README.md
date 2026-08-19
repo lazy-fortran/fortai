@@ -37,6 +37,25 @@ initialize; the wrapper therefore also exports `CUDA_VISIBLE_DEVICES=""` and,
 when `nvidia-smi` is available, fails if the server appears as a GPU compute
 process. The result JSON records `cuda_visible_devices`.
 
+## Resident CUDA kernel
+
+The CUDA comparator measures the resident Q8 GEMV operation against the
+installed llama.cpp `ggml-cuda` implementation on identical deterministic
+Q8 data. It is a kernel gate, not a complete Qwen model benchmark:
+
+```bash
+CUDA_DEVICE=0 benchmark/compare_cuda_q8.sh
+CUDA_DEVICE=1 FORTAI_CUDA_ROWS=2048 FORTAI_CUDA_WIDTH=8192 \
+  benchmark/compare_cuda_q8.sh
+CUDA_DEVICE=0 FORTAI_CUDA_ITERATIONS=100 FORTAI_CUDA_WARMUP=20 \
+  benchmark/profile_cuda_q8.sh
+```
+
+The profiler retains raw Nsight Compute diagnostics and Nsight Systems
+reports. `ERR_NVGPUCTRPERM` is recorded when the host denies performance
+counter access; it does not invalidate the CUDA-event timing or correctness
+gate.
+
 ## Repeated runs, medians, and variance
 
 Single measurements are not evidence. `repeat_compare_qwen35_cpu.sh` runs the

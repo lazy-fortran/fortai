@@ -6,8 +6,9 @@ sampling, and architecture-specialized accelerator backends.
 The first delivery is a buildable Qwen3.5 CPU reference path. It contains the
 public runtime types, GGUF Q8_0 loading, Qwen3.5 hybrid recurrent/full-attention
 execution for the 0.8B, 2B, and 4B model family, native OpenMP/SIMD matvecs,
-and persistent benchmark/provenance tooling. CUDA, Metal, MLX, HIP, SYCL,
-Vulkan, and TinyGPU backends remain reserved for measured implementations.
+and persistent benchmark/provenance tooling. The first CUDA Q8 resident GEMV
+kernel is now measured on RTX 5060 Ti; the complete model backends remain
+staged behind explicit acceptance gates.
 
 ## Design
 
@@ -72,6 +73,12 @@ OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu.sh \
 # collect matched decode-only perf profiles for FortAI and llama.cpp
 OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu_both.sh \
   .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
+
+# build and compare the resident CUDA Q8 GEMV kernel with llama.cpp ggml-cuda
+benchmark/compare_cuda_q8.sh
+
+# retain Nsight Compute (when GPU counters are permitted) and Nsight Systems data
+benchmark/profile_cuda_q8.sh
 ```
 
 The comparison and paired-profile scripts refuse to start when another
@@ -102,9 +109,11 @@ and their provenance logic are tracked.
 ## Status
 
 Version 0.1.0 includes an experimental model-level Qwen3.5 CPU runtime for
-Q8_0 GGUF. Its behavior and throughput are benchmarked against llama.cpp by
-persistent scripts, but it is not promoted for production until the named
-workload performance gate is passed. CUDA and multi-GPU Qwen3.8-27B remain on
+Q8_0 GGUF and a resident CUDA Q8 GEMV kernel. The CPU path is benchmarked
+against llama.cpp on the 0.8B, 2B, and 4B fixtures; the CUDA kernel is matched
+against llama.cpp's ggml-cuda operation on identical resident data. Neither
+is promoted as a complete production model backend until the named workload
+gate passes. Full CUDA Qwen3.8-27B and its required multi-GPU split remain on
 the roadmap. See [ROADMAP.md](ROADMAP.md).
 
 FortAI will only promote a production candidate for a named workload after it
