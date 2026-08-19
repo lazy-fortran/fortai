@@ -73,6 +73,8 @@ OMP_NUM_THREADS=2 benchmark/compare_qwen35_cuda_llama.sh \
   "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
 benchmark/profile_qwen35_cuda.sh \
   "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
+benchmark/profile_qwen35_cuda_llama.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
 ```
 
 This path uploads Q8 weights once but still transfers each activation and
@@ -81,6 +83,12 @@ upload, reducing measured copy calls, but the path remains host-controlled.
 Its results are retained as integration evidence and explicitly marked
 `not_promoted_host_transfers`; the production CUDA gate requires device-resident
 activations and fused recurrent/attention work.
+
+The `_llama` profiler stores paired Nsight Systems reports and API/kernel CSV
+summaries for FortAI and llama.cpp under one provenance directory. The current
+paired profile shows FortAI making thousands of activation/output copies while
+llama.cpp keeps the graph resident and uses fused `mul_mat_vec_q` and
+`gated_delta_net_cuda` work; that is the actionable CUDA gap.
 
 ## Repeated runs, medians, and variance
 
