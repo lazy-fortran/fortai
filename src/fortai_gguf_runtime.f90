@@ -60,6 +60,7 @@ module fortai_gguf_runtime
         procedure :: get_row => gguf_tensor_get_row
         procedure :: matvec => gguf_tensor_matvec
         procedure :: matvec_pair_q8 => gguf_tensor_matvec_pair_q8
+        procedure :: matvec_triplet_q8 => gguf_tensor_matvec_triplet_q8
         procedure :: matvec_q8 => gguf_tensor_matvec_q8
         procedure :: value => gguf_tensor_value
     end type gguf_tensor_t
@@ -513,6 +514,92 @@ contains
                 !$omp end parallel do
             end if
         end subroutine gguf_tensor_matvec_pair_q8
+
+        subroutine gguf_tensor_matvec_triplet_q8(self, second, third, vector, values, &
+                second_values, third_values, quantized, scales, stat)
+            class(gguf_tensor_t), intent(in) :: self, second, third
+            real(real32), intent(in) :: vector(:)
+            real(real32), intent(out) :: values(:), second_values(:), third_values(:)
+            integer(int8), contiguous, intent(out) :: quantized(:)
+            real(real32), contiguous, intent(out) :: scales(:)
+            type(status_t), intent(out) :: stat
+            integer(int64) :: block, row, total_rows, first_rows, second_rows
+            integer(int64) :: block_count, index
+            real(real32) :: maximum, scale
+
+            call stat%clear()
+            if (self%value_type /= GGML_TYPE_Q8_0 .or. second%value_type /= GGML_TYPE_Q8_0 &
+                .or. third%value_type /= GGML_TYPE_Q8_0) then
+                call stat%set(FORTAI_UNSUPPORTED, 'triplet activation matvec needs Q8_0 tensors')
+                return
+            end if
+            if (size(self%shape) /= 2 .or. size(second%shape) /= 2 .or. &
+                size(third%shape) /= 2) then
+                call stat%set(FORTAI_INVALID, 'triplet matvec dimensions do not agree')
+                return
+            end if
+            if (self%shape(1) /= second%shape(1) .or. self%shape(1) /= third%shape(1) .or. &
+                size(vector) /= self%shape(1) .or. size(values) /= self%shape(2) .or. &
+                size(second_values) /= second%shape(2) .or. &
+                size(third_values) /= third%shape(2) .or. mod(size(vector), 32) /= 0 .or. &
+                size(quantized) < size(vector) .or. &
+                size(scales) < (size(vector) + 31) / 32) then
+                call stat%set(FORTAI_INVALID, 'triplet matvec dimensions do not agree')
+                return
+            end if
+            block_count = size(vector) / 32
+            do block = 0, block_count - 1
+                maximum = maxval(abs(vector(block * 32 + 1:(block + 1) * 32)))
+                if (maximum > 0.0_real32) then
+                    scale = maximum / 127.0_real32
+                    scales(block + 1) = scale
+                    quantized(block * 32 + 1:(block + 1) * 32) = int(max(-127, min(127, &
+                        nint(vector(block * 32 + 1:(block + 1) * 32) / scale))), int8)
+                else
+                    scales(block + 1) = 0.0_real32
+                    quantized(block * 32 + 1:(block + 1) * 32) = 0_int8
+                end if
+            end do
+
+            first_rows = self%shape(2)
+            second_rows = second%shape(2)
+            total_rows = first_rows + second_rows + third%shape(2)
+            if (total_rows < 128_int64) then
+                do index = 1, total_rows
+                    if (index <= first_rows) then
+                        values(index) = fortai_q8_dot(self%bytes, quantized, scales, &
+                            int(index - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    else if (index <= first_rows + second_rows) then
+                        row = index - first_rows
+                        second_values(row) = fortai_q8_dot(second%bytes, quantized, scales, &
+                            int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    else
+                        row = index - first_rows - second_rows
+                        third_values(row) = fortai_q8_dot(third%bytes, quantized, scales, &
+                            int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    end if
+                end do
+            else
+                !$omp parallel do default(none) shared(self, second, third, quantized, scales, &
+                !$omp& values, second_values, third_values, first_rows, second_rows, total_rows, &
+                !$omp& block_count) private(index, row) schedule(static)
+                do index = 1, total_rows
+                    if (index <= first_rows) then
+                        values(index) = fortai_q8_dot(self%bytes, quantized, scales, &
+                            int(index - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    else if (index <= first_rows + second_rows) then
+                        row = index - first_rows
+                        second_values(row) = fortai_q8_dot(second%bytes, quantized, scales, &
+                            int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    else
+                        row = index - first_rows - second_rows
+                        third_values(row) = fortai_q8_dot(third%bytes, quantized, scales, &
+                            int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    end if
+                end do
+                !$omp end parallel do
+            end if
+        end subroutine gguf_tensor_matvec_triplet_q8
 
         subroutine read_metadata_value(unit, value_type, value, io_status)
             integer, intent(in) :: unit

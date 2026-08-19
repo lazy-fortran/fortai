@@ -212,11 +212,11 @@ contains
 
     subroutine test_gguf_q8_matvec(failures)
         integer, intent(inout) :: failures
-        type(gguf_tensor_t) :: tensor
+        type(gguf_tensor_t) :: tensor, second, third
         type(status_t) :: stat
         integer(int8) :: quantized(32)
-        real(real32) :: scales(1), vector(32), output(1)
-        integer :: i
+        real(real32) :: scales(1), vector(32), output(1), second_output(2), third_output(1)
+        integer :: i, row
 
         tensor%value_type = GGML_TYPE_Q8_0
         tensor%shape = [32_int64, 1_int64]
@@ -231,6 +231,32 @@ contains
         call require(stat%is_ok(), 'Q8 activation matvec status', failures)
         call require(abs(real(output(1), real64) - 528.0_real64) < 1.0e-4_real64, &
             'Q8 activation matvec independent oracle', failures)
+
+        second%value_type = GGML_TYPE_Q8_0
+        second%shape = [32_int64, 2_int64]
+        allocate (second%bytes(68))
+        second%bytes = 0_int8
+        third%value_type = GGML_TYPE_Q8_0
+        third%shape = [32_int64, 1_int64]
+        allocate (third%bytes(34))
+        third%bytes = 0_int8
+        do row = 0, 1
+            second%bytes(row * 34 + 1) = int(z'00', int8)
+            second%bytes(row * 34 + 2) = int(z'3c', int8)
+            do i = 1, 32
+                second%bytes(row * 34 + i + 2) = int((row + 1) * i, int8)
+            end do
+        end do
+        third%bytes(2) = int(z'3c', int8)
+        do i = 1, 32
+            third%bytes(i + 2) = int(3 * i, int8)
+        end do
+        call tensor%matvec_triplet_q8(second, third, vector, output, second_output, &
+            third_output, quantized, scales, stat)
+        call require(stat%is_ok(), 'Q8 triplet activation matvec status', failures)
+        call require(maxval(abs(real([output(1), second_output, third_output], real64) - &
+            [528.0_real64, 528.0_real64, 1056.0_real64, 1584.0_real64])) < 1.0e-4_real64, &
+            'Q8 triplet activation matvec independent oracle', failures)
     end subroutine test_gguf_q8_matvec
 
     subroutine test_gdn_kernel(failures)

@@ -56,6 +56,16 @@ Summaries land in `benchmark/results/repeat_<model>_<stamp>.json` (ignored,
 like all results). Fix `OMP_NUM_THREADS`, steps, and context explicitly when
 citing numbers; compare medians and report the spread beside them.
 
+For the independent greedy decode gate, run:
+
+```bash
+OMP_NUM_THREADS=4 benchmark/check_qwen35_cpu_trace.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 8 128
+```
+
+This asks llama.cpp for top-token IDs and compares them with FortAI's optional
+per-step trace. A nonzero exit is expected until Qwen3.5 model parity closes.
+
 ## Promotion rule
 
 FortAI is promoted for a named model, quantization, device, context, batch, and

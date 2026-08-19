@@ -10,7 +10,13 @@ bash -n "$root_dir/benchmark/compare_qwen35_cpu_llama.sh"
 bash -n "$root_dir/benchmark/repeat_compare_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/tune_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/profile_qwen35_cpu.sh"
+bash -n "$root_dir/benchmark/check_qwen35_cpu_trace.sh"
 bash -n "$root_dir/.provenance/fetch_models.sh"
+"$root_dir/tools/worktree_digest.sh" >/dev/null
+if rg -n '(^|[[:space:]])fpm (run|test|build)' "$root_dir/benchmark" "$root_dir/tools" >/dev/null; then
+    echo 'benchmark/tools must use fo, not direct fpm commands' >&2
+    exit 1
+fi
 "$root_dir/benchmark/run_llama_cpp.sh" --dry-run >/dev/null
 "$root_dir/.provenance/fetch_models.sh" --dry-run >/dev/null
 printf '%s\n' 'benchmark scripts syntax check passed'

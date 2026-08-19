@@ -9,9 +9,11 @@ program fortai_cpu_run
     real(real32), allocatable :: logits(:)
     character(len=512) :: model_path, argument
     integer(int64) :: token, steps, context, position, next_token
-    integer :: clock_start, clock_end, clock_rate, i, ios
+    integer :: clock_start, clock_end, clock_rate, i, ios, trace_length
     integer :: load_start, load_end, forward_start, forward_end
     real(real32) :: elapsed, load_seconds, forward_seconds, tokens_per_second, checksum
+    character(len=16) :: trace_tokens
+    logical :: trace_enabled
 
     call get_command_argument(1, model_path)
     if (len_trim(model_path) == 0) then
@@ -28,6 +30,9 @@ program fortai_cpu_run
     call get_command_argument(4, argument)
     if (len_trim(argument) > 0) read (argument, *, iostat=ios) context
     if (steps <= 0_int64 .or. context <= 0_int64) error stop 2
+    call get_environment_variable('FORTAI_TRACE_TOKENS', trace_tokens, length=trace_length)
+    trace_enabled = .false.
+    if (trace_length > 0) trace_enabled = trace_tokens(1:trace_length) == '1'
 
     call system_clock(clock_start, clock_rate)
     load_start = clock_start
@@ -52,6 +57,7 @@ program fortai_cpu_run
             if (logits(i) > logits(next_token + 1_int64)) next_token = int(i - 1, int64)
         end do
         token = next_token
+        if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
     end do
     call system_clock(clock_end)
     forward_end = clock_end

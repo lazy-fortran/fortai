@@ -38,12 +38,13 @@ plan.
 
 ## Build and test
 
-Requirements are a Fortran 2018 compiler and [fpm](https://fpm.fortran-lang.org/).
+Requirements are a Fortran 2018 compiler and the local Lazy Fortran `fo`
+driver (which invokes fpm-compatible project builds).
 
 ```bash
-fpm build
-fpm test
-fpm run -- --version
+fo build
+fo test
+fo exec --no-build fortai --version
 ```
 
 For the native CPU candidate build:

@@ -59,6 +59,12 @@ from pathlib import Path
 
 paths = [line.strip() for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
 results = [json.loads(Path(path).read_text()) for path in paths]
+if any(item.get("llama_server_cleanup") != "verified" for item in results):
+    raise SystemExit("at least one comparison did not verify llama-server cleanup")
+if any(int(item["fortai"].get("steps", -1)) != int(item["steps"]) for item in results):
+    raise SystemExit("FortAI step count mismatch in comparison results")
+if any(int(item["llama_cpp"].get("timings", {}).get("predicted_n", -1)) != int(item["steps"]) for item in results):
+    raise SystemExit("llama.cpp step count mismatch in comparison results")
 
 def stats(values):
     return {
@@ -76,6 +82,11 @@ llama = [float(item["llama_cpp"]["timings"]["predicted_per_second"]) for item in
 first = results[0]
 summary = {
     "fortai_commit": first["fortai_commit"],
+    "fortai_patch_digest": first.get("fortai_patch_digest", ""),
+    "fortai_tracked_tree_digest": first.get("fortai_tracked_tree_digest", ""),
+    "fortai_worktree_digest": first.get("fortai_worktree_digest", ""),
+    "build_flags": first.get("build_flags", ""),
+    "llama_server_cleanup": "verified",
     "compiler": first["compiler"],
     "cuda_visible_devices": first.get("cuda_visible_devices", "unset"),
     "omp_num_threads": first["omp_num_threads"],

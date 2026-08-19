@@ -453,14 +453,8 @@ contains
         real(real32) :: score, maximum, normalizer, weight, accumulator
 
         call stat % clear()
-        call layer_matvec(self, layer % attn_q, self % normalized, self % q_work, &
-            size(self % q_work), stat)
-        if (.not. stat % is_ok()) return
-        call layer_matvec(self, layer % attn_k, self % normalized, self % k_work, &
-            size(self % k_work), stat)
-        if (.not. stat % is_ok()) return
-        call layer_matvec(self, layer % attn_v, self % normalized, self % v_work, &
-            size(self % v_work), stat)
+        call model_matvec_triplet(self, layer % attn_q, layer % attn_k, layer % attn_v, &
+            self % normalized, self % q_work, self % k_work, self % v_work, stat)
         if (.not. stat % is_ok()) return
         do head = 1, self % attention_heads
             q_offset = (head - 1) * 2 * self % attention_head_size
@@ -626,6 +620,35 @@ contains
         end if
     end subroutine model_matvec_pair
 
+    subroutine model_matvec_triplet(self, first_index, second_index, third_index, input, &
+            first_output, second_output, third_output, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: first_index, second_index, third_index
+        real(real32), intent(in) :: input(:)
+        real(real32), intent(out) :: first_output(:), second_output(:), third_output(:)
+        type(status_t), intent(out) :: stat
+
+        call stat%clear()
+        if (first_index == 0 .or. second_index == 0 .or. third_index == 0) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CPU triplet tensor binding is invalid')
+            return
+        end if
+        if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &
+            self%file%tensors(second_index)%value_type == GGML_TYPE_Q8_0 .and. &
+            self%file%tensors(third_index)%value_type == GGML_TYPE_Q8_0) then
+            call self%file%tensors(first_index)%matvec_triplet_q8( &
+                self%file%tensors(second_index), self%file%tensors(third_index), input, &
+                first_output, second_output, third_output, self%quantized_input, &
+                self%quantized_scales, stat)
+        else
+            call model_matvec(self, first_index, input, first_output, stat)
+            if (.not. stat%is_ok()) return
+            call model_matvec(self, second_index, input, second_output, stat)
+            if (.not. stat%is_ok()) return
+            call model_matvec(self, third_index, input, third_output, stat)
+        end if
+    end subroutine model_matvec_triplet
+
     subroutine rms_norm(input, weights, epsilon, output, stat)
         real(real32), intent(in) :: input(:), epsilon
         type(gguf_tensor_t), intent(in) :: weights
@@ -674,19 +697,23 @@ contains
         integer, intent(in) :: heads, stride, dimension
         integer(int64), intent(in) :: position
         real(real32), intent(in) :: base
-        integer :: head, i
+        integer :: head, i, half_dimension
         real(real32) :: angle, cosine, sine, first, second
 
+        ! Qwen3.5 uses interleaved MRoPE with NeoX-style half-vector pairs.
+        ! For text all three position streams are equal, so the frequency
+        ! sequence is the usual one; vision will require explicit sections.
+        half_dimension = dimension / 2
         do head = 0, heads - 1
-            do i = 0, dimension - 2, 2
-                angle = real(position, real32) / base**(real(i, real32) / &
+            do i = 0, half_dimension - 1
+                angle = real(position, real32) / base**(real(2 * i, real32) / &
                     real(dimension, real32))
                 cosine = cos(angle)
                 sine = sin(angle)
                 first = values(head * stride + i + 1)
-                second = values(head * stride + i + 2)
+                second = values(head * stride + i + half_dimension + 1)
                 values(head * stride + i + 1) = first * cosine - second * sine
-                values(head * stride + i + 2) = first * sine + second * cosine
+                values(head * stride + i + half_dimension + 1) = first * sine + second * cosine
             end do
         end do
     end subroutine apply_rope
