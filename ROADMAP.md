@@ -27,7 +27,7 @@ math flags belong to measured candidate builds, not the correctness oracle.
 | FAI-CUDA-001 | single-device CUDA backend | experimental, device-resident Qwen path | independent ABI oracle, model trace parity, and paired llama.cpp benchmark |
 | FAI-CUDA-001A | host-controlled Qwen3.5 CUDA integration slice | experimental, measured slower | weights resident, model correctness smoke, persistent transfer/launch profile; cannot be promoted |
 | FAI-CUDA-001B | device-resident Qwen3.5 recurrent, attention, KV, and FFN path | experimental, measured slower | 0.8B/2B/4B smoke, CUDA trace parity, and fewer host activation round trips |
-| FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | open | matched Nsight profile and end-to-end speed at least equal to llama.cpp |
+| FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | experimental, opt-in and slower on RTX 5060 Ti | matched Nsight profile and end-to-end speed at least equal to the direct resident plan and llama.cpp |
 | FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | deferred | two-device placement, transfer accounting, and stable generation |
 | FAI-CUDA-002 | Q4 repack and fused GDN kernels | deferred | validated kernel tournament on named GPUs |
 | FAI-CUDA-003 | CUDA MTP and speculative decoding | deferred | acceptance rate and end-to-end throughput |
@@ -62,8 +62,9 @@ oracle run beginning at token 9419. Current CPU evidence covers 0.8B, 2B, and
 4B Q8_0 model-level runs with the server stopped and sequential execution.
 The CUDA evidence now includes an experimental device-resident Qwen3.5 path
 for the 0.8B, 2B, and 4B fixtures. The 0.8B eight-token CUDA trace matches
-llama.cpp, and the paired 64-token result is 272.34 tok/s versus 299.99
-tok/s (0.908x), so it remains unpromoted. The remaining measured gap includes
-uncaptured launches and slower specialized Q8/GDN kernels. Nsight Compute is
-attempted and its permission result is retained; Nsight Systems remains the
-fallback timing profile when GPU performance-counter access is unavailable.
+llama.cpp. CUDA Graph replay was profiled as an A/B and is slower on the tested
+RTX 5060 Ti, so it is opt-in while the direct resident launch plan remains the
+default. The paired 64-token result remains unpromoted until it matches the
+competing harness. Nsight Compute is attempted and its permission result is
+retained; Nsight Systems remains the fallback timing profile when GPU
+performance-counter access is unavailable.

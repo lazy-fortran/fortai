@@ -143,6 +143,7 @@ module fortai_qwen35_cpu
         type(c_ptr) :: cuda_logits = c_null_ptr
         logical :: cuda_enabled = .false.
         logical :: cuda_device_pipeline = .false.
+        logical :: cuda_graph_enabled = .false.
         logical :: cuda_graph_ready = .false.
     contains
         procedure :: close => qwen35_cpu_close
@@ -385,12 +386,22 @@ contains
     subroutine setup_cuda_device_pipeline(self, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         type(status_t), intent(out) :: stat
-        integer :: i
+        integer :: i, graph_length
         integer(c_size_t) :: hidden_bytes
+        character(len=8) :: graph_env
 
         call stat%clear()
         self%cuda_device_pipeline = .false.
+        self%cuda_graph_enabled = .false.
         self%cuda_graph_ready = .false.
+        call get_environment_variable('FORTAI_ENABLE_CUDA_GRAPH', graph_env, length=graph_length)
+        if (graph_length > 0) then
+            if (graph_env(1:graph_length) == '1') self%cuda_graph_enabled = .true.
+        end if
+        call get_environment_variable('FORTAI_DISABLE_CUDA_GRAPH', graph_env, length=graph_length)
+        if (graph_length > 0) then
+            if (graph_env(1:graph_length) == '1') self%cuda_graph_enabled = .false.
+        end if
         if (.not. self%cuda_enabled) return
         if (.not. allocated(self%layers)) then
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA device pipeline has no layers')
@@ -609,7 +620,7 @@ contains
             if (.not. stat % is_ok()) return
         end if
         capture_graph = .false.
-        if (self%cuda_device_pipeline) then
+        if (self%cuda_device_pipeline .and. self%cuda_graph_enabled) then
             if (self%cuda_graph_ready) then
                 call self%cuda%graph_launch(stat)
                 if (.not. stat%is_ok()) return
@@ -620,7 +631,8 @@ contains
             end if
         end if
 
-        if (.not. self%cuda_device_pipeline .or. .not. self%cuda_graph_ready) then
+        if (.not. self%cuda_device_pipeline .or. .not. self%cuda_graph_ready .or. &
+            .not. self%cuda_graph_enabled) then
             do i = 1, self % layer_count
                 if (self%cuda_device_pipeline) then
                     if (self%layers(i)%recurrent) then
@@ -673,7 +685,8 @@ contains
             end do
         end if
 
-        if (self%cuda_device_pipeline .and. .not. self%cuda_graph_ready) then
+        if (self%cuda_device_pipeline .and. (.not. self%cuda_graph_ready .or. &
+            .not. self%cuda_graph_enabled)) then
             call forward_output_device(self, stat)
             if (.not. stat%is_ok()) return
         end if

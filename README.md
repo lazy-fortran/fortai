@@ -8,9 +8,10 @@ experimental device-resident CUDA path. It contains the
 public runtime types, GGUF Q8_0 loading, Qwen3.5 hybrid recurrent/full-attention
 execution for the 0.8B, 2B, and 4B model family, native OpenMP/SIMD matvecs,
 and persistent benchmark/provenance tooling. The CUDA path keeps recurrent
-state, attention KV caches, activations, and FFN execution on the RTX 5060 Ti;
-CUDA Graph replay, Q4 repacking, and multi-GPU 27B execution remain staged
-behind explicit acceptance gates.
+state, attention KV caches, activations, and FFN execution on the RTX 5060 Ti.
+CUDA Graph replay is available as an explicit opt-in, but is disabled by
+default on the tested RTX 5060 Ti until it passes the end-to-end gate; Q4
+repacking and multi-GPU 27B execution remain staged behind explicit gates.
 
 ## Design
 

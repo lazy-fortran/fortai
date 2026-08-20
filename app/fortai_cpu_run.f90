@@ -9,9 +9,10 @@ program fortai_cpu_run
     real(real32), allocatable :: logits(:)
     character(len=512) :: model_path, argument
     integer(int64) :: token, steps, context, position, next_token
-    integer :: clock_start, clock_end, clock_rate, i, ios, trace_length
+    integer :: clock_start, clock_end, clock_rate, max_index, ios, trace_length
+    integer :: sample_start, sample_end
     integer :: load_start, load_end, forward_start, forward_end
-    real(real32) :: elapsed, load_seconds, forward_seconds, tokens_per_second, checksum
+    real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
     character(len=16) :: trace_tokens
     logical :: trace_enabled
 
@@ -44,6 +45,7 @@ program fortai_cpu_run
     call system_clock(load_end)
     allocate (logits(model%vocabulary_size))
     checksum = 0.0_real32
+    sample_seconds = 0.0_real32
     call system_clock(forward_start)
     do position = 0_int64, steps - 1_int64
         call model%forward(token, position, logits, stat)
@@ -52,10 +54,11 @@ program fortai_cpu_run
             error stop 1
         end if
         checksum = checksum + sum(logits)
-        next_token = 0_int64
-        do i = 2, size(logits)
-            if (logits(i) > logits(next_token + 1_int64)) next_token = int(i - 1, int64)
-        end do
+        call system_clock(sample_start)
+        max_index = maxloc(logits, dim=1)
+        call system_clock(sample_end)
+        sample_seconds = sample_seconds + real(sample_end - sample_start, real32) / real(clock_rate, real32)
+        next_token = int(max_index - 1, int64)
         token = next_token
         if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
     end do
@@ -72,6 +75,7 @@ program fortai_cpu_run
     print '(a,es16.8)', 'logit_checksum=', checksum
     print '(a,es16.8)', 'load_seconds=', load_seconds
     print '(a,es16.8)', 'forward_seconds=', forward_seconds
+    print '(a,es16.8)', 'sample_seconds=', sample_seconds
     print '(a,es16.8)', 'elapsed_seconds=', elapsed
     print '(a,es16.8)', 'tokens_per_second=', tokens_per_second
 end program fortai_cpu_run

@@ -75,24 +75,34 @@ benchmark/profile_qwen35_cuda.sh \
   "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
 benchmark/profile_qwen35_cuda_llama.sh \
   "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
+
+# repeat the paired CUDA comparison and retain median/variance evidence
+benchmark/repeat_compare_qwen35_cuda.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 5 9419 64 128 0
 ```
 
-This path uploads Q8 weights once but still transfers each activation and
-output around each matvec. Paired and triplet projections reuse one activation
-upload, and attention Q/K/V triplets use one contiguous device-to-host copy.
-Recurrent layers keep convolution/GDN state and their projections resident;
-the FFN path fuses gate/up projection, SiLU-product, requantization, and the
-down projection on the device. The path remains host-controlled at layer
-boundaries.
-Its results are retained as integration evidence and explicitly marked
-`not_promoted_host_transfers`; the production CUDA gate requires device-resident
-activations and fused recurrent/attention work.
+The model path uploads Q8 weights once and keeps the token embedding lookup,
+activations, recurrent state, attention KV caches, FFN projections, and final
+logit projection device-resident. Only the logits needed by the current host
+sampler and the next-token/control values cross the boundary. The path is
+host-controlled at the model-call boundary and uses a resident CUDA Graph only
+when explicitly enabled:
+
+```bash
+FORTAI_ENABLE_CUDA_GRAPH=1 benchmark/compare_qwen35_cuda_llama.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 64 128 0
+```
+
+On the tested RTX 5060 Ti, the graph A/B is retained as evidence but is slower
+than the direct resident launch plan, so graph replay is disabled by default.
+Its results remain marked `not_promoted_cuda_graph_or_full_parity` until the
+complete model-level gate reaches the competing harness.
 
 The `_llama` profiler stores paired Nsight Systems reports and API/kernel CSV
 summaries for FortAI and llama.cpp under one provenance directory. The current
-paired profile shows FortAI making thousands of activation/output copies while
-llama.cpp keeps the graph resident and uses fused `mul_mat_vec_q` and
-`gated_delta_net_cuda` work; that is the actionable CUDA gap.
+paired profile shows FortAI's standalone Q8/GDN/attention sequence versus
+llama.cpp's fused `mul_mat_vec_q`, `gated_delta_net_cuda`, and graph plan; that
+is the actionable CUDA gap.
 
 The standalone recurrent-kernel harness uses an independent scalar CPU oracle,
 checks both state and output, and compares a four-launch decomposition with a
