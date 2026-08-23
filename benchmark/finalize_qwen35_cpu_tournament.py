@@ -18,6 +18,9 @@ ALLOWED_MODELS = frozenset(
         "Qwen3.5-4B-Q8_0.gguf",
     }
 )
+DEFAULT_ORACLE_STEPS = 8
+DEFAULT_ORACLE_TOP_K = 32
+DEFAULT_ORACLE_TOLERANCE = 1.0e-2
 
 COMMON_KEYS = (
     "fortai_commit",
@@ -114,9 +117,21 @@ def _load(path: Path) -> dict[str, object]:
     return json.loads(path.read_text())
 
 
-def finalize(summary_paths: list[Path], oracle_path: Path) -> dict[str, object]:
+def finalize(
+    summary_paths: list[Path],
+    oracle_path: Path,
+    oracle_steps: int = DEFAULT_ORACLE_STEPS,
+    oracle_top_k: int = DEFAULT_ORACLE_TOP_K,
+    oracle_tolerance: float = DEFAULT_ORACLE_TOLERANCE,
+) -> dict[str, object]:
     if not summary_paths:
         raise ValueError("at least one thread summary is required")
+    if oracle_steps <= 0:
+        raise ValueError("oracle steps must be positive")
+    if oracle_top_k < 2:
+        raise ValueError("oracle top-k must be at least two")
+    if not math.isfinite(oracle_tolerance) or oracle_tolerance < 0.0:
+        raise ValueError("oracle tolerance must be finite and nonnegative")
     summaries = [validate_summary(_load(path), str(path)) for path in summary_paths]
     first = summaries[0]
     for key in COMMON_KEYS:
@@ -175,7 +190,13 @@ def finalize(summary_paths: list[Path], oracle_path: Path) -> dict[str, object]:
         raise ValueError("behavioral oracle did not verify cleanup")
     if int(oracle.get("omp_num_threads", 0)) != int(best_fortai["omp_num_threads"]):
         raise ValueError("behavioral oracle is not bound to the best FortAI thread")
-    if int(oracle.get("top_k", 0)) < 2 or float(oracle.get("maximum_centered_logit_error", math.inf)) > float(oracle.get("tolerance", -1.0)):
+    if int(oracle.get("steps", 0)) != oracle_steps:
+        raise ValueError("behavioral oracle step count does not match tournament contract")
+    if int(oracle.get("top_k", 0)) != oracle_top_k:
+        raise ValueError("behavioral oracle top-k does not match tournament contract")
+    if not _close(oracle.get("tolerance"), oracle_tolerance):
+        raise ValueError("behavioral oracle tolerance does not match tournament contract")
+    if float(oracle.get("maximum_centered_logit_error", math.inf)) > oracle_tolerance:
         raise ValueError("behavioral oracle tolerance gate failed")
 
     return {
@@ -270,6 +291,7 @@ def self_test() -> None:
             "performance_gate_eligible": True,
             "llama_server_cleanup": "verified",
             "omp_num_threads": 1,
+            "steps": 8,
             "top_k": 32,
             "maximum_centered_logit_error": 1.0e-7,
             "tolerance": 1.0e-2,
@@ -324,6 +346,14 @@ def self_test() -> None:
             pass
         else:
             raise AssertionError("mismatched oracle was accepted")
+        weak_oracle = root / "weak_oracle.json"
+        weak_oracle.write_text(json.dumps({**oracle, "top_k": 2}))
+        try:
+            finalize([summary_a], weak_oracle)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("weaker oracle contract was accepted")
         runtime_oracle = root / "runtime_oracle.json"
         runtime_oracle.write_text(json.dumps({**oracle, "compiler": "other"}))
         try:
@@ -339,6 +369,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("summaries", nargs="*")
     parser.add_argument("--oracle", type=Path)
+    parser.add_argument("--oracle-steps", type=int, default=DEFAULT_ORACLE_STEPS)
+    parser.add_argument("--oracle-top-k", type=int, default=DEFAULT_ORACLE_TOP_K)
+    parser.add_argument("--oracle-tolerance", type=float, default=DEFAULT_ORACLE_TOLERANCE)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -347,7 +380,13 @@ def main() -> None:
         return
     if not args.summaries or args.oracle is None or args.output is None:
         parser.error("summaries, --oracle, and --output are required")
-    result = finalize([Path(path) for path in args.summaries], args.oracle)
+    result = finalize(
+        [Path(path) for path in args.summaries],
+        args.oracle,
+        args.oracle_steps,
+        args.oracle_top_k,
+        args.oracle_tolerance,
+    )
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps({"winner": result["winner"], "best_fortai": result["best_fortai"], "best_llama_cpp": result["best_llama_cpp"]}, sort_keys=True))
 

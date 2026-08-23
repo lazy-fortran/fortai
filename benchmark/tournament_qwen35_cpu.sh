@@ -120,5 +120,7 @@ printf '%s\n' "$oracle_payload" >"$oracle_file"
 summary_file="$result_dir/tournament_${base}_${stamp}.json"
 mapfile -t summary_paths <"$index_file"
 python3 "$root_dir/benchmark/finalize_qwen35_cpu_tournament.py" \
-    "${summary_paths[@]}" --oracle "$oracle_file" --output "$summary_file"
+    "${summary_paths[@]}" --oracle "$oracle_file" --output "$summary_file" \
+    --oracle-steps "$oracle_steps" --oracle-top-k "$oracle_top_k" \
+    --oracle-tolerance "$oracle_tolerance"
 printf 'summary=%s\noracle=%s\n' "$summary_file" "$oracle_file"
