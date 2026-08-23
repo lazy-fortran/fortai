@@ -11,6 +11,14 @@ if [[ ! -f "$model_path" ]]; then
     echo "model not found: $model_path" >&2
     exit 2
 fi
+model_name=$(basename "$model_path")
+case "$model_name" in
+    Qwen3.5-0.8B-Q8_0.gguf|Qwen3.5-2B-Q8_0.gguf|Qwen3.5-4B-Q8_0.gguf) ;;
+    *)
+        echo "tournament model scope is limited to Qwen3.5 0.8B/2B/4B Q8_0: $model_name" >&2
+        exit 2
+        ;;
+esac
 
 repeats="${2:-${FORTAI_BENCH_REPEATS:-5}}"
 token_id="${3:-${FORTAI_TOKEN_ID:-9419}}"
