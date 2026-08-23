@@ -89,6 +89,8 @@ def validate_summary(summary: dict[str, object], source: str) -> dict[str, objec
         raise ValueError(f"{source}: CPU tournament must hide all CUDA devices")
     if summary.get("metric") != "matched_forward_steps_per_second":
         raise ValueError(f"{source}: unsupported tournament metric")
+    if int(summary.get("steps", 0)) <= 0:
+        raise ValueError(f"{source}: timing step count must be positive")
     repeats = int(summary.get("repeats", 0))
     if repeats < 5:
         raise ValueError(f"{source}: at least five repeats are required")
@@ -269,6 +271,7 @@ def _fixture(thread: int = 2) -> dict[str, object]:
             "repeats": 5,
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "cuda_visible_devices": "",
+            "steps": 64,
             "omp_num_threads": thread,
             "measurement_conditions": "isolated",
             "shared_service_conditions": False,
@@ -380,6 +383,7 @@ def self_test() -> None:
         )
         rejects(lambda item: item.update({"cuda_visible_devices": "0"}), "cuda_visible")
         rejects(lambda item: item.update({"metric": "wall_time"}), "metric")
+        rejects(lambda item: item.update({"steps": 0}), "steps")
         rejects(lambda item: item.update({"shared_service_conditions": True}), "shared")
         rejects(lambda item: item["fortai_matched_forward_steps_per_second"].update({"median": 999.0}), "tampered")
         rejects(lambda item: item.update({"fortai_commit": "other"}), "mixed")
