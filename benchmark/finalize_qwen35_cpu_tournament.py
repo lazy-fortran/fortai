@@ -11,6 +11,14 @@ import tempfile
 from pathlib import Path
 
 
+ALLOWED_MODELS = frozenset(
+    {
+        "Qwen3.5-0.8B-Q8_0.gguf",
+        "Qwen3.5-2B-Q8_0.gguf",
+        "Qwen3.5-4B-Q8_0.gguf",
+    }
+)
+
 COMMON_KEYS = (
     "fortai_commit",
     "fortai_patch_digest",
@@ -67,6 +75,12 @@ def _close(actual: object, expected: object) -> bool:
 
 
 def validate_summary(summary: dict[str, object], source: str) -> dict[str, object]:
+    model = summary.get("model")
+    if not isinstance(model, str) or Path(model).name not in ALLOWED_MODELS:
+        raise ValueError(
+            f"{source}: tournament model scope is limited to "
+            "Qwen3.5 0.8B/2B/4B Q8_0"
+        )
     repeats = int(summary.get("repeats", 0))
     if repeats < 5:
         raise ValueError(f"{source}: at least five repeats are required")
@@ -207,6 +221,7 @@ def _fixture(thread: int = 2) -> dict[str, object]:
     summary.update(
         {
             "repeats": 5,
+            "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "omp_num_threads": thread,
             "measurement_conditions": "isolated",
             "shared_service_conditions": False,
@@ -238,7 +253,7 @@ def self_test() -> None:
             "fortai_worktree_digest": "same",
             "build_flags": "same",
             "fortai_executable_sha256": "same",
-            "model": "same",
+            "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "model_sha256": "same",
             "token_id": "same",
             "context": "same",
@@ -294,6 +309,10 @@ def self_test() -> None:
             raise AssertionError(f"fixture was accepted: {message}")
 
         rejects(lambda item: item.update({"repeats": 4}), "short")
+        rejects(
+            lambda item: item.update({"model": "/fixtures/Qwen3.8-27B-Q4_K_XL.gguf"}),
+            "out_of_scope_model",
+        )
         rejects(lambda item: item.update({"shared_service_conditions": True}), "shared")
         rejects(lambda item: item["fortai_matched_forward_steps_per_second"].update({"median": 999.0}), "tampered")
         rejects(lambda item: item.update({"fortai_commit": "other"}), "mixed")
