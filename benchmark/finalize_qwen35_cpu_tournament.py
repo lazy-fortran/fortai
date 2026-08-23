@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -128,6 +129,10 @@ def _load(path: Path) -> dict[str, object]:
     return json.loads(path.read_text())
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def finalize(
     summary_paths: list[Path],
     oracle_path: Path,
@@ -144,6 +149,7 @@ def finalize(
     if not math.isfinite(oracle_tolerance) or oracle_tolerance < 0.0:
         raise ValueError("oracle tolerance must be finite and nonnegative")
     summaries = [validate_summary(_load(path), str(path)) for path in summary_paths]
+    summary_digests = {str(path): _sha256(path) for path in summary_paths}
     first = summaries[0]
     for key in COMMON_KEYS:
         if key not in first:
@@ -167,6 +173,7 @@ def finalize(
     winner = "fortai" if fortai_median >= llama_median else "llama_cpp"
 
     oracle = _load(oracle_path)
+    oracle_digest = _sha256(oracle_path)
     if oracle.get("verdict") != "PASS":
         raise ValueError("behavioral oracle did not pass")
     for key in (
@@ -248,6 +255,13 @@ def finalize(
             "steps": oracle_steps,
             "top_k": oracle_top_k,
             "tolerance": oracle_tolerance,
+        },
+        "input_artifacts": {
+            "thread_summaries": [
+                {"path": str(path), "sha256": summary_digests[str(path)]}
+                for path in summary_paths
+            ],
+            "oracle": {"path": str(oracle_path), "sha256": oracle_digest},
         },
         "best_fortai": {
             "omp_num_threads": int(best_fortai["omp_num_threads"]),
@@ -352,6 +366,13 @@ def self_test() -> None:
             "steps": 8,
             "top_k": 32,
             "tolerance": 1.0e-2,
+        }
+        assert result["input_artifacts"] == {
+            "thread_summaries": [
+                {"path": str(summary_a), "sha256": _sha256(summary_a)},
+                {"path": str(summary_b), "sha256": _sha256(summary_b)},
+            ],
+            "oracle": {"path": str(oracle_path), "sha256": _sha256(oracle_path)},
         }
         try:
             finalize([summary_a], oracle_path)
