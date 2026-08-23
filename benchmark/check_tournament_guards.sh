@@ -21,4 +21,14 @@ if ! grep -Fq 'tournament model scope is limited to Qwen3.5 0.8B/2B/4B Q8_0' "$l
     cat "$log_file" >&2
     exit 1
 fi
+repeat_log="$fixture_dir/repeat.log"
+if "$root_dir/benchmark/repeat_compare_qwen35_cpu.sh" "$model_path" >"$repeat_log" 2>&1; then
+    echo 'repeat comparison accepted an out-of-scope model' >&2
+    exit 1
+fi
+if ! grep -Fq 'CPU repeat model scope is limited to Qwen3.5 0.8B/2B/4B Q8_0' "$repeat_log"; then
+    echo 'repeat comparison scope guard did not reject before execution' >&2
+    cat "$repeat_log" >&2
+    exit 1
+fi
 printf '%s\n' 'CPU tournament scope guard passed'
