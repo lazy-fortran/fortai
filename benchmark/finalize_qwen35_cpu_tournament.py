@@ -135,8 +135,8 @@ def finalize(
     oracle_top_k: int = DEFAULT_ORACLE_TOP_K,
     oracle_tolerance: float = DEFAULT_ORACLE_TOLERANCE,
 ) -> dict[str, object]:
-    if not summary_paths:
-        raise ValueError("at least one thread summary is required")
+    if len(summary_paths) < 2:
+        raise ValueError("at least two thread summaries are required")
     if oracle_steps <= 0:
         raise ValueError("oracle steps must be positive")
     if oracle_top_k < 2:
@@ -353,6 +353,12 @@ def self_test() -> None:
             "top_k": 32,
             "tolerance": 1.0e-2,
         }
+        try:
+            finalize([summary_a], oracle_path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("single-thread candidate was accepted")
 
         mixed_repeats = _fixture(2)
         mixed_repeats["repeats"] = 6

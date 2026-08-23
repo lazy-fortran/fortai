@@ -56,6 +56,7 @@ if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"; then
 fi
 
 declare -A seen_threads=()
+thread_count=0
 for threads in $thread_list; do
     if [[ ! "$threads" =~ ^[0-9]+$ || "$threads" -le 0 ]]; then
         echo "thread counts must be unique positive integers: $threads" >&2
@@ -66,7 +67,12 @@ for threads in $thread_list; do
         exit 2
     fi
     seen_threads[$threads]=1
+    thread_count=$((thread_count + 1))
 done
+if (( thread_count < 2 )); then
+    echo 'tournament requires at least two distinct thread candidates' >&2
+    exit 2
+fi
 
 result_dir="$root_dir/benchmark/results"
 log_dir="$root_dir/benchmark/logs"
