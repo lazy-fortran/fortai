@@ -104,6 +104,27 @@ evidence_gate_verdict: PASS
 review_verdict: PASS
 ```
 
+The llama.cpp model harness acceptance is closed for the named 0.8B
+correctness tuple. The paired artifacts above were produced from revision
+`3dd5d011c8fde305f284ba653eee4943669434e9` with model SHA-256
+`091d8deba394f428b67aa42c100ee145fcbecac5a79621935d3655016ca737e5`, token
+`9419`, context `128`, and eight requested/generated steps. Each result
+records `prompt_n=1`, `cache_n=0`, `predicted_n=8`, and
+`llama_server_cleanup=verified`; the trace and centered-top-32 checks passed.
+The runs are marked shared-service and performance-ineligible, so this closes
+the harness contract only and makes no throughput or winner claim.
+
+```text
+leaf_id: FAI-BENCH-002
+leaf_status: PASS
+claim_id: FAI-BENCH-002
+claim_status: CLOSED
+parent_id: FAI-BENCH
+parent_status: OPEN
+evidence_gate_verdict: PASS
+review_verdict: PASS
+```
+
 ## GPU path
 
 | ID | Work | Status | Acceptance |
@@ -134,7 +155,7 @@ comparison exists, the result stays unpromoted until one is available.
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
 | FAI-BENCH-001 | persistent CPU reference benchmark | in progress | native fo build, content digest, and result with provenance |
-| FAI-BENCH-002 | llama.cpp model benchmark harness | in progress | same model, token count, context, output budget, cleanup, and trace gate |
+| FAI-BENCH-002 | llama.cpp model benchmark harness | closed | same model, token count, context, output budget, cleanup, and trace gate |
 | FAI-PROV-001 | source fetch and revision records | in progress | tracked fetch tooling, ignored fetched trees |
 
 No FortAI versus llama.cpp performance claim is valid until FortAI has a
