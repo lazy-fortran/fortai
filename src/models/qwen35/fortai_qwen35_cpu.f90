@@ -217,10 +217,7 @@ contains
         self % max_context = 256_int64
         if (present(max_context)) self % max_context = max_context
         self%persistent_openmp = .false.
-        if (self%hidden_size == 1536_int32 .and. self%vocabulary_size == 248320_int32 .and. &
-            self%layer_count == 24_int32) then
-            call enable_persistent_openmp(self)
-        end if
+        call enable_persistent_openmp(self)
         self % bos_token = self % file % meta_int('tokenizer.ggml.bos_token_id', 0_int64)
         self % eos_token = self % file % meta_int('tokenizer.ggml.eos_token_id', 0_int64)
         interval = int(self % file % meta_int('qwen35.full_attention_interval', 4_int64), int32)
