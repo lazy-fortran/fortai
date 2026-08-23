@@ -156,7 +156,7 @@ comparison exists, the result stays unpromoted until one is available.
 | --- | --- | --- | --- |
 | FAI-BENCH-001 | persistent CPU reference benchmark | in progress | native fo build, content digest, and result with provenance |
 | FAI-BENCH-002 | llama.cpp model benchmark harness | closed | same model, token count, context, output budget, cleanup, and trace gate |
-| FAI-PROV-001 | source fetch and revision records | in progress | tracked fetch tooling, ignored fetched trees |
+| FAI-PROV-001 | source fetch and revision records | closed | tracked fetch tooling, ignored fetched trees |
 
 No FortAI versus llama.cpp performance claim is valid until FortAI has a
 model-level forward and decode path. Kernel microbenchmarks and model-level
@@ -175,6 +175,25 @@ default. The paired 64-token result remains unpromoted until it matches the
 competing harness. Nsight Compute is attempted and its permission result is
 retained; Nsight Systems remains the fallback timing profile when GPU
 performance-counter access is unavailable.
+
+The source/model provenance acceptance is closed at revision
+`0fe922dbc7dd02240262e40dcede203ab44905cf`. An end-to-end local source clone
+resolved the current commit into a revision record; source and model dry-runs
+parsed all seven and three manifest entries respectively. The fetched source,
+downloaded models, and revision records are all ignored by Git, while the
+fetch scripts and manifests remain tracked. This verifies provenance behavior
+without fetching or committing a model artifact.
+
+```text
+leaf_id: FAI-PROV-001
+leaf_status: PASS
+claim_id: FAI-PROV-001
+claim_status: CLOSED
+parent_id: FAI-PROV
+parent_status: OPEN
+evidence_gate_verdict: PASS
+review_verdict: PASS
+```
 
 The immutable FAI-CPU-002 promotion evidence is revision
 `efdcfed023e9878da4cea5d24b39e44f64d86bf6`, reviewed as base
