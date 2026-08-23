@@ -89,6 +89,16 @@ centered-logit errors were `2.431842038852494e-7` (0.8B),
 three permitted small models; they do not close the strict 1–64-thread speed
 gate.
 
+A bounded Luna scaling audit on the 0.8B fixture found no safe scheduling-only
+promotion. With 64 forwards at eight threads, `spread/cores` measured
+`27.4207` tokens/s, `close/cores` `27.4560`, and `master/cores` `27.6817`; a
+temporary `schedule(dynamic,32)` variant was not reproducibly better than
+static scheduling at four or eight threads. The host reports GNU OpenMP's
+default `OMP_WAIT_POLICY=PASSIVE`, so workers sleep between matvec regions
+while llama.cpp keeps a hot worker pool. A persistent worker region or broader
+forward fusion is a materially larger redesign and remains unpromoted until it
+passes the independent logits oracle and the full seven-level tournament.
+
 The low-level CPU path is not missing an assembly implementation. The tracked
 `src/backend/cpu/fortai_q8_dot.c` contains AVX2/F16C/FMA kernels for Q8 dot,
 activation quantization, dequantization, SiLU, SiLU-product, and GDN steps;
