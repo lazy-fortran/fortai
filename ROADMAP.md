@@ -72,6 +72,32 @@ empty-patch digest
 These records close only the model-open/run/metadata claims. They do not
 establish logits parity for the larger fixtures or a performance comparison.
 
+Fresh CPU model-level runs at current revision
+`58dcfac82775216965e4c36d0e39bc32f8cc99d6` used the same validated native
+flags, token `9419`, eight steps, context `128`, two OpenMP threads, and
+`CUDA_VISIBLE_DEVICES=""`; the protected llama-server was not used. They
+share tracked/worktree digest
+`65a54e19cafc5a56a8d80c9e8ae5ef8e3acda67a30db2684625bcb62b974b351` and the
+empty-patch digest
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`:
+
+* 0.8B model SHA-256 `091d8deba394f428b67aa42c100ee145fcbecac5a79621935d3655016ca737e5`,
+  result `fortai_Qwen3.5-0.8B-Q8_0_20260823T151903Z.json` SHA-256
+  `0125d816d7c352b44f0802658379c3c76fa817b3e7dc636197be9d0890369d1f`,
+  24 layers, and `22.4719105` tokens/s.
+* 2B model SHA-256 `30d5d309e77d48b44325fe8eee08f4201f99687752f9a4a77fa66498457b45f4`,
+  result `fortai_Qwen3.5-2B-Q8_0_20260823T151739Z.json` SHA-256
+  `5a6bab31b8b35c86090b4e98ee20cea15df3b46b0e5a7540be05f65dd04fddd1`,
+  24 layers, and `10.1265821` tokens/s.
+* 4B model SHA-256 `c3fc7bcaf6f75b8f7ceeead9a769f5a7a9f86a8180af1cfb2b72958dcad8e028`,
+  result `fortai_Qwen3.5-4B-Q8_0_20260823T151808Z.json` SHA-256
+  `bc62ecc91c3f35c2aa712c158a3f954395e30f8e38a006ec1ea4fb6dc943653d`,
+  32 layers, and `3.76825261` tokens/s.
+
+These freshness runs confirm the permitted model-open/run path only; they do
+not establish logits parity for the larger fixtures or a fair performance
+comparison.
+
 The 0.8B text-only acceptance was rerun at revision
 `3dd5d011c8fde305f284ba653eee4943669434e9` with Q8_0, token `9419`, eight
 steps, context `128`, two OpenMP threads, and the independent llama.cpp b10566
