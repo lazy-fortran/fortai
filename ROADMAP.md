@@ -98,6 +98,16 @@ These freshness runs confirm the permitted model-open/run path only; they do
 not establish logits parity for the larger fixtures or a fair performance
 comparison.
 
+A fresh strict 0.8B centered-top-32 logits gate at revision
+`71e5df9d65ddaaf2adf6cba2b732aefcc15278c4` also passed with maximum centered
+logit error `2.431842038852494e-7` against tolerance `1.0e-2`. The comparison
+result `compare_Qwen3.5-0.8B-Q8_0_20260823T152028Z.json` has SHA-256
+`6bc6815da8635374e55dfb0ba633729609a31a090c5fcd7c3e94b4bdec46c52e`, model
+SHA-256 `091d8deba394f428b67aa42c100ee145fcbecac5a79621935d3655016ca737e5`,
+and verified temporary-server cleanup. Since protected PID `268006` was
+resident, this result is explicitly `measurement_conditions=shared_service`
+and `performance_gate_eligible=false`; it is correctness evidence only.
+
 The 0.8B text-only acceptance was rerun at revision
 `3dd5d011c8fde305f284ba653eee4943669434e9` with Q8_0, token `9419`, eight
 steps, context `128`, two OpenMP threads, and the independent llama.cpp b10566
