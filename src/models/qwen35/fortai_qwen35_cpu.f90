@@ -905,7 +905,8 @@ contains
                 self % recurrent_head_size, self % norm_epsilon)
         end do
         do head = 1, self % recurrent_value_heads
-            key_head = (head - 1) / (self % recurrent_value_heads / self % recurrent_key_heads)
+            ! Match llama.cpp's broadcast of recurrent Q/K heads over value heads.
+            key_head = mod(head - 1, self % recurrent_key_heads)
             beta = sigmoid(self % beta_work(head))
             decay = self % file % tensors(layer % ssm_a) % value(int(head, int64)) * &
                 softplus(self % alpha_work(head) + self % file % tensors(layer % ssm_dt) % value( &
