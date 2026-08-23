@@ -125,8 +125,9 @@ def validate_summary(summary: dict[str, object], source: str) -> dict[str, objec
     return summary
 
 
-def _load(path: Path) -> dict[str, object]:
-    return json.loads(path.read_text())
+def _load_frozen(path: Path) -> tuple[dict[str, object], str]:
+    raw = path.read_bytes()
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
 
 
 def _sha256(path: Path) -> str:
@@ -148,8 +149,9 @@ def finalize(
         raise ValueError("oracle top-k must be at least two")
     if not math.isfinite(oracle_tolerance) or oracle_tolerance < 0.0:
         raise ValueError("oracle tolerance must be finite and nonnegative")
-    summaries = [validate_summary(_load(path), str(path)) for path in summary_paths]
-    summary_digests = {str(path): _sha256(path) for path in summary_paths}
+    frozen_summaries = [(path, *_load_frozen(path)) for path in summary_paths]
+    summaries = [validate_summary(payload, str(path)) for path, payload, _ in frozen_summaries]
+    summary_digests = {str(path): digest for path, _, digest in frozen_summaries}
     first = summaries[0]
     for key in COMMON_KEYS:
         if key not in first:
@@ -172,8 +174,7 @@ def finalize(
     llama_median = float(best_llama["llama_cpp_matched_forward_steps_per_second"]["median"])
     winner = "fortai" if fortai_median >= llama_median else "llama_cpp"
 
-    oracle = _load(oracle_path)
-    oracle_digest = _sha256(oracle_path)
+    oracle, oracle_digest = _load_frozen(oracle_path)
     if oracle.get("verdict") != "PASS":
         raise ValueError("behavioral oracle did not pass")
     for key in (
