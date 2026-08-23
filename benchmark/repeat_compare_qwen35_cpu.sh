@@ -106,6 +106,7 @@ summary = {
     "shared_service_conditions": first["shared_service_conditions"],
     "performance_gate_eligible": first["performance_gate_eligible"],
     "compiler": first["compiler"],
+    "cpu_model": first["cpu_model"],
     "cuda_visible_devices": first.get("cuda_visible_devices", "unset"),
     "omp_num_threads": first["omp_num_threads"],
     "omp_proc_bind": first["omp_proc_bind"],

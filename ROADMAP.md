@@ -12,7 +12,7 @@ and reproducible benchmark tooling.
 | FAI-CPU-001B | Qwen3.5-2B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-001C | Qwen3.5-4B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-002 | CPU logits parity and tokenizer path | closed | token-by-token logits agree with an independent oracle |
-| FAI-CPU-003 | native CPU candidate tournament | in progress | compiler flags, thread count, and winner recorded |
+| FAI-CPU-003 | native CPU candidate tournament | in progress | isolated repeated medians, bound logits oracle, compiler flags, thread count, and winner recorded |
 | FAI-CPU-MOE-001 | CPU MoE execution for Qwen3.6-35B | deferred | expert routing, resident weights, and llama.cpp comparison |
 
 The CPU implementation should use validated compiler features for the machine

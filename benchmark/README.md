@@ -160,6 +160,22 @@ Summaries land in `benchmark/results/repeat_<model>_<stamp>.json` (ignored,
 like all results). Fix `OMP_NUM_THREADS`, steps, and context explicitly when
 citing numbers; compare medians and report the spread beside them.
 
+The promotion-grade CPU thread tournament combines those repeated summaries
+and binds the selected FortAI thread to the independent centered-logit oracle:
+
+```bash
+benchmark/tournament_qwen35_cpu.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 5 9419 64 128 8 32 1.0e-2
+```
+
+It screens threads `1 2 4 8 16 32` by default, requires at least five isolated
+runs per thread, recomputes medians and spreads, rejects mixed provenance or
+shared-service timing, and records separate FortAI/llama.cpp optima plus an
+explicit winner. The finalizer also checks that the winning thread, binary,
+flags, revision, model, and runtime match the eight-step top-32 logits oracle.
+The wrapper refuses to run while any llama-server is resident; shared-service
+results remain screening evidence and cannot enter the performance gate.
+
 For the independent greedy decode gate, run:
 
 ```bash

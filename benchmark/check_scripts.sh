@@ -8,6 +8,7 @@ bash -n "$root_dir/benchmark/run_llama_cpp.sh"
 bash -n "$root_dir/benchmark/run_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/compare_qwen35_cpu_llama.sh"
 bash -n "$root_dir/benchmark/repeat_compare_qwen35_cpu.sh"
+bash -n "$root_dir/benchmark/tournament_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/tune_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/profile_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/check_qwen35_cpu_trace.sh"
@@ -27,6 +28,7 @@ bash -n "$root_dir/tools/build_cuda_backend.sh"
 bash -n "$root_dir/tools/build_cuda_qwen35.sh"
 bash -n "$root_dir/.provenance/fetch_models.sh"
 python3 "$root_dir/benchmark/finalize_qwen35_cpu_result.py" --self-test >/dev/null
+python3 "$root_dir/benchmark/finalize_qwen35_cpu_tournament.py" --self-test >/dev/null
 "$root_dir/tools/worktree_digest.sh" >/dev/null
 if rg -n '(^|[[:space:]])fpm (run|test|build)' "$root_dir/benchmark" "$root_dir/tools" >/dev/null; then
     echo 'benchmark/tools must use fo, not direct fpm commands' >&2
