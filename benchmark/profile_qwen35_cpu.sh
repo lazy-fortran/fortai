@@ -51,13 +51,17 @@ native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-lo
 (cd "$root_dir" && fo build --flag "$native_flags") >"$profile_dir/build.log"
 run=(fo exec --no-build --cwd "$root_dir" fortai_cpu_run "$model_path" "$token_id" "$steps" "$context")
 events="task-clock,context-switches,cpu-migrations,cycles,instructions,branches,branch-misses,cache-references,cache-misses"
+perf_delay_args=()
+if [[ "$delay_ms" != 0 ]]; then
+    perf_delay_args=(-D "$delay_ms")
+fi
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf stat -D "$delay_ms" -x, -e "$events" -o "$profile_dir/perf-stat.csv" -- \
+    perf stat "${perf_delay_args[@]}" -x, -e "$events" -o "$profile_dir/perf-stat.csv" -- \
     "${run[@]}" >"$profile_dir/stat-run.log" 2>&1
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf record -D "$delay_ms" -F "$frequency" -m "$perf_mmap" --call-graph "$perf_call_graph" \
+    perf record "${perf_delay_args[@]}" -F "$frequency" -m "$perf_mmap" --call-graph "$perf_call_graph" \
     -o "$profile_dir/perf.data" -- \
     "${run[@]}" >"$profile_dir/record-run.log" 2>&1
 

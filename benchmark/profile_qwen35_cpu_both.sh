@@ -74,6 +74,10 @@ export OMP_PLACES="${OMP_PLACES:-cores}"
 export CUDA_VISIBLE_DEVICES=""
 native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto}"
 events="task-clock,context-switches,cpu-migrations,cycles,instructions,branches,branch-misses,cache-references,cache-misses"
+fortai_perf_delay_args=()
+if [[ "$fortai_delay_ms" != 0 ]]; then
+    fortai_perf_delay_args=(-D "$fortai_delay_ms")
+fi
 
 {
     "$root_dir/tools/worktree_digest.sh"
@@ -102,11 +106,11 @@ events="task-clock,context-switches,cpu-migrations,cycles,instructions,branches,
 run=(fo exec --no-build --cwd "$root_dir" fortai_cpu_run "$model_path" "$token_id" "$steps" "$context")
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf stat -D "$fortai_delay_ms" -x, -e "$events" -o "$profile_dir/fortai-perf-stat.csv" -- \
+    perf stat "${fortai_perf_delay_args[@]}" -x, -e "$events" -o "$profile_dir/fortai-perf-stat.csv" -- \
     "${run[@]}" >"$profile_dir/fortai-stat-run.log" 2>&1
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf record -D "$fortai_delay_ms" -F "$frequency" -m "$perf_mmap" \
+    perf record "${fortai_perf_delay_args[@]}" -F "$frequency" -m "$perf_mmap" \
         --call-graph "$perf_call_graph" -o "$profile_dir/fortai-perf.data" -- \
     "${run[@]}" >"$profile_dir/fortai-record-run.log" 2>&1
 
