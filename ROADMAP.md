@@ -31,8 +31,9 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The current tournament-readiness implementation anchor is revision
-`04e98c9edc0728ad5087a3f33ff7ca3e9396cd48`. It refuses a resident
-`llama-server` before starting any timing, requires at least five repeats for
+`78bdb3a`. It refuses any unverified resident `llama-server` before starting
+timing, while allowing only the exact protected GPU service (PID `268006`,
+port `8080`) as independent from the CPU measurements. It requires at least five repeats for
 each thread candidate, restricts the tournament and direct-repeat wrappers
 and finalizer to the exact 0.8B/2B/4B Q8_0 model allowlist, binds the selected
 median to the exact
@@ -47,31 +48,37 @@ explicitly oversubscribed on this machine's 32 online CPUs. It writes the final
 lifecycle record
 through a same-directory fsync-and-replace sequence so a partial output cannot
 be promoted.
-A successful finalizer also
-emits exact FAI-CPU-003/FAI-CPU lifecycle IDs and explicit open/pending review
-axes without self-promoting the claim. No FAI-CPU-003 timing artifact or
-winner exists yet; the protected PID `268006` on port `8080` keeps this leaf
-evidence-incomplete.
+A successful finalizer also emits exact FAI-CPU-003/FAI-CPU lifecycle IDs and
+explicit open/pending review axes without self-promoting the claim. No
+FAI-CPU-003 timing artifact or winner exists yet; the next step is the full
+eligible tournament on the protected-service-safe temporary CPU ports.
 
-The binding hardening in revision `04e98c9edc0728ad5087a3f33ff7ca3e9396cd48`
+The binding hardening in revision `a8cd84e19ddd04a6e4026bde13417e4c2dc004ba`
 now validates the rank and configured dimensions of the global, FFN,
 recurrent/SSM, and full-attention tensors before any Qwen3.5 layer is
 allocated. The permitted 4B fixture opens and executes one CPU step through
 these checks; this is fail-fast diagnostic hardening, not a logits-parity
 fix.
 
-A fresh strict centered-top-32 check for the permitted 2B fixture at the
-previous clean revision `6e9bffa3894a361defcade0912cad140e261fa76` passed all
-eight steps with maximum centered-logit error
-`3.5649993890274345e-7` against tolerance `1.0e-2`. Its result
-`compare_Qwen3.5-2B-Q8_0_20260823T160012Z.json` has SHA-256
-`9a660a2a3c7ea684de88a472d94c57d3996161647dca0c9bdd880ca7ee97a2c5` and is
-explicitly shared-service correctness-only evidence. The corresponding fresh
-4B check remains a hard failure at step 0 (`FortAI=314`, `llama.cpp=11`); its
-result `compare_Qwen3.5-4B-Q8_0_20260823T160115Z.json` has SHA-256
-`3107adef4a76779cb70b8f57c34f0c699ff74d16761351cd92036a47e40fc1b0` and is
-also shared-service correctness-only evidence. Neither result changes the
-FAI-CPU-003 lifecycle or establishes any performance claim.
+The recurrent head-broadcast fix in revision
+`a8cd84e19ddd04a6e4026bde13417e4c2dc004ba` changed the 4B strict centered-
+top-32 check from a step-0 failure (`FortAI=314`, `llama.cpp=11`) to PASS.
+Fresh eight-step checks now pass for all three permitted fixtures under the
+same token `9419`, context `128`, top-32, and `1.0e-2` tolerance contract:
+
+* 0.8B: maximum centered-logit error `2.431842038852494e-7`, result
+  `compare_Qwen3.5-0.8B-Q8_0_20260823T163558Z.json`, SHA-256
+  `97ab09c7d8a3f79d66a78dd1098903e4de5b4f910f5a7da96b89aee78216088d`.
+* 2B: maximum centered-logit error `3.5649993890274345e-7`, result
+  `compare_Qwen3.5-2B-Q8_0_20260823T163524Z.json`, SHA-256
+  `a9d6b1e30da5dac091d80ca364485171d013a482af4712526927f2f4fdfb3703`.
+* 4B: maximum centered-logit error `2.434161379127886e-7`, result
+  `compare_Qwen3.5-4B-Q8_0_20260823T163416Z.json`, SHA-256
+  `b187576b580bb0001f2e4996d4e37bf029b867cf13c2a74f525dde663d388843`.
+
+All three are explicitly shared-service correctness-only evidence because the
+protected server remains resident; they do not establish any performance
+claim or change the FAI-CPU-003 lifecycle.
 
 ```text
 leaf_id: FAI-CPU-003

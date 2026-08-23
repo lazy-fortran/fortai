@@ -88,11 +88,12 @@ benchmark/check_qwen35_cuda_trace.sh \
 benchmark/profile_cuda_q8.sh
 ```
 
-The comparison and paired-profile scripts refuse to start when another
-`llama-server` is already running. If a protected production server must stay
-up, an explicit override starts the temporary CPU comparison on its own port;
-these results are labelled shared-service measurements and are not a fair
-performance-gate result:
+The CPU comparison wrapper refuses to start when an unverified
+`llama-server` is already running. The exact protected GPU resident service
+(PID `268006`, port `8080`) is independently allowed: CPU comparisons still
+run on a separately checked temporary port and remain eligible for the
+performance gate. Other resident servers can be used only with the explicit
+shared-service override, which marks the result ineligible:
 
 ```bash
 FORTAI_ALLOW_EXISTING_LLAMA_SERVER=1 LLAMA_PORT=18081 \
