@@ -129,6 +129,7 @@ print(json.dumps({
     "token_id": int(result["token_id"]),
     "context": int(result["context"]),
     "cpu_model": result["cpu_model"],
+    "online_cpus": result["online_cpus"],
     "protected_gpu_server_independent": result["protected_gpu_server_independent"],
     "protected_gpu_server_pid": result["protected_gpu_server_pid"],
     "persistent_openmp": result["persistent_openmp"],
