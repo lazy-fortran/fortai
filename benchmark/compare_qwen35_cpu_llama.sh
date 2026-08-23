@@ -50,8 +50,12 @@ if [[ ! -x "$llama_server" ]]; then
     echo "llama-server not found: $llama_server" >&2
     exit 2
 fi
+measurement_conditions=isolated
+performance_gate_eligible=true
 if pgrep -x llama-server >/dev/null 2>&1; then
     if [[ "${FORTAI_ALLOW_EXISTING_LLAMA_SERVER:-0}" == 1 ]]; then
+        measurement_conditions=shared_service
+        performance_gate_eligible=false
         echo "allowing existing llama-server; this comparison is intentionally under shared-service conditions" >&2
         pgrep -a -x llama-server >&2 || true
     else
@@ -91,6 +95,12 @@ llama_record="$root_dir/.provenance/records/llama.cpp.txt"
     env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" \
         OMP_PLACES="$OMP_PLACES" fo exec --no-build fortai_cpu_run \
         "$model_path" "$token_id" "$steps" "$context") >"$fortai_log"
+fortai_executable=$(readlink -f "$root_dir/build/fo/app/fortai_cpu_run")
+if [[ ! -x "$fortai_executable" ]]; then
+    echo "FortAI CPU runner not found after build: $fortai_executable" >&2
+    exit 1
+fi
+fortai_executable_sha256=$(sha256sum "$fortai_executable" | awk '{print $1}')
 
 cleanup() {
     if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
@@ -215,6 +225,12 @@ if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"; then
     exit 1
 fi
 
+digest_after=$("$root_dir/tools/worktree_digest.sh")
+if [[ "$digest_after" != "$digest_output" ]]; then
+    echo "worktree changed during CPU comparison" >&2
+    exit 1
+fi
+
 MODEL_PATH="$model_path" TOKEN_ID="$token_id" STEPS="$steps" CONTEXT="$context" \
 COMMIT="$(git -C "$root_dir" rev-parse HEAD)" OMP_NUM_THREADS="$threads" \
 COMPILER="$(gfortran --version | head -n 1)" FORTAI_LOG="$fortai_log" \
@@ -229,7 +245,8 @@ LLAMA_CLEANUP="verified" LLAMA_SERVER_PATH="$llama_server" \
 LLAMA_SERVER_SHA256="$llama_server_sha256" LLAMA_LIBRARY_DIR="$llama_library_dir" \
 LLAMA_LIBRARY_DIGEST="$llama_library_digest" CPU_MODEL="$cpu_model" \
 LLAMA_RECORD="$llama_record" LLAMA_PROCESS_PROVENANCE="$llama_process_provenance" \
-LLAMA_VERSION="$llama_version" \
+LLAMA_VERSION="$llama_version" FORTAI_EXECUTABLE="$fortai_executable" \
+FORTAI_EXECUTABLE_SHA256="$fortai_executable_sha256" \
 python3 - <<'PY'
 import hashlib
 import json
@@ -266,6 +283,8 @@ result = {
     "llama_oracle_top_k": int(os.environ["ORACLE_TOP_K"]),
     "llama_server_cleanup": os.environ["LLAMA_CLEANUP"],
     "build_flags": os.environ["BUILD_FLAGS"],
+    "omp_proc_bind": os.environ["OMP_PROC_BIND"],
+    "omp_places": os.environ["OMP_PLACES"],
     "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
     "compiler": os.environ["COMPILER"],
     "cpu_model": os.environ["CPU_MODEL"],
@@ -275,6 +294,8 @@ result = {
     "token_id": int(os.environ["TOKEN_ID"]),
     "steps": int(os.environ["STEPS"]),
     "context": int(os.environ["CONTEXT"]),
+    "fortai_executable": os.environ["FORTAI_EXECUTABLE"],
+    "fortai_executable_sha256": os.environ["FORTAI_EXECUTABLE_SHA256"],
     "llama_cpp_provenance": llama_provenance,
     "llama_server": os.environ["LLAMA_SERVER_PATH"],
     "llama_server_sha256": os.environ["LLAMA_SERVER_SHA256"],
@@ -290,6 +311,8 @@ result = {
     "llama_cpp": llama_payload,
 }
 Path(os.environ["RESULT_FILE"]).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-print(json.dumps(result, sort_keys=True))
 PY
+python3 "$root_dir/benchmark/finalize_qwen35_cpu_result.py" "$result_file" \
+    --measurement-conditions "$measurement_conditions" \
+    --performance-gate-eligible "$performance_gate_eligible"
 printf 'result=%s\nllama_log=%s\nfortai_log=%s\n' "$result_file" "$llama_log" "$fortai_log"

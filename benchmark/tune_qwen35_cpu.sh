@@ -43,9 +43,11 @@ import sys
 from pathlib import Path
 
 result = json.loads(Path(sys.argv[1]).read_text())
-fortai = result["fortai"].get("tokens_per_second", "?")
-llama = result["llama_cpp"].get("timings", {}).get("predicted_per_second", "?")
-print(f"threads={result['omp_num_threads']} fortai_tok_s={fortai} llama_tok_s={llama}")
+matched = result["matched_forward"]
+fortai = matched["fortai_steps_per_second"]
+llama = matched["llama_cpp_steps_per_second"]
+print(f"threads={result['omp_num_threads']} fortai_matched_step_s={fortai} "
+      f"llama_matched_step_s={llama}")
 PY
 done
 
@@ -56,17 +58,34 @@ from pathlib import Path
 
 paths = [line.strip() for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
 results = [json.loads(Path(path).read_text()) for path in paths]
-best_fortai = max(results, key=lambda item: float(item["fortai"]["tokens_per_second"]))
-best_llama = max(results, key=lambda item: float(item["llama_cpp"]["timings"]["predicted_per_second"]))
+first = results[0]
+for key in ("fortai_commit", "fortai_patch_digest", "fortai_tracked_tree_digest",
+            "fortai_worktree_digest", "fortai_executable_sha256", "build_flags",
+            "compiler", "cpu_model", "model_sha256", "token_id", "steps",
+            "context", "omp_proc_bind", "omp_places", "llama_launcher_sha256",
+            "llama_executable_sha256", "llama_loaded_libraries", "llama_version",
+            "measurement_conditions", "performance_gate_eligible"):
+    if any(item.get(key) != first.get(key) for item in results[1:]):
+        raise SystemExit(f"mixed {key} values in thread sweep")
+best_fortai = max(results,
+    key=lambda item: float(item["matched_forward"]["fortai_steps_per_second"]))
+best_llama = max(results,
+    key=lambda item: float(item["matched_forward"]["llama_cpp_steps_per_second"]))
 summary = {
     "results": results,
+    "metric": "single_run_matched_forward_steps_per_second",
+    "screening_only": True,
+    "measurement_conditions": first["measurement_conditions"],
+    "performance_gate_eligible": first["performance_gate_eligible"],
     "best_fortai": {
-        "threads": best_fortai["omp_num_threads"],
-        "tokens_per_second": float(best_fortai["fortai"]["tokens_per_second"]),
+        "omp_num_threads": best_fortai["omp_num_threads"],
+        "matched_forward_steps_per_second":
+            float(best_fortai["matched_forward"]["fortai_steps_per_second"]),
     },
     "best_llama_cpp": {
-        "threads": best_llama["omp_num_threads"],
-        "tokens_per_second": float(best_llama["llama_cpp"]["timings"]["predicted_per_second"]),
+        "omp_num_threads": best_llama["omp_num_threads"],
+        "matched_forward_steps_per_second":
+            float(best_llama["matched_forward"]["llama_cpp_steps_per_second"]),
     },
 }
 Path(sys.argv[2]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

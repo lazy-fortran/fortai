@@ -99,6 +99,11 @@ FORTAI_ALLOW_EXISTING_LLAMA_SERVER=1 LLAMA_PORT=18081 \
   benchmark/compare_qwen35_cpu_llama.sh MODEL.gguf 9419 128 128
 ```
 
+The tuning script is a one-run screening sweep, not promotion evidence. A
+candidate winner requires repeated matched-forward measurements at each
+relevant thread count. Shared-service result JSON is explicitly marked
+`performance_gate_eligible: false`.
+
 The local Lazy Fortran workflow is also supported:
 
 ```bash

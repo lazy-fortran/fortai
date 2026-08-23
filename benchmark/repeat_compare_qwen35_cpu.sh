@@ -66,6 +66,20 @@ if any(int(item["fortai"].get("steps", -1)) != int(item["steps"]) for item in re
 if any(int(item["llama_cpp"].get("timings", {}).get("predicted_n", -1)) != int(item["steps"]) for item in results):
     raise SystemExit("llama.cpp step count mismatch in comparison results")
 
+first = results[0]
+immutable_keys = (
+    "fortai_commit", "fortai_patch_digest", "fortai_tracked_tree_digest",
+    "fortai_worktree_digest", "fortai_executable_sha256", "build_flags",
+    "compiler", "cpu_model", "omp_num_threads", "omp_proc_bind", "omp_places",
+    "model_sha256", "token_id", "steps", "context", "llama_launcher_sha256",
+    "llama_executable_sha256", "llama_loaded_libraries", "llama_version",
+    "measurement_conditions", "shared_service_conditions",
+    "performance_gate_eligible",
+)
+for key in immutable_keys:
+    if any(item.get(key) != first.get(key) for item in results[1:]):
+        raise SystemExit(f"mixed {key} values in repeated comparison")
+
 def stats(values):
     return {
         "n": len(values),
@@ -77,32 +91,46 @@ def stats(values):
         "values": values,
     }
 
-fortai = [float(item["fortai"]["tokens_per_second"]) for item in results]
-llama = [float(item["llama_cpp"]["timings"]["predicted_per_second"]) for item in results]
-first = results[0]
+fortai = [float(item["matched_forward"]["fortai_steps_per_second"]) for item in results]
+llama = [float(item["matched_forward"]["llama_cpp_steps_per_second"]) for item in results]
 summary = {
     "fortai_commit": first["fortai_commit"],
     "fortai_patch_digest": first.get("fortai_patch_digest", ""),
     "fortai_tracked_tree_digest": first.get("fortai_tracked_tree_digest", ""),
     "fortai_worktree_digest": first.get("fortai_worktree_digest", ""),
     "build_flags": first.get("build_flags", ""),
+    "fortai_executable_sha256": first.get("fortai_executable_sha256", ""),
     "llama_server_cleanup": "verified",
+    "temporary_llama_server_cleanup": "verified",
+    "measurement_conditions": first["measurement_conditions"],
+    "shared_service_conditions": first["shared_service_conditions"],
+    "performance_gate_eligible": first["performance_gate_eligible"],
     "compiler": first["compiler"],
     "cuda_visible_devices": first.get("cuda_visible_devices", "unset"),
     "omp_num_threads": first["omp_num_threads"],
+    "omp_proc_bind": first["omp_proc_bind"],
+    "omp_places": first["omp_places"],
     "model": first["model"],
     "model_sha256": first["model_sha256"],
     "token_id": first["token_id"],
     "steps": first["steps"],
     "context": first["context"],
     "repeats": int(sys.argv[3]),
-    "fortai_tokens_per_second": stats(fortai),
-    "llama_cpp_tokens_per_second": stats(llama),
+    "metric": "matched_forward_steps_per_second",
+    "fortai_matched_forward_steps_per_second": stats(fortai),
+    "llama_cpp_matched_forward_steps_per_second": stats(llama),
+    "llama_launcher_sha256": first["llama_launcher_sha256"],
+    "llama_executable_sha256": first["llama_executable_sha256"],
+    "llama_loaded_libraries": first["llama_loaded_libraries"],
+    "llama_version": first["llama_version"],
     "result_files": paths,
 }
 Path(sys.argv[2]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-print(json.dumps({"fortai_tokens_per_second": summary["fortai_tokens_per_second"],
-                  "llama_cpp_tokens_per_second": summary["llama_cpp_tokens_per_second"]},
+print(json.dumps({
+                  "fortai_matched_forward_steps_per_second":
+                      summary["fortai_matched_forward_steps_per_second"],
+                  "llama_cpp_matched_forward_steps_per_second":
+                      summary["llama_cpp_matched_forward_steps_per_second"]},
                  sort_keys=True))
 PY
 printf 'summary=%s\n' "$summary_file"

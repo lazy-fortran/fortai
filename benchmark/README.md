@@ -31,6 +31,13 @@ CPU thread count, and Q8_0 GGUF for both programs. It always terminates the
 temporary server. Results are evidence, not promotion: a slower FortAI result
 is explicitly retained as experimental.
 
+FortAI times every requested model forward. llama.cpp's generation rate omits
+the prompt forward because its first generated token is free, so that raw rate
+is not directly comparable. The result therefore validates an uncached
+one-token prompt and records `matched_forward` over the prompt forward plus
+the remaining generated-token forwards. CPU repeat and tuning summaries use
+only this matched rate.
+
 The comparison is strictly CPU-only. The installed llama-server links
 libggml-cuda, so `-ngl 0 --device none` alone still lets the CUDA backend
 initialize; the wrapper therefore also exports `CUDA_VISIBLE_DEVICES=""` and,
@@ -41,7 +48,10 @@ actual process-image digests, the reported llama.cpp version, and every loaded
 is explicitly set, the comparison fails if the process loads those libraries
 from another directory. The `llama_cpp_provenance` object describes the latest
 machine-local fetched source checkout; the executable, version, and loaded
-library fields identify the runtime used by a comparison.
+library fields identify the runtime used by a comparison. Shared-service runs
+record `shared_service_conditions: true` and
+`performance_gate_eligible: false`; cleanup refers only to the temporary CPU
+server started by the wrapper.
 
 ## Resident CUDA kernel
 
@@ -126,8 +136,9 @@ driver, GPU identity, and fixture metadata under `benchmark/results`.
 Single measurements are not evidence. `repeat_compare_qwen35_cpu.sh` runs the
 comparison wrapper N times (default 5) for one model and writes a summary JSON
 with median, mean, sample standard deviation, min, max, and all raw values for
-both FortAI and llama.cpp decode throughput, plus the commit, compiler, thread
-count, model path + SHA-256, token/steps/context, and server-cleanup checks.
+both FortAI and llama.cpp matched-forward throughput. It rejects mixed
+revisions, flags, affinity, workload, model, or llama.cpp runtime provenance
+and records whether the host conditions are performance-gate eligible.
 
 ```bash
 downloads=/mnt/storage/code/lazy-fortran/fortai/.provenance/downloads
