@@ -31,7 +31,7 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The tournament readiness implementation is revision
-`a99246208d4df8a4d4624fcaa24782f6e99994a3`. It refuses a resident
+`f338f5bd12c8e9ba56c41217d49786dc95f93164`. It refuses a resident
 `llama-server` before starting any timing, requires at least five repeats for
 each thread candidate, restricts the tournament and direct-repeat wrappers
 and finalizer to the exact 0.8B/2B/4B Q8_0 model allowlist, binds the selected
