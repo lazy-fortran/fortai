@@ -34,6 +34,10 @@ COMMON_KEYS = (
     "measurement_conditions",
     "shared_service_conditions",
     "performance_gate_eligible",
+    "repeats",
+    "metric",
+    "llama_server_cleanup",
+    "temporary_llama_server_cleanup",
 )
 
 
@@ -207,7 +211,9 @@ def _fixture(thread: int = 2) -> dict[str, object]:
             "measurement_conditions": "isolated",
             "shared_service_conditions": False,
             "performance_gate_eligible": True,
+            "metric": "matched_forward_steps_per_second",
             "llama_server_cleanup": "verified",
+            "temporary_llama_server_cleanup": "verified",
             "fortai_matched_forward_steps_per_second": _stats(values),
             "llama_cpp_matched_forward_steps_per_second": _stats([9.0, 10.0, 11.0, 12.0, 13.0]),
         }
@@ -258,6 +264,23 @@ def self_test() -> None:
         result = finalize([summary_a, summary_b], oracle_path)
         assert result["winner"] == "fortai"
         assert result["best_fortai"]["omp_num_threads"] == 1
+
+        mixed_repeats = _fixture(2)
+        mixed_repeats["repeats"] = 6
+        mixed_repeats["fortai_matched_forward_steps_per_second"] = _stats(
+            [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+        )
+        mixed_repeats["llama_cpp_matched_forward_steps_per_second"] = _stats(
+            [9.0, 10.0, 11.0, 12.0, 13.0, 14.0]
+        )
+        mixed_path = root / "mixed_repeats.json"
+        mixed_path.write_text(json.dumps(mixed_repeats))
+        try:
+            finalize([summary_a, mixed_path], oracle_path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("mixed repeat counts were accepted")
 
         def rejects(mutator, message):
             changed = _fixture(1)
