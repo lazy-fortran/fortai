@@ -30,6 +30,24 @@ and FP contraction disabled, passed all eight steps with maximum error
 `2.431842038852494e-7`. FAI-CPU-003 still requires repeated isolated timing
 evidence before a performance winner can be recorded.
 
+The tournament readiness implementation is revision
+`cb9b12e950eeb34444f5cf438a0db7c5811dfc3b`. It refuses a resident
+`llama-server` before starting any timing, requires at least five repeats for
+each thread candidate, and binds the selected median to the independent
+centered-logit oracle. No FAI-CPU-003 timing artifact or winner exists yet;
+the protected PID `268006` on port `8080` keeps this leaf evidence-incomplete.
+
+```text
+leaf_id: FAI-CPU-003
+leaf_status: IN_PROGRESS
+claim_id: FAI-CPU-003
+claim_status: OPEN
+parent_id: FAI-CPU
+parent_status: OPEN
+evidence_gate_verdict: NEEDS EVIDENCE
+review_verdict: PASS
+```
+
 The 2B and 4B CPU scaling acceptance runs were repeated at revision
 `2b3b135f6fff19148b5613bca4fc294b89a25082` with the validated native flags,
 Q8_0 fixtures, token `9419`, eight steps, context `128`, two OpenMP threads,
@@ -190,7 +208,9 @@ The tracked trace and centered-logit verifiers match the 0.8B Q8_0 fixture for
 the eight-token oracle run beginning at token 9419. The strict top-32 gate
 measured a maximum centered-logit error of `2.431842038852494e-7` against its
 `1.0e-2` tolerance. Current CPU evidence covers 0.8B, 2B, and 4B Q8_0
-model-level runs with the server stopped and sequential execution.
+model-level runs with sequential FortAI execution. The 0.8B paired oracle
+run is explicitly shared-service correctness evidence and performance-
+ineligible; the 2B and 4B scaling runs do not start a llama-server.
 The CUDA evidence now includes an experimental device-resident Qwen3.5 path
 for the 0.8B, 2B, and 4B fixtures. The 0.8B eight-token CUDA trace matches
 llama.cpp. CUDA Graph replay was profiled as an A/B and is slower on the tested
