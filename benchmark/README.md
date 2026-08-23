@@ -214,7 +214,12 @@ matched FortAI/llama.cpp `perf stat` counters (including cycles and retired
 instructions), zero-loss call graphs, and Intel-syntax disassembly for both
 the FortAI executable and llama.cpp's `libggml-cpu`. The profiler accepts the
 same verified protected GPU resident service as the CPU comparison wrapper and
-defaults to the b10566 executable/library pair used by the current oracle.
+defaults to the b10566 executable/library pair used by the current oracle. On
+hosts that restrict perf attach or record access, set
+`FORTAI_PERF_USE_SUDO=1`; this uses `sudo -n perf`, records the runner in
+provenance, and restores artifact ownership to the invoking user. Kernel
+symbol warnings caused by `kernel.kptr_restrict` do not affect user-space
+FortAI/llama.cpp assembly samples.
 
 ## Promotion rule
 

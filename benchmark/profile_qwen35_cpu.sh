@@ -11,7 +11,17 @@ if [[ ! -f "$model_path" ]]; then
     echo "model not found: $model_path" >&2
     exit 2
 fi
-if ! command -v perf >/dev/null 2>&1; then
+perf_cmd=(perf)
+perf_runner=perf
+if [[ "${FORTAI_PERF_USE_SUDO:-0}" == 1 ]]; then
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+        echo "FORTAI_PERF_USE_SUDO=1 requires passwordless sudo" >&2
+        exit 2
+    fi
+    perf_cmd=(sudo -n perf)
+    perf_runner='sudo -n perf'
+fi
+if ! "${perf_cmd[@]}" --version >/dev/null 2>&1; then
     echo "perf is required for profiling" >&2
     exit 2
 fi
@@ -46,6 +56,7 @@ native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-lo
     printf 'perf_mmap=%s\n' "$perf_mmap"
     printf 'perf_call_graph=%s\n' "$perf_call_graph"
     printf 'perf_delay_ms=%s\n' "$delay_ms"
+    printf 'perf_runner=%s\n' "$perf_runner"
 } >"$profile_dir/provenance.txt"
 
 (cd "$root_dir" && fo build --flag "$native_flags") >"$profile_dir/build.log"
@@ -57,13 +68,17 @@ if [[ "$delay_ms" != 0 ]]; then
 fi
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf stat "${perf_delay_args[@]}" -x, -e "$events" -o "$profile_dir/perf-stat.csv" -- \
+    "${perf_cmd[@]}" stat "${perf_delay_args[@]}" -x, -e "$events" -o "$profile_dir/perf-stat.csv" -- \
     "${run[@]}" >"$profile_dir/stat-run.log" 2>&1
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf record "${perf_delay_args[@]}" -F "$frequency" -m "$perf_mmap" --call-graph "$perf_call_graph" \
+    "${perf_cmd[@]}" record "${perf_delay_args[@]}" -F "$frequency" -m "$perf_mmap" --call-graph "$perf_call_graph" \
     -o "$profile_dir/perf.data" -- \
     "${run[@]}" >"$profile_dir/record-run.log" 2>&1
+
+if [[ "$perf_runner" != perf ]]; then
+    sudo -n chown "$(id -u):$(id -g)" -- "$profile_dir/perf-stat.csv" "$profile_dir/perf.data"
+fi
 
 perf report --stdio --no-children --sort symbol,dso -i "$profile_dir/perf.data" \
     >"$profile_dir/perf-report.txt"

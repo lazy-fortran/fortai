@@ -93,7 +93,14 @@ fresh `llvm-mca -mcpu=znver3` analysis of the AVX2 Q8 inner block estimates a
 three-cycle backend throughput before cache and memory effects. This makes
 the remaining strict 1–64-thread gate a scheduling/parallel graph problem,
 not a missing scalar-to-assembly conversion; no theoretical optimum claim is
-promoted until a reproducible current-runtime profile and tournament pass.
+promoted until a reproducible current-runtime profile and tournament pass. A
+current paired capture at
+`benchmark/profiles/Qwen3.5-0.8B-Q8_0_both_20260823T171834Z` (commit
+`a96f153275ee3da8dbb0dc376352058fff623fe3`, `sudo -n perf`, zero lost
+samples) puts `q8_dot_avx2` at `83.10%` of FortAI samples and
+`ggml_vec_dot_q8_0_q8_0` at `78.07%` of llama.cpp samples. Its host was under
+unrelated load, so it is assembly evidence rather than a promotion-grade
+throughput result; the strict tournament remains the independent gate.
 
 ```text
 leaf_id: FAI-CPU-003

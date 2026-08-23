@@ -11,7 +11,17 @@ if [[ ! -f "$model_path" ]]; then
     echo "model not found: $model_path" >&2
     exit 2
 fi
-if ! command -v perf >/dev/null 2>&1; then
+perf_cmd=(perf)
+perf_runner=perf
+if [[ "${FORTAI_PERF_USE_SUDO:-0}" == 1 ]]; then
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+        echo "FORTAI_PERF_USE_SUDO=1 requires passwordless sudo" >&2
+        exit 2
+    fi
+    perf_cmd=(sudo -n perf)
+    perf_runner='sudo -n perf'
+fi
+if ! "${perf_cmd[@]}" --version >/dev/null 2>&1; then
     echo "perf is required for profiling" >&2
     exit 2
 fi
@@ -93,6 +103,7 @@ fi
     printf 'llama_perf_delay_ms=%s\n' "$llama_delay_ms"
     printf 'perf_mmap=%s\n' "$perf_mmap"
     printf 'perf_call_graph=%s\n' "$perf_call_graph"
+    printf 'perf_runner=%s\n' "$perf_runner"
     printf 'llama_server=%s\n' "$llama_server"
     printf 'llama_server_sha256=%s\n' "$(sha256sum "$llama_server" | awk '{print $1}')"
     printf 'llama_library_dir=%s\n' "$llama_library_dir"
@@ -106,11 +117,11 @@ fi
 run=(fo exec --no-build --cwd "$root_dir" fortai_cpu_run "$model_path" "$token_id" "$steps" "$context")
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf stat "${fortai_perf_delay_args[@]}" -x, -e "$events" -o "$profile_dir/fortai-perf-stat.csv" -- \
+    "${perf_cmd[@]}" stat "${fortai_perf_delay_args[@]}" -x, -e "$events" -o "$profile_dir/fortai-perf-stat.csv" -- \
     "${run[@]}" >"$profile_dir/fortai-stat-run.log" 2>&1
 
 env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" OMP_PLACES="$OMP_PLACES" \
-    perf record "${fortai_perf_delay_args[@]}" -F "$frequency" -m "$perf_mmap" \
+    "${perf_cmd[@]}" record "${fortai_perf_delay_args[@]}" -F "$frequency" -m "$perf_mmap" \
         --call-graph "$perf_call_graph" -o "$profile_dir/fortai-perf.data" -- \
     "${run[@]}" >"$profile_dir/fortai-record-run.log" 2>&1
 
@@ -169,13 +180,13 @@ run_llama_profile() {
     done
 
     if [[ "$mode" == stat ]]; then
-        profiler=(perf stat -x, -e "$events" -o "$stat_file" -p "$active_llama_pid")
+        profiler=("${perf_cmd[@]}" stat -x, -e "$events" -o "$stat_file" -p "$active_llama_pid")
     else
-        profiler=(perf record -F "$frequency" -m "$perf_mmap" \
+        profiler=("${perf_cmd[@]}" record -F "$frequency" -m "$perf_mmap" \
             --call-graph "$perf_call_graph" -o "$output_file" -p "$active_llama_pid")
     fi
     if [[ "$llama_delay_ms" != 0 ]]; then
-        profiler=(perf "${profiler[@]:1}" -D "$llama_delay_ms")
+        profiler=("${perf_cmd[@]}" "${profiler[@]:${#perf_cmd[@]}}" -D "$llama_delay_ms")
     fi
     "${profiler[@]}" >"$profile_dir/llama-${mode}-perf.log" 2>&1 &
     active_perf_pid=$!
@@ -207,6 +218,12 @@ PY
 
 run_llama_profile stat "$port"
 run_llama_profile record "$((port + 1))"
+
+if [[ "$perf_runner" != perf ]]; then
+    sudo -n chown "$(id -u):$(id -g)" -- \
+        "$profile_dir/fortai-perf-stat.csv" "$profile_dir/fortai-perf.data" \
+        "$profile_dir/llama-stat-perf-stat.csv" "$profile_dir/llama-record-perf.data"
+fi
 
 perf report --stdio --no-children --sort symbol,dso -i "$profile_dir/fortai-perf.data" \
     >"$profile_dir/fortai-perf-report.txt"

@@ -77,6 +77,11 @@ OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu.sh \
 OMP_NUM_THREADS=4 benchmark/profile_qwen35_cpu_both.sh \
   .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
 
+# use passwordless sudo for hosts that restrict perf attach/record access
+FORTAI_PERF_USE_SUDO=1 OMP_NUM_THREADS=4 \
+  benchmark/profile_qwen35_cpu_both.sh \
+  .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
+
 # build and compare the device-resident Qwen3.5 CUDA path with llama.cpp
 benchmark/compare_qwen35_cuda_llama.sh \
   .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
