@@ -8,7 +8,7 @@ and reproducible benchmark tooling.
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
-| FAI-CPU-001 | Qwen3.5-0.8B text-only CPU reference | experimental | model opens, independent Q8 oracle passes, and the 8-step trace matches llama.cpp |
+| FAI-CPU-001 | Qwen3.5-0.8B text-only CPU reference | closed | model opens, independent Q8 oracle passes, and the 8-step trace matches llama.cpp |
 | FAI-CPU-001B | Qwen3.5-2B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-001C | Qwen3.5-4B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-002 | CPU logits parity and tokenizer path | closed | token-by-token logits agree with an independent oracle |
@@ -50,6 +50,37 @@ empty-patch digest
 
 These records close only the model-open/run/metadata claims. They do not
 establish logits parity for the larger fixtures or a performance comparison.
+
+The 0.8B text-only acceptance was rerun at revision
+`3dd5d011c8fde305f284ba653eee4943669434e9` with Q8_0, token `9419`, eight
+steps, context `128`, two OpenMP threads, and the independent llama.cpp b10566
+oracle. The trace result
+`compare_Qwen3.5-0.8B-Q8_0_20260823T144318Z.json` has SHA-256
+`dcc2c826c61ad4587deaa04e85bab83203d8a40be6584248251559cb535d4573` and
+matched token IDs `[11, 271, 40, 1044, 3133, 440, 264, 12654]`. The centered
+top-32 result
+`compare_Qwen3.5-0.8B-Q8_0_20260823T144301Z.json` has SHA-256
+`17acddc6075cfc7b95163a69c2ff2c57dd60c25f338a49032a09343caf94841f` and
+maximum centered-logit error `2.431842038852494e-7` against tolerance
+`1.0e-2`. Both results identify model SHA-256
+`091d8deba394f428b67aa42c100ee145fcbecac5a79621935d3655016ca737e5`, llama
+executable SHA-256
+`5b07556654335803a4a6f6e8f94b4bec13945e68843f28319bf69852176f935c`, and
+the empty-patch digest
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+The shared-service condition is correctness-only evidence; it is not eligible
+for a performance claim.
+
+```text
+leaf_id: FAI-CPU-001
+leaf_status: PASS
+claim_id: FAI-CPU-001
+claim_status: CLOSED
+parent_id: FAI-CPU
+parent_status: OPEN
+evidence_gate_verdict: PASS
+review_verdict: PASS
+```
 
 ```text
 leaf_id: FAI-CPU-001B
