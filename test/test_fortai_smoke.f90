@@ -1,5 +1,5 @@
 program test_fortai_smoke
-    use, intrinsic :: iso_c_binding, only: c_float, c_int64_t
+    use, intrinsic :: iso_c_binding, only: c_float, c_int16_t, c_int64_t
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
     use fortai_arena, only: arena_t
     use fortai_backend_cpu, only: cpu_matvec, cpu_matvec_inplace
@@ -22,6 +22,12 @@ program test_fortai_smoke
     implicit none
 
     interface
+        function fortai_float_to_half_test(value) bind(C, name='fortai_float_to_half') result(bits)
+            import c_float, c_int16_t
+            real(c_float), value, intent(in) :: value
+            integer(c_int16_t) :: bits
+        end function fortai_float_to_half_test
+
         subroutine fortai_gdn_step_test(state, key, value, query, decay, beta, head_size, &
                 output_scale, output) bind(C, name='fortai_gdn_step')
             import c_float, c_int64_t
@@ -31,6 +37,17 @@ program test_fortai_smoke
             integer(c_int64_t), value, intent(in) :: head_size
             real(c_float), intent(out) :: output(*)
         end subroutine fortai_gdn_step_test
+
+        subroutine fortai_flash_attention_f16_test(query, key_cache, value_cache, count, &
+                key_stride, value_stride, key_size, value_size, scale, output) &
+                bind(C, name='fortai_flash_attention_f16')
+            import c_float, c_int64_t
+            real(c_float), intent(in) :: query(*), key_cache(*), value_cache(*)
+            integer(c_int64_t), value, intent(in) :: count, key_stride, value_stride
+            integer(c_int64_t), value, intent(in) :: key_size, value_size
+            real(c_float), value, intent(in) :: scale
+            real(c_float), intent(out) :: output(*)
+        end subroutine fortai_flash_attention_f16_test
 
         subroutine fortai_silu_product(left, right, count) bind(C, name='fortai_silu_product')
             import c_float, c_int64_t
@@ -52,6 +69,8 @@ program test_fortai_smoke
     call test_device_and_arena(failures)
     call test_gguf_cache_qwen(failures)
     call test_gguf_q8_matvec(failures)
+    call test_half_conversion(failures)
+    call test_flash_attention_kernel(failures)
     call test_gdn_kernel(failures)
     call test_silu_kernel(failures)
     if (failures > 0) error stop 1
@@ -264,6 +283,75 @@ contains
             1583.9033203125_real64])) < 1.0e-4_real64, &
             'Q8 triplet activation matvec independent oracle', failures)
     end subroutine test_gguf_q8_matvec
+
+    subroutine test_half_conversion(failures)
+        integer, intent(inout) :: failures
+
+        call require(fortai_float_to_half_test(1.0_real32) == int(z'3c00', c_int16_t), &
+            'F16 exact value conversion', failures)
+        call require(fortai_float_to_half_test(1.00048828125_real32) == int(z'3c00', c_int16_t), &
+            'F16 midpoint rounds to even lower value', failures)
+        call require(fortai_float_to_half_test(1.00146484375_real32) == int(z'3c02', c_int16_t), &
+            'F16 midpoint rounds to even upper value', failures)
+        call require(fortai_float_to_half_test(2.98023223876953125e-8_real32) == &
+            int(z'0000', c_int16_t), 'F16 subnormal midpoint rounds to zero', failures)
+        call require(fortai_float_to_half_test(8.94069671630859375e-8_real32) == &
+            int(z'0002', c_int16_t), 'F16 subnormal midpoint rounds to even value', failures)
+    end subroutine test_half_conversion
+
+    subroutine test_flash_attention_kernel(failures)
+        integer, intent(inout) :: failures
+        integer, parameter :: key_size = 32, value_size = 32, key_count = 3
+        integer, parameter :: key_stride = 35, value_stride = 37
+        real(real32), parameter :: query_pattern(8) = [ &
+            1.00031_real32, -0.33327_real32, 0.20007_real32, -0.14291_real32, &
+            0.09094_real32, -0.07689_real32, 0.05887_real32, -0.05261_real32]
+        real(real32), parameter :: key_pattern(8, key_count) = reshape([ &
+            0.0_real32, 0.0_real32, 0.0_real32, 0.0_real32, &
+            0.0_real32, 0.0_real32, 0.0_real32, 0.0_real32, &
+            -0.75_real32, 0.5_real32, -1.25_real32, 0.25_real32, &
+            -0.375_real32, 0.875_real32, -0.625_real32, 0.125_real32, &
+            0.5_real32, -1.0_real32, 0.75_real32, -0.5_real32, &
+            1.25_real32, -0.25_real32, 0.375_real32, -0.875_real32], [8, key_count])
+        real(real32), parameter :: value_pattern(8, key_count) = reshape([ &
+            1.0_real32, -0.75_real32, 0.333251953125_real32, 7.5_real32, &
+            -3.125_real32, 0.015625_real32, 19.0_real32, -0.0625_real32, &
+            -0.8125_real32, 1.125_real32, -2.5_real32, 0.0625_real32, &
+            8.25_real32, -0.5_real32, -11.0_real32, 0.333251953125_real32, &
+            2.25_real32, -1.375_real32, 4.5_real32, -6.25_real32, &
+            0.125_real32, 3.75_real32, 0.03125_real32, -8.0_real32], [8, key_count])
+        real(real32), parameter :: expected_pattern(8) = [ &
+            2.02924752_real32, -1.24691701_real32, 3.82288337_real32, -4.31401777_real32, &
+            -0.158871993_real32, 3.17909908_real32, 2.34450269_real32, -6.79623699_real32]
+        real(real32) :: query(key_size), key_cache(key_stride, key_count)
+        real(real32) :: value_cache(value_stride, key_count), output(value_size)
+        integer :: block, key_index
+
+        key_cache = 123.5_real32
+        value_cache = -321.0_real32
+        do block = 0, 3
+            query(block * 8 + 1:block * 8 + 8) = query_pattern
+            do key_index = 1, key_count
+                key_cache(block * 8 + 1:block * 8 + 8, key_index) = &
+                    key_pattern(:, key_index)
+                value_cache(block * 8 + 1:block * 8 + 8, key_index) = &
+                    value_pattern(:, key_index)
+            end do
+        end do
+
+        call fortai_flash_attention_f16_test(query, key_cache, value_cache, &
+            int(key_count, c_int64_t), int(key_stride, c_int64_t), &
+            int(value_stride, c_int64_t), int(key_size, c_int64_t), &
+            int(value_size, c_int64_t), 0.37_real32, output)
+        ! Independent expected values from llama.cpp b10566's CPU graph. The
+        ! non-unit strides and alternating score maxima exercise cache layout,
+        ! online-softmax rescaling, and the FP16 value accumulator.
+        do block = 0, 3
+            call require(maxval(abs(output(block * 8 + 1:block * 8 + 8) - &
+                expected_pattern)) < 1.0e-5_real32, &
+                'F16 flash-attention independent oracle', failures)
+        end do
+    end subroutine test_flash_attention_kernel
 
     subroutine test_gdn_kernel(failures)
         integer, intent(inout) :: failures

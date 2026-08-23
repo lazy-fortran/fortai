@@ -9,45 +9,53 @@
 __attribute__((target("avx2,fma")))
 static inline __m256 expf_avx2(__m256 value)
 {
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 half = _mm256_set1_ps(0.5f);
-    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
-    const __m256 ln2_hi = _mm256_set1_ps(0.693359375f);
-    const __m256 ln2_lo = _mm256_set1_ps(-2.12194440e-4f);
-    const __m256 max_input = _mm256_set1_ps(88.3762626647949f);
-    const __m256 min_input = _mm256_set1_ps(-88.3762626647949f);
-    const __m256 c1 = _mm256_set1_ps(1.9875691500e-4f);
-    const __m256 c2 = _mm256_set1_ps(1.3981999507e-3f);
-    const __m256 c3 = _mm256_set1_ps(8.3334519073e-3f);
-    const __m256 c4 = _mm256_set1_ps(4.1665795894e-2f);
-    const __m256 c5 = _mm256_set1_ps(1.6666665459e-1f);
-    const __m256 c6 = _mm256_set1_ps(5.0000001201e-1f);
-    __m256 fx, truncated, z, polynomial;
-    __m256i exponent;
+    const __m256 r = _mm256_set1_ps(0x1.8p23f);
+    const __m256 z = _mm256_fmadd_ps(value,
+        _mm256_set1_ps(0x1.715476p+0f), r);
+    const __m256 n = _mm256_sub_ps(z, r);
+    const __m256 b = _mm256_fnmadd_ps(n,
+        _mm256_set1_ps(0x1.7f7d1cp-20f),
+        _mm256_fnmadd_ps(n, _mm256_set1_ps(0x1.62e4p-1f), value));
+    const __m256i exponent = _mm256_slli_epi32(_mm256_castps_si256(z), 23);
+    const __m256 scale = _mm256_castsi256_ps(_mm256_add_epi32(exponent,
+        _mm256_castps_si256(_mm256_set1_ps(1.0f))));
+    const __m256i overflow = _mm256_castps_si256(_mm256_cmp_ps(
+        _mm256_andnot_ps(_mm256_set1_ps(-0.0f), n),
+        _mm256_set1_ps(126.0f), _CMP_GT_OQ));
+    const __m256 square = _mm256_mul_ps(b, b);
+    const __m256 polynomial = _mm256_fmadd_ps(
+        _mm256_fmadd_ps(
+            _mm256_fmadd_ps(_mm256_set1_ps(0x1.0e4020p-7f), b,
+                _mm256_set1_ps(0x1.573e2ep-5f)), square,
+            _mm256_fmadd_ps(_mm256_set1_ps(0x1.555e66p-3f), b,
+                _mm256_set1_ps(0x1.fffdb6p-2f))),
+        square, _mm256_mul_ps(_mm256_set1_ps(0x1.ffffecp-1f), b));
 
-    value = _mm256_min_ps(value, max_input);
-    value = _mm256_max_ps(value, min_input);
-    fx = _mm256_add_ps(_mm256_mul_ps(value, log2e), half);
-    exponent = _mm256_cvttps_epi32(fx);
-    truncated = _mm256_cvtepi32_ps(exponent);
-    exponent = _mm256_sub_epi32(exponent, _mm256_and_si256(
-        _mm256_castps_si256(_mm256_cmp_ps(truncated, fx, _CMP_GT_OQ)),
-        _mm256_set1_epi32(1)));
-    fx = _mm256_cvtepi32_ps(exponent);
-    value = _mm256_sub_ps(value, _mm256_mul_ps(fx, ln2_hi));
-    value = _mm256_sub_ps(value, _mm256_mul_ps(fx, ln2_lo));
-    z = _mm256_mul_ps(value, value);
-    polynomial = c1;
-    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c2);
-    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c3);
-    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c4);
-    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c5);
-    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, value), c6);
-    polynomial = _mm256_add_ps(_mm256_mul_ps(polynomial, z), value);
-    polynomial = _mm256_add_ps(polynomial, one);
-    exponent = _mm256_add_epi32(exponent, _mm256_set1_epi32(0x7f));
-    exponent = _mm256_slli_epi32(exponent, 23);
-    return _mm256_mul_ps(polynomial, _mm256_castsi256_ps(exponent));
+    if (!_mm256_movemask_ps(_mm256_castsi256_ps(overflow)))
+        return _mm256_fmadd_ps(polynomial, scale, scale);
+
+    {
+        const __m256i underflow_adjustment = _mm256_and_si256(
+            _mm256_castps_si256(_mm256_cmp_ps(n, _mm256_setzero_ps(),
+                _CMP_LE_OQ)), _mm256_set1_epi32((int32_t)0x82000000u));
+        const __m256 first_scale = _mm256_castsi256_ps(_mm256_add_epi32(
+            underflow_adjustment, _mm256_set1_epi32(0x7f000000)));
+        const __m256 second_scale = _mm256_castsi256_ps(_mm256_sub_epi32(
+            exponent, underflow_adjustment));
+        const __m256i extreme = _mm256_castps_si256(_mm256_cmp_ps(
+            _mm256_andnot_ps(_mm256_set1_ps(-0.0f), n),
+            _mm256_set1_ps(192.0f), _CMP_GT_OQ));
+        return _mm256_or_ps(
+            _mm256_and_ps(_mm256_castsi256_ps(extreme),
+                _mm256_mul_ps(first_scale, first_scale)),
+            _mm256_andnot_ps(_mm256_castsi256_ps(extreme),
+                _mm256_or_ps(
+                    _mm256_and_ps(_mm256_castsi256_ps(overflow),
+                        _mm256_mul_ps(_mm256_fmadd_ps(second_scale,
+                            polynomial, second_scale), first_scale)),
+                    _mm256_andnot_ps(_mm256_castsi256_ps(overflow),
+                        _mm256_fmadd_ps(scale, polynomial, scale)))));
+    }
 }
 
 static inline float half_to_float(uint16_t value)
@@ -87,29 +95,52 @@ static inline uint16_t float_to_half(float value)
     uint32_t bits;
     __builtin_memcpy(&bits, &value, sizeof(bits));
     const uint32_t sign = (bits >> 16) & 0x8000u;
-    int32_t exponent = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
+    const uint32_t exponent_bits = (bits >> 23) & 0xffu;
     uint32_t fraction = bits & 0x007fffffu;
+    int32_t exponent;
 
-    if (exponent <= 0) {
-        if (exponent < -10)
-            return (uint16_t)sign;
-        fraction = (fraction | 0x00800000u) >> (uint32_t)(1 - exponent);
-        if ((bits & 0x00001000u) != 0u)
-            fraction += 0x00002000u;
-        return (uint16_t)(sign | (fraction >> 13));
+    if (exponent_bits == 0xffu) {
+        if (fraction == 0u)
+            return (uint16_t)(sign | 0x7c00u);
+        fraction >>= 13;
+        if (fraction == 0u)
+            fraction = 1u;
+        return (uint16_t)(sign | 0x7c00u | fraction);
     }
-    if (exponent >= 31)
+    if (exponent_bits == 0u)
+        return (uint16_t)sign;
+
+    exponent = (int32_t)exponent_bits - 127;
+    if (exponent < -14) {
+        uint32_t halfway, remainder, rounded;
+        int32_t shift;
+        if (exponent < -25)
+            return (uint16_t)sign;
+        fraction |= 0x00800000u;
+        shift = -exponent - 1;
+        rounded = fraction >> shift;
+        remainder = fraction & ((1u << shift) - 1u);
+        halfway = 1u << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (rounded & 1u) != 0u))
+            ++rounded;
+        return (uint16_t)(sign | rounded);
+    }
+    if (exponent > 15)
         return (uint16_t)(sign | 0x7c00u);
-    if ((fraction & 0x00001000u) != 0u) {
-        fraction += 0x00002000u;
-        if ((fraction & 0x00800000u) != 0u) {
-            fraction = 0;
+
+    {
+        uint32_t rounded = fraction >> 13;
+        const uint32_t remainder = fraction & 0x1fffu;
+        if (remainder > 0x1000u || (remainder == 0x1000u && (rounded & 1u) != 0u))
+            ++rounded;
+        if (rounded == 0x400u) {
+            rounded = 0u;
             ++exponent;
-            if (exponent >= 31)
+            if (exponent > 15)
                 return (uint16_t)(sign | 0x7c00u);
         }
+        return (uint16_t)(sign | ((uint32_t)(exponent + 15) << 10) | rounded);
     }
-    return (uint16_t)(sign | ((uint32_t)exponent << 10) | (fraction >> 13));
 }
 
 __attribute__((always_inline))
@@ -123,6 +154,204 @@ static inline uint16_t load_u16(const int8_t *address)
 uint16_t fortai_float_to_half(float value)
 {
     return float_to_half(value);
+}
+
+static void floats_to_half_scalar(const float *__restrict input,
+    uint16_t *__restrict output, int64_t count)
+{
+    int64_t i;
+    for (i = 0; i < count; ++i)
+        output[i] = float_to_half(input[i]);
+}
+
+__attribute__((target("avx2,f16c")))
+static void floats_to_half_avx2(const float *__restrict input,
+    uint16_t *__restrict output, int64_t count)
+{
+    int64_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        const __m256 values = _mm256_loadu_ps(input + i);
+        _mm_storeu_si128((__m128i *)(output + i), _mm256_cvtps_ph(values, 0));
+    }
+    for (; i < count; ++i)
+        output[i] = _cvtss_sh(input[i], _MM_FROUND_TO_NEAREST_INT);
+}
+
+static float dot_f16_scalar(const uint16_t *__restrict left,
+    const uint16_t *__restrict right, int64_t count)
+{
+    double sum = 0.0;
+    int64_t i;
+    for (i = 0; i < count; ++i)
+        sum += (double)(half_to_float(left[i]) * half_to_float(right[i]));
+    return (float)sum;
+}
+
+__attribute__((target("avx2,f16c,fma")))
+static float dot_f16_avx2(const uint16_t *__restrict left,
+    const uint16_t *__restrict right, int64_t count)
+{
+    __m256 sums[4] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps()
+    };
+    int64_t i = 0;
+    int j;
+    double sum;
+
+    for (; i + 32 <= count; i += 32) {
+        for (j = 0; j < 4; ++j) {
+            const __m256 left_values = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(left + i + 8 * j)));
+            const __m256 right_values = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(right + i + 8 * j)));
+            sums[j] = _mm256_fmadd_ps(left_values, right_values, sums[j]);
+        }
+    }
+
+    sums[0] = _mm256_add_ps(sums[0], sums[2]);
+    sums[1] = _mm256_add_ps(sums[1], sums[3]);
+    sums[0] = _mm256_add_ps(sums[0], sums[1]);
+    {
+        const __m128 lanes = _mm_add_ps(_mm256_castps256_ps128(sums[0]),
+            _mm256_extractf128_ps(sums[0], 1));
+        const __m128 pairs = _mm_hadd_ps(lanes, lanes);
+        sum = (double)_mm_cvtss_f32(_mm_hadd_ps(pairs, pairs));
+    }
+    for (; i < count; ++i)
+        sum += (double)(half_to_float(left[i]) * half_to_float(right[i]));
+    return (float)sum;
+}
+
+static void scale_f16_scalar(uint16_t *__restrict values, int64_t count,
+    float factor)
+{
+    int64_t i;
+    for (i = 0; i < count; ++i)
+        values[i] = float_to_half(half_to_float(values[i]) * factor);
+}
+
+__attribute__((target("avx2,f16c")))
+static void scale_f16_avx2(uint16_t *__restrict values, int64_t count,
+    float factor)
+{
+    const __m256 factor_values = _mm256_set1_ps(factor);
+    int64_t i = 0;
+    int j;
+    for (; i + 32 <= count; i += 32) {
+        for (j = 0; j < 4; ++j) {
+            const __m256 values_f32 = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(values + i + 8 * j)));
+            _mm_storeu_si128((__m128i *)(values + i + 8 * j),
+                _mm256_cvtps_ph(_mm256_mul_ps(values_f32, factor_values), 0));
+        }
+    }
+    for (; i < count; ++i)
+        values[i] = _cvtss_sh(_cvtsh_ss(values[i]) * factor,
+            _MM_FROUND_TO_NEAREST_INT);
+}
+
+static void mad_f16_scalar(uint16_t *__restrict output,
+    const uint16_t *__restrict input, int64_t count, float factor)
+{
+    int64_t i;
+    for (i = 0; i < count; ++i)
+        output[i] = float_to_half(half_to_float(output[i]) +
+            half_to_float(input[i]) * factor);
+}
+
+__attribute__((target("avx2,f16c,fma")))
+static void mad_f16_avx2(uint16_t *__restrict output,
+    const uint16_t *__restrict input, int64_t count, float factor)
+{
+    const __m256 factor_values = _mm256_set1_ps(factor);
+    int64_t i = 0;
+    int j;
+    for (; i + 32 <= count; i += 32) {
+        for (j = 0; j < 4; ++j) {
+            const __m256 input_f32 = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(input + i + 8 * j)));
+            const __m256 output_f32 = _mm256_cvtph_ps(
+                _mm_loadu_si128((const __m128i *)(output + i + 8 * j)));
+            _mm_storeu_si128((__m128i *)(output + i + 8 * j),
+                _mm256_cvtps_ph(_mm256_fmadd_ps(input_f32, factor_values,
+                    output_f32), 0));
+        }
+    }
+    for (; i < count; ++i)
+        output[i] = _cvtss_sh(_cvtsh_ss(output[i]) +
+            _cvtsh_ss(input[i]) * factor, _MM_FROUND_TO_NEAREST_INT);
+}
+
+void fortai_flash_attention_f16(const float *__restrict query,
+    const float *__restrict key_cache, const float *__restrict value_cache,
+    int64_t count, int64_t key_stride, int64_t value_stride,
+    int64_t key_size, int64_t value_size, float scale,
+    float *__restrict output)
+{
+    typedef void (*convert_fn)(const float *, uint16_t *, int64_t);
+    typedef float (*dot_fn)(const uint16_t *, const uint16_t *, int64_t);
+    typedef void (*scale_fn)(uint16_t *, int64_t, float);
+    typedef void (*mad_fn)(uint16_t *, const uint16_t *, int64_t, float);
+    convert_fn convert = floats_to_half_scalar;
+    dot_fn dot = dot_f16_scalar;
+    scale_fn scale_values = scale_f16_scalar;
+    mad_fn add_scaled = mad_f16_scalar;
+    float sum = 0.0f;
+    float maximum = -INFINITY;
+    int64_t cache_index, i;
+
+    if (count <= 0 || key_stride < key_size || value_stride < value_size ||
+            key_size <= 0 || value_size <= 0)
+        return;
+
+#if defined(__GNUC__)
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c") &&
+            __builtin_cpu_supports("fma")) {
+        convert = floats_to_half_avx2;
+        dot = dot_f16_avx2;
+        scale_values = scale_f16_avx2;
+        add_scaled = mad_f16_avx2;
+    }
+#endif
+
+    {
+        uint16_t query_f16[key_size];
+        uint16_t key_f16[key_size];
+        uint16_t value_f16[value_size];
+        uint16_t accumulator_f16[value_size];
+
+        convert(query, query_f16, key_size);
+        for (i = 0; i < value_size; ++i)
+            accumulator_f16[i] = 0;
+
+        for (cache_index = 0; cache_index < count; ++cache_index) {
+            const float old_maximum = maximum;
+            float maximum_scale = 1.0f;
+            float value_scale = 1.0f;
+            float score;
+
+            convert(key_cache + cache_index * key_stride, key_f16, key_size);
+            score = dot(key_f16, query_f16, key_size) * scale;
+            if (score > maximum) {
+                maximum = score;
+                maximum_scale = expf(old_maximum - maximum);
+                scale_values(accumulator_f16, value_size, maximum_scale);
+            } else {
+                value_scale = expf(score - maximum);
+            }
+
+            convert(value_cache + cache_index * value_stride, value_f16, value_size);
+            add_scaled(accumulator_f16, value_f16, value_size, value_scale);
+            sum = fmaf(sum, maximum_scale, value_scale);
+        }
+
+        {
+            const float inverse_sum = sum == 0.0f ? 0.0f : 1.0f / sum;
+            for (i = 0; i < value_size; ++i)
+                output[i] = half_to_float(accumulator_f16[i]) * inverse_sum;
+        }
+    }
 }
 
 static void q8_quantize_scalar(const float *__restrict input,
@@ -342,14 +571,17 @@ float fortai_q8_dot(const int8_t *__restrict weights,
 }
 
 __attribute__((target("avx2,fma")))
-static inline float horizontal_sum(__m256 value)
+static inline float reduce_dot_sums(__m256 sums[4])
 {
-    const __m128 lower = _mm256_castps256_ps128(value);
-    const __m128 upper = _mm256_extractf128_ps(value, 1);
-    __m128 sum = _mm_add_ps(lower, upper);
-    sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
-    sum = _mm_add_ss(sum, _mm_movehdup_ps(sum));
-    return _mm_cvtss_f32(sum);
+    __m128 lanes, pairs;
+
+    sums[0] = _mm256_add_ps(sums[0], sums[2]);
+    sums[1] = _mm256_add_ps(sums[1], sums[3]);
+    sums[0] = _mm256_add_ps(sums[0], sums[1]);
+    lanes = _mm_add_ps(_mm256_castps256_ps128(sums[0]),
+        _mm256_extractf128_ps(sums[0], 1));
+    pairs = _mm_hadd_ps(lanes, lanes);
+    return _mm_cvtss_f32(_mm_hadd_ps(pairs, pairs));
 }
 
 __attribute__((target("avx2,fma")))
@@ -362,37 +594,60 @@ static void gdn_step_avx2(float *state, const float *key, const float *value,
 
     for (row = 0; row < head_size; ++row) {
         float *state_row = state + row * head_size;
-        __m256 key_dot = _mm256_setzero_ps();
-        int64_t column;
+        __m256 key_sums[4] = {
+            _mm256_setzero_ps(), _mm256_setzero_ps(),
+            _mm256_setzero_ps(), _mm256_setzero_ps()
+        };
+        int64_t column = 0;
+        int j;
 
 #if defined(__GNUC__)
 #pragma GCC unroll 4
 #endif
-        for (column = 0; column < head_size; column += 8) {
-            const __m256 state_values = _mm256_loadu_ps(state_row + column);
-            const __m256 key_values = _mm256_loadu_ps(key + column);
-            const __m256 decayed_state = _mm256_mul_ps(state_values, decay_vector);
-            _mm256_storeu_ps(state_row + column,
-                decayed_state);
-            key_dot = _mm256_fmadd_ps(decayed_state, key_values, key_dot);
+        for (; column + 32 <= head_size; column += 32) {
+            for (j = 0; j < 4; ++j) {
+                const __m256 state_values = _mm256_loadu_ps(state_row + column + 8 * j);
+                const __m256 key_values = _mm256_loadu_ps(key + column + 8 * j);
+                const __m256 decayed_state = _mm256_mul_ps(state_values, decay_vector);
+                _mm256_storeu_ps(state_row + column + 8 * j, decayed_state);
+                key_sums[j] = _mm256_fmadd_ps(decayed_state, key_values, key_sums[j]);
+            }
         }
         {
-            const float delta = (value[row] - horizontal_sum(key_dot)) * beta;
+            float key_dot = reduce_dot_sums(key_sums);
+            for (; column < head_size; ++column) {
+                state_row[column] *= decay;
+                key_dot += state_row[column] * key[column];
+            }
+            const float delta = (value[row] - key_dot) * beta;
             const __m256 delta_vector = _mm256_set1_ps(delta);
-            __m256 query_dot = _mm256_setzero_ps();
+            __m256 query_sums[4] = {
+                _mm256_setzero_ps(), _mm256_setzero_ps(),
+                _mm256_setzero_ps(), _mm256_setzero_ps()
+            };
 
+            column = 0;
 #if defined(__GNUC__)
 #pragma GCC unroll 4
 #endif
-            for (column = 0; column < head_size; column += 8) {
-                __m256 state_values = _mm256_loadu_ps(state_row + column);
-                const __m256 key_values = _mm256_loadu_ps(key + column);
-                const __m256 query_values = _mm256_loadu_ps(query + column);
-                state_values = _mm256_fmadd_ps(delta_vector, key_values, state_values);
-                _mm256_storeu_ps(state_row + column, state_values);
-                query_dot = _mm256_fmadd_ps(state_values, query_values, query_dot);
+            for (; column + 32 <= head_size; column += 32) {
+                for (j = 0; j < 4; ++j) {
+                    __m256 state_values = _mm256_loadu_ps(state_row + column + 8 * j);
+                    const __m256 key_values = _mm256_loadu_ps(key + column + 8 * j);
+                    const __m256 query_values = _mm256_loadu_ps(query + column + 8 * j);
+                    state_values = _mm256_fmadd_ps(delta_vector, key_values, state_values);
+                    _mm256_storeu_ps(state_row + column + 8 * j, state_values);
+                    query_sums[j] = _mm256_fmadd_ps(state_values, query_values, query_sums[j]);
+                }
             }
-            output[row] = horizontal_sum(query_dot) * output_scale;
+            {
+                float query_dot = reduce_dot_sums(query_sums);
+                for (; column < head_size; ++column) {
+                    state_row[column] += delta * key[column];
+                    query_dot += state_row[column] * query[column];
+                }
+                output[row] = query_dot * output_scale;
+            }
         }
     }
 }
@@ -429,7 +684,8 @@ void fortai_gdn_step(float *state, const float *key, const float *value,
     float output_scale, float *output)
 {
 #if defined(__GNUC__)
-    if (__builtin_cpu_supports("avx2") && head_size >= 8 && head_size % 8 == 0) {
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+            head_size >= 8 && head_size % 8 == 0) {
         gdn_step_avx2(state, key, value, query, decay, beta, head_size,
             output_scale, output);
         return;
@@ -443,8 +699,6 @@ __attribute__((target("avx2,fma")))
 static void silu_array_avx2(float *values, int64_t count)
 {
     const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 lower = _mm256_set1_ps(-20.0f);
-    const __m256 upper = _mm256_set1_ps(20.0f);
     int64_t index;
 
     for (index = 0; index + 8 <= count; index += 8) {
@@ -452,10 +706,6 @@ static void silu_array_avx2(float *values, int64_t count)
         const __m256 exponent = expf_avx2(_mm256_sub_ps(
             _mm256_setzero_ps(), input));
         __m256 result = _mm256_div_ps(input, _mm256_add_ps(one, exponent));
-        result = _mm256_blendv_ps(result, _mm256_setzero_ps(),
-            _mm256_cmp_ps(input, lower, _CMP_LT_OQ));
-        result = _mm256_blendv_ps(result, input,
-            _mm256_cmp_ps(input, upper, _CMP_GT_OQ));
         _mm256_storeu_ps(values + index, result);
     }
     for (; index < count; ++index)
@@ -473,7 +723,7 @@ static void silu_array_scalar(float *values, int64_t count)
 void fortai_silu(float *values, int64_t count)
 {
 #if defined(__GNUC__)
-    if (__builtin_cpu_supports("avx2") && count >= 8) {
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && count >= 8) {
         silu_array_avx2(values, count);
         return;
     }
@@ -485,8 +735,6 @@ __attribute__((target("avx2,fma")))
 static void silu_product_avx2(float *left, const float *right, int64_t count)
 {
     const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 lower = _mm256_set1_ps(-20.0f);
-    const __m256 upper = _mm256_set1_ps(20.0f);
     int64_t index;
 
     for (index = 0; index + 8 <= count; index += 8) {
@@ -494,10 +742,6 @@ static void silu_product_avx2(float *left, const float *right, int64_t count)
         const __m256 exponent = expf_avx2(_mm256_sub_ps(
             _mm256_setzero_ps(), input));
         __m256 result = _mm256_div_ps(input, _mm256_add_ps(one, exponent));
-        result = _mm256_blendv_ps(result, _mm256_setzero_ps(),
-            _mm256_cmp_ps(input, lower, _CMP_LT_OQ));
-        result = _mm256_blendv_ps(result, input,
-            _mm256_cmp_ps(input, upper, _CMP_GT_OQ));
         result = _mm256_mul_ps(result, _mm256_loadu_ps(right + index));
         _mm256_storeu_ps(left + index, result);
     }
@@ -516,7 +760,7 @@ static void silu_product_scalar(float *left, const float *right, int64_t count)
 void fortai_silu_product(float *left, const float *right, int64_t count)
 {
 #if defined(__GNUC__)
-    if (__builtin_cpu_supports("avx2") && count >= 8) {
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && count >= 8) {
         silu_product_avx2(left, right, count);
         return;
     }

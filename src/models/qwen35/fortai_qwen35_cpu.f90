@@ -29,6 +29,17 @@ module fortai_qwen35_cpu
             integer(c_int64_t), value, intent(in) :: count
         end subroutine fortai_q8_quantize
 
+        subroutine fortai_flash_attention_f16(query, key_cache, value_cache, count, &
+                key_stride, value_stride, key_size, value_size, scale, output) &
+                bind(C, name='fortai_flash_attention_f16')
+            import c_float, c_int64_t
+            real(c_float), intent(in) :: query(*), key_cache(*), value_cache(*)
+            integer(c_int64_t), value, intent(in) :: count, key_stride, value_stride
+            integer(c_int64_t), value, intent(in) :: key_size, value_size
+            real(c_float), value, intent(in) :: scale
+            real(c_float), intent(out) :: output(*)
+        end subroutine fortai_flash_attention_f16
+
         subroutine fortai_gdn_step(state, key, value, query, decay, beta, head_size, &
                 output_scale, output) bind(C, name='fortai_gdn_step')
             import c_float, c_int64_t
@@ -807,7 +818,7 @@ contains
         integer :: channel, head, j, key_head, slot
         integer :: key_offset, query_offset, state_offset, value_offset
         integer(int64) :: tensor_index
-        real(real32) :: accumulator, beta, decay, decay_factor, norm_factor
+        real(real32) :: accumulator, beta, decay, decay_factor, inverse_norm
         real(c_float) :: elapsed_ms
 
         call stat % clear()
@@ -904,12 +915,12 @@ contains
                 int(self % recurrent_head_size, c_int64_t), &
                 1.0_real32 / sqrt(real(self % recurrent_head_size, real32)), &
                 self % attention_work((head - 1) * self % recurrent_head_size + 1:))
-            norm_factor = rms_slice(self % attention_work, &
+            inverse_norm = rms_inverse_scale(self % attention_work, &
                 (head - 1) * self % recurrent_head_size + 1, self % recurrent_head_size, &
                 self % norm_epsilon)
             do j = 1, self % recurrent_head_size
                 self % attention_work((head - 1) * self % recurrent_head_size + j) = &
-                    self % attention_work((head - 1) * self % recurrent_head_size + j) / norm_factor * &
+                    self % attention_work((head - 1) * self % recurrent_head_size + j) * inverse_norm * &
                     self % file % tensors(layer % ssm_norm) % value(int(j, int64)) * &
                     self % gate_work((head - 1) * self % recurrent_head_size + j)
             end do
@@ -980,8 +991,8 @@ contains
         type(qwen35_cpu_layer_t), intent(inout) :: layer
         integer(int64), intent(in) :: position
         type(status_t), intent(out) :: stat
-        integer :: head, i, kv_head, previous, q_offset, k_offset, v_offset
-        real(real32) :: score, maximum, normalizer, weight, accumulator
+        integer :: head, i, kv_head, q_offset, k_offset, v_offset
+        real(real32) :: attention_scale
 
         call stat % clear()
         call model_matvec_triplet(self, layer % attn_q, layer % attn_k, layer % attn_v, &
@@ -1002,32 +1013,21 @@ contains
         call apply_rope(self % k_work, self % attention_heads_kv, self % attention_head_size, &
             position, self % rope_dimension, self % rope_base)
         call self % layers_state_store(layer, position)
+        attention_scale = 1.0_real32 / sqrt(real(self % attention_head_size, real32))
 
         do head = 1, self % attention_heads
             kv_head = (head - 1) / (self % attention_heads / self % attention_heads_kv)
-            maximum = -huge(1.0_real32)
-            do previous = 0, int(position)
-                score = 0.0_real32
-                do i = 1, self % attention_head_size
-                    score = score + self % q_work((head - 1) * 2 * self % attention_head_size + i) * &
-                        self % layers_key_value(layer, kv_head, previous, i, .true.)
-                end do
-                self % scores(previous + 1) = score / sqrt(real(self % attention_head_size, real32))
-                maximum = max(maximum, self % scores(previous + 1))
-            end do
-            normalizer = 0.0_real32
-            do previous = 0, int(position)
-                self % scores(previous + 1) = exp(self % scores(previous + 1) - maximum)
-                normalizer = normalizer + self % scores(previous + 1)
-            end do
+            q_offset = (head - 1) * 2 * self % attention_head_size
             v_offset = (head - 1) * self % value_length
+            call fortai_flash_attention_f16(self % q_work(q_offset + 1:), &
+                layer % key_cache(kv_head * self % attention_head_size + 1:), &
+                layer % value_cache(kv_head * self % value_length + 1:), position + 1_int64, &
+                int(self % attention_head_size * self % attention_heads_kv, c_int64_t), &
+                int(self % value_length * self % attention_heads_kv, c_int64_t), &
+                int(self % attention_head_size, c_int64_t), int(self % value_length, c_int64_t), &
+                attention_scale, self % attention_work(v_offset + 1:))
             do i = 1, self % value_length
-                accumulator = 0.0_real32
-                do previous = 0, int(position)
-                    accumulator = accumulator + self % scores(previous + 1) / normalizer * &
-                        self % layers_key_value(layer, kv_head, previous, i, .false.)
-                end do
-                self % attention_work(v_offset + i) = accumulator * &
+                self % attention_work(v_offset + i) = self % attention_work(v_offset + i) * &
                     sigmoid(self % q_work(q_offset_for_gate(head, self % attention_head_size) + i))
             end do
         end do
@@ -1421,7 +1421,7 @@ contains
         end if
         sum_squares = 0.0_real64
         do i = 1, size(input)
-            sum_squares = sum_squares + real(input(i), real64) * real(input(i), real64)
+            sum_squares = sum_squares + real(input(i) * input(i), real64)
         end do
         mean = real(sum_squares / real(size(input), real64), real32)
         inverse_scale = 1.0_real32 / sqrt(mean + epsilon)
@@ -1442,7 +1442,7 @@ contains
 
         sum_squares = 0.0_real64
         do i = first, first + length - 1
-            sum_squares = sum_squares + real(values(i), real64) * real(values(i), real64)
+            sum_squares = sum_squares + real(values(i) * values(i), real64)
         end do
         mean = real(sum_squares / real(length, real64), real32)
         inverse_scale = 1.0_real32 / sqrt(mean + epsilon)
@@ -1462,7 +1462,7 @@ contains
 
         sum_squares = 0.0_real64
         do i = first, first + length - 1
-            sum_squares = sum_squares + real(values(i), real64) * real(values(i), real64)
+            sum_squares = sum_squares + real(values(i) * values(i), real64)
         end do
         inverse_scale = 1.0_real32 / max(sqrt(real(sum_squares, real32)), epsilon)
         do i = first, first + length - 1
@@ -1506,11 +1506,7 @@ contains
     real(real32) function sigmoid(value)
         real(real32), intent(in) :: value
 
-        if (value >= 0.0_real32) then
-            sigmoid = 1.0_real32 / (1.0_real32 + exp(-value))
-        else
-            sigmoid = exp(value) / (1.0_real32 + exp(value))
-        end if
+        sigmoid = 1.0_real32 / (1.0_real32 + exp(-value))
     end function sigmoid
 
     real(real32) function softplus(value)
@@ -1525,7 +1521,7 @@ contains
         end if
     end function softplus
 
-    real(real32) function rms_slice(values, first, length, epsilon)
+    real(real32) function rms_inverse_scale(values, first, length, epsilon)
         real(real32), intent(in) :: values(:), epsilon
         integer, intent(in) :: first, length
         integer :: i
@@ -1533,10 +1529,11 @@ contains
 
         sum_squares = 0.0_real64
         do i = first, first + length - 1
-            sum_squares = sum_squares + real(values(i), real64) * real(values(i), real64)
+            sum_squares = sum_squares + real(values(i) * values(i), real64)
         end do
-        rms_slice = sqrt(real(sum_squares / real(length, real64), real32) + epsilon)
-    end function rms_slice
+        rms_inverse_scale = 1.0_real32 / &
+            sqrt(real(sum_squares / real(length, real64), real32) + epsilon)
+    end function rms_inverse_scale
 
     integer function q_offset_for_gate(head, head_size)
         integer, intent(in) :: head, head_size
