@@ -115,6 +115,17 @@ promotion is claimed. The clean paired profile
 `84.06%` in `ggml_vec_dot_q8_0_q8_0`; host perf counters are usable, while
 the remaining gate is still model-level scaling.
 
+After the oracle-provenance fix in revision `0cc24222ce091c97cb1a0a8af3f70f33e22101e8`,
+the same 0.8B candidate was rerun with the immutable `master/cores` affinity.
+The promotion-grade artifact
+`benchmark/results/tournament_Qwen3.5-0.8B-Q8_0_20260823T183647Z.json`
+passes all required levels `1 2 4 8 16 32 64`, with five repeats per level,
+an isolated CPU server, hidden CUDA, verified cleanup, and the bound centered
+top-32 oracle (maximum error `2.431842038852494e-7`). FortAI's median speedups
+over llama.cpp range from `1.12x` at one thread to `2.89x` at 64 threads.
+This closes the 0.8B candidate's measured 1–64 gate; FAI-CPU-003 remains open
+until the scoped small-model acceptance is explicitly reviewed.
+
 The low-level CPU path is not missing an assembly implementation. The tracked
 `src/backend/cpu/fortai_q8_dot.c` contains AVX2/F16C/FMA kernels for Q8 dot,
 activation quantization, dequantization, SiLU, SiLU-product, and GDN steps;
