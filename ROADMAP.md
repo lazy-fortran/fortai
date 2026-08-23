@@ -101,7 +101,8 @@ forward fusion is a materially larger redesign and remains unpromoted until it
 passes the independent logits oracle and the full seven-level tournament.
 
 Revision `93b32de46fe3d5bc27a819b393b4235e4c4131d0` adds an opt-in
-`FORTAI_ENABLE_PERSISTENT_OPENMP=1` worker region for the Qwen3.5-0.8B shape.
+`FORTAI_ENABLE_PERSISTENT_OPENMP=1` worker region for the permitted Qwen3.5
+Q8_0 CPU model shapes.
 It keeps the default path unchanged, records the mode in comparison, repeat,
 tournament, oracle, and perf-profile provenance, and passes the isolated
 centered-top-32 oracle (maximum error `2.431842038852494e-7`). A fresh
@@ -125,6 +126,14 @@ top-32 oracle (maximum error `2.431842038852494e-7`). FortAI's median speedups
 over llama.cpp range from `1.12x` at one thread to `2.89x` at 64 threads.
 This closes the 0.8B candidate's measured 1–64 gate; FAI-CPU-003 remains open
 until the scoped small-model acceptance is explicitly reviewed.
+
+The persistent mode also passes isolated centered-top-32 oracles for 2B
+(`3.5649993890274345e-7`) and 4B (`2.434161379127886e-7`) at revision
+`425f780994951bd2621c9029154a3d4cdde7fdb0`. Five-repeat 16-thread spot
+comparisons under `master/cores` record FortAI medians of `13.6344` versus
+`9.0708` tokens/s (2B) and `6.1973` versus `4.6517` tokens/s (4B) for
+llama.cpp; these are model-size spot checks, not full seven-level tournament
+promotions.
 
 The low-level CPU path is not missing an assembly implementation. The tracked
 `src/backend/cpu/fortai_q8_dot.c` contains AVX2/F16C/FMA kernels for Q8 dot,
