@@ -17,7 +17,7 @@ steps="${3:-${FORTAI_BENCH_STEPS:-8}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 threads="${OMP_NUM_THREADS:-$(nproc)}"
 llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"
-llama_library_dir="${LLAMA_LIBRARY_DIR:-/home/ert/.local/llama.cpp-b10430-cuda}"
+llama_library_dir="${LLAMA_LIBRARY_DIR:-}"
 port="${LLAMA_PORT:-18081}"
 result_dir="$root_dir/benchmark/results"
 log_dir="$root_dir/benchmark/logs"
@@ -65,6 +65,9 @@ import hashlib
 import sys
 from pathlib import Path
 
+if not sys.argv[1]:
+    print("none")
+    raise SystemExit
 directory = Path(sys.argv[1])
 digest = hashlib.sha256()
 if directory.is_dir():
@@ -129,6 +132,60 @@ for attempt in $(seq 1 120); do
     fi
 done
 
+llama_process_provenance=$(LLAMA_SERVER_PID="$server_pid" \
+LLAMA_CONFIGURED_LIBRARY_DIR="$llama_library_dir" python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+pid = int(os.environ["LLAMA_SERVER_PID"])
+executable = Path(f"/proc/{pid}/exe").resolve(strict=True)
+mapped_paths = set()
+for line in Path(f"/proc/{pid}/maps").read_text().splitlines():
+    fields = line.split()
+    if len(fields) < 6 or not fields[-1].startswith("/"):
+        continue
+    path = Path(fields[-1]).resolve(strict=True)
+    if path.name.startswith("libllama") or path.name.startswith("libggml"):
+        mapped_paths.add(path)
+libraries = [
+    {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    for path in sorted(mapped_paths, key=str)
+]
+
+configured = os.environ.get("LLAMA_CONFIGURED_LIBRARY_DIR", "")
+if configured:
+    root = Path(configured).resolve(strict=True)
+    mismatched = []
+    for item in libraries:
+        try:
+            Path(item["path"]).relative_to(root)
+        except ValueError:
+            mismatched.append(item["path"])
+    if mismatched:
+        raise SystemExit(
+            "loaded llama.cpp libraries are outside LLAMA_LIBRARY_DIR: "
+            + ", ".join(mismatched)
+        )
+
+print(json.dumps({
+    "executable": str(executable),
+    "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+    "loaded_libraries": libraries,
+}, sort_keys=True))
+PY
+)
+llama_version=$("$llama_server" --version 2>&1 | \
+    sed -n '/^version:/p;/^built with /p')
+if [[ -z "$llama_version" ]]; then
+    echo "llama-server did not report its version" >&2
+    exit 1
+fi
+
 if command -v nvidia-smi >/dev/null 2>&1; then
     if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
         | grep -Eq "^[[:space:]]*${server_pid}[[:space:]]*$"; then
@@ -159,7 +216,8 @@ ORACLE_PROBS="${FORTAI_LLAMA_ORACLE_PROBS:-0}" \
 LLAMA_CLEANUP="verified" LLAMA_SERVER_PATH="$llama_server" \
 LLAMA_SERVER_SHA256="$llama_server_sha256" LLAMA_LIBRARY_DIR="$llama_library_dir" \
 LLAMA_LIBRARY_DIGEST="$llama_library_digest" CPU_MODEL="$cpu_model" \
-LLAMA_RECORD="$llama_record" \
+LLAMA_RECORD="$llama_record" LLAMA_PROCESS_PROVENANCE="$llama_process_provenance" \
+LLAMA_VERSION="$llama_version" \
 python3 - <<'PY'
 import hashlib
 import json
@@ -184,6 +242,7 @@ if record_path.is_file():
         if "=" in line:
             key, value = line.split("=", 1)
             llama_provenance[key] = value
+process_provenance = json.loads(os.environ["LLAMA_PROCESS_PROVENANCE"])
 result = {
     "fortai_commit": os.environ["COMMIT"],
     "fortai_patch_digest": os.environ["PATCH_DIGEST"],
@@ -206,6 +265,12 @@ result = {
     "llama_cpp_provenance": llama_provenance,
     "llama_server": os.environ["LLAMA_SERVER_PATH"],
     "llama_server_sha256": os.environ["LLAMA_SERVER_SHA256"],
+    "llama_launcher": os.environ["LLAMA_SERVER_PATH"],
+    "llama_launcher_sha256": os.environ["LLAMA_SERVER_SHA256"],
+    "llama_executable": process_provenance["executable"],
+    "llama_executable_sha256": process_provenance["executable_sha256"],
+    "llama_loaded_libraries": process_provenance["loaded_libraries"],
+    "llama_version": os.environ["LLAMA_VERSION"],
     "llama_library_dir": os.environ["LLAMA_LIBRARY_DIR"],
     "llama_library_digest": os.environ["LLAMA_LIBRARY_DIGEST"],
     "fortai": runner,

@@ -35,7 +35,11 @@ The comparison is strictly CPU-only. The installed llama-server links
 libggml-cuda, so `-ngl 0 --device none` alone still lets the CUDA backend
 initialize; the wrapper therefore also exports `CUDA_VISIBLE_DEVICES=""` and,
 when `nvidia-smi` is available, fails if the server appears as a GPU compute
-process. The result JSON records `cuda_visible_devices`.
+process. The result JSON records `cuda_visible_devices`, the launcher and
+actual process-image digests, the reported llama.cpp version, and every loaded
+`libllama`/`libggml` path and digest. `LLAMA_LIBRARY_DIR` is optional; when it
+is explicitly set, the comparison fails if the process loads those libraries
+from another directory.
 
 ## Resident CUDA kernel
 
