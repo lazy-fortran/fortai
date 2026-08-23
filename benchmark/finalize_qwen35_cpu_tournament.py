@@ -181,6 +181,7 @@ def finalize(
         "llama_executable_sha256",
         "llama_loaded_libraries",
         "llama_version",
+        "temporary_llama_server_cleanup",
     ):
         if oracle.get(key) != first.get(key):
             raise ValueError(f"oracle does not match tournament {key}")
@@ -192,6 +193,8 @@ def finalize(
         raise ValueError("behavioral oracle is not performance-gate eligible")
     if oracle.get("llama_server_cleanup") != "verified":
         raise ValueError("behavioral oracle did not verify cleanup")
+    if oracle.get("temporary_llama_server_cleanup") != "verified":
+        raise ValueError("behavioral oracle did not verify temporary cleanup")
     if int(oracle.get("omp_num_threads", 0)) != int(best_fortai["omp_num_threads"]):
         raise ValueError("behavioral oracle is not bound to the best FortAI thread")
     if int(oracle.get("steps", 0)) != oracle_steps:
@@ -205,6 +208,16 @@ def finalize(
 
     return {
         "kind": "qwen35_cpu_thread_tournament",
+        "lifecycle": {
+            "leaf_id": "FAI-CPU-003",
+            "leaf_status": "IN_PROGRESS",
+            "claim_id": "FAI-CPU-003",
+            "claim_status": "OPEN",
+            "parent_id": "FAI-CPU",
+            "parent_status": "OPEN",
+            "evidence_gate_verdict": "PASS",
+            "review_verdict": "NEEDS REVIEW",
+        },
         "fortai_commit": first["fortai_commit"],
         "fortai_patch_digest": first["fortai_patch_digest"],
         "fortai_tracked_tree_digest": first["fortai_tracked_tree_digest"],
@@ -222,6 +235,12 @@ def finalize(
         "metric": "median_matched_forward_steps_per_second",
         "measurement_conditions": "isolated",
         "performance_gate_eligible": True,
+        "cuda_visible_devices": first["cuda_visible_devices"],
+        "oracle_contract": {
+            "steps": oracle_steps,
+            "top_k": oracle_top_k,
+            "tolerance": oracle_tolerance,
+        },
         "best_fortai": {
             "omp_num_threads": int(best_fortai["omp_num_threads"]),
             "median_steps_per_second": fortai_median,
@@ -296,6 +315,7 @@ def self_test() -> None:
             "shared_service_conditions": False,
             "performance_gate_eligible": True,
             "llama_server_cleanup": "verified",
+            "temporary_llama_server_cleanup": "verified",
             "omp_num_threads": 1,
             "steps": 8,
             "top_k": 32,
@@ -307,6 +327,21 @@ def self_test() -> None:
         result = finalize([summary_a, summary_b], oracle_path)
         assert result["winner"] == "fortai"
         assert result["best_fortai"]["omp_num_threads"] == 1
+        assert result["lifecycle"] == {
+            "leaf_id": "FAI-CPU-003",
+            "leaf_status": "IN_PROGRESS",
+            "claim_id": "FAI-CPU-003",
+            "claim_status": "OPEN",
+            "parent_id": "FAI-CPU",
+            "parent_status": "OPEN",
+            "evidence_gate_verdict": "PASS",
+            "review_verdict": "NEEDS REVIEW",
+        }
+        assert result["oracle_contract"] == {
+            "steps": 8,
+            "top_k": 32,
+            "tolerance": 1.0e-2,
+        }
 
         mixed_repeats = _fixture(2)
         mixed_repeats["repeats"] = 6
@@ -361,6 +396,16 @@ def self_test() -> None:
             pass
         else:
             raise AssertionError("weaker oracle contract was accepted")
+        incomplete_cleanup_oracle = root / "incomplete_cleanup_oracle.json"
+        incomplete_cleanup_oracle.write_text(
+            json.dumps({**oracle, "temporary_llama_server_cleanup": "unverified"})
+        )
+        try:
+            finalize([summary_a], incomplete_cleanup_oracle)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("incomplete oracle cleanup was accepted")
         runtime_oracle = root / "runtime_oracle.json"
         runtime_oracle.write_text(json.dumps({**oracle, "compiler": "other"}))
         try:
