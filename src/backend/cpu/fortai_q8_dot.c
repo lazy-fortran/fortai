@@ -455,7 +455,7 @@ static void q8_dequantize_row_scalar(const int8_t *__restrict weights,
     }
 }
 
-__attribute__((target("avx2,f16c,fma")))
+__attribute__((target("avx2,f16c")))
 static void q8_dequantize_row_avx2(const int8_t *__restrict weights,
     float *__restrict output, int64_t block_count)
 {
@@ -564,7 +564,8 @@ float fortai_q8_dot(const int8_t *__restrict weights,
     int64_t row, int64_t block_count)
 {
 #if defined(__GNUC__)
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c"))
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c") &&
+            __builtin_cpu_supports("fma"))
         return q8_dot_avx2(weights, quantized, scales, row, block_count);
 #endif
     return q8_dot_scalar(weights, quantized, scales, row, block_count);
