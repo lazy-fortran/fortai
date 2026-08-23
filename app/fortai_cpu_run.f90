@@ -6,14 +6,16 @@ program fortai_cpu_run
 
     type(qwen35_cpu_model_t) :: model
     type(status_t) :: stat
-    real(real32), allocatable :: logits(:)
+    real(real32), allocatable :: logits(:), ranked_logits(:)
     character(len=512) :: model_path, argument
     integer(int64) :: token, steps, context, position, next_token
     integer :: clock_start, clock_end, clock_rate, max_index, ios, trace_length
     integer :: sample_start, sample_end
     integer :: load_start, load_end, forward_start, forward_end
+    integer :: rank, top_count, top_index, trace_top_ios, trace_top_length
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
-    character(len=16) :: trace_tokens
+    real(real32) :: maximum_logit
+    character(len=16) :: trace_tokens, trace_top_logits
     logical :: trace_enabled
 
     call get_command_argument(1, model_path)
@@ -34,6 +36,15 @@ program fortai_cpu_run
     call get_environment_variable('FORTAI_TRACE_TOKENS', trace_tokens, length=trace_length)
     trace_enabled = .false.
     if (trace_length > 0) trace_enabled = trace_tokens(1:trace_length) == '1'
+    top_count = 0
+    call get_environment_variable('FORTAI_TRACE_TOP_LOGITS', trace_top_logits, &
+        length=trace_top_length)
+    if (trace_top_length > 0) then
+        if (trace_top_length > len(trace_top_logits)) error stop 2
+        read (trace_top_logits(1:trace_top_length), *, iostat=trace_top_ios) top_count
+        if (trace_top_ios /= 0) error stop 2
+        if (top_count < 0) error stop 2
+    end if
 
     call system_clock(clock_start, clock_rate)
     load_start = clock_start
@@ -44,6 +55,8 @@ program fortai_cpu_run
     end if
     call system_clock(load_end)
     allocate (logits(model%vocabulary_size))
+    if (top_count > model%vocabulary_size) error stop 2
+    if (top_count > 0) allocate (ranked_logits(model%vocabulary_size))
     checksum = 0.0_real32
     sample_seconds = 0.0_real32
     call system_clock(forward_start)
@@ -54,6 +67,16 @@ program fortai_cpu_run
             error stop 1
         end if
         checksum = checksum + sum(logits)
+        if (top_count > 0) then
+            maximum_logit = maxval(logits)
+            ranked_logits = logits
+            do rank = 1, top_count
+                top_index = maxloc(ranked_logits, dim=1)
+                print '(a,i0,a,i0,a,i0,a,es16.8)', 'top_logit[', position, ',', rank, &
+                    ']=', top_index - 1, ',', ranked_logits(top_index) - maximum_logit
+                ranked_logits(top_index) = -huge(0.0_real32)
+            end do
+        end if
         call system_clock(sample_start)
         max_index = maxloc(logits, dim=1)
         call system_clock(sample_end)

@@ -146,7 +146,25 @@ OMP_NUM_THREADS=4 benchmark/check_qwen35_cpu_trace.sh \
 ```
 
 This asks llama.cpp for top-token IDs and compares them with FortAI's optional
-per-step trace. A nonzero exit is expected until Qwen3.5 model parity closes.
+per-step trace. The named 0.8B Q8_0 run currently passes, but matching greedy
+token IDs alone does not establish numeric logits parity.
+
+For a numeric CPU diagnostic, compare centered top logits against llama.cpp's
+pre-sampling log probabilities. Centering removes the common log-softmax
+normalization, so the reported values are directly comparable logits. This
+one-step form isolates the initial forward pass:
+
+```bash
+OMP_NUM_THREADS=2 benchmark/check_qwen35_cpu_logits.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 1 128 32 1.0e-2
+```
+
+The checker builds FortAI without fast-math, requires the same top-token and
+top-k token set, and reports the maximum centered-logit error together with
+both model and llama.cpp executable digests. Increase `steps` to 8 for the
+multi-step state gate. The initial-forward check currently passes for the
+named 0.8B fixture, while the multi-step check exposes a later state
+divergence; passing one step does not close FAI-CPU-002.
 
 ## Promotion rule
 

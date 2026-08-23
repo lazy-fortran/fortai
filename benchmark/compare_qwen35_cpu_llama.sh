@@ -15,6 +15,7 @@ fi
 token_id="${2:-${FORTAI_TOKEN_ID:-9419}}"
 steps="${3:-${FORTAI_BENCH_STEPS:-8}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
+oracle_top_k="${FORTAI_LLAMA_ORACLE_TOP_K:-0}"
 threads="${OMP_NUM_THREADS:-$(nproc)}"
 llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"
 llama_library_dir="${LLAMA_LIBRARY_DIR:-}"
@@ -27,6 +28,11 @@ base=$(basename "$model_path" .gguf)
 fortai_log="$log_dir/compare_fortai_${base}_${stamp}.log"
 llama_log="$log_dir/compare_llama_${base}_${stamp}.log"
 result_file="$result_dir/compare_${base}_${stamp}.json"
+
+if [[ ! "$oracle_top_k" =~ ^[0-9]+$ ]]; then
+    echo "FORTAI_LLAMA_ORACLE_TOP_K must be a nonnegative integer: $oracle_top_k" >&2
+    exit 2
+fi
 
 export OMP_NUM_THREADS="$threads"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-spread}"
@@ -94,7 +100,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-request=$(env TOKEN_ID="$token_id" STEPS="$steps" ORACLE_PROBS="${FORTAI_LLAMA_ORACLE_PROBS:-0}" python3 - <<'PY'
+request=$(env TOKEN_ID="$token_id" STEPS="$steps" ORACLE_PROBS="${FORTAI_LLAMA_ORACLE_PROBS:-0}" \
+ORACLE_TOP_K="$oracle_top_k" python3 - <<'PY'
 import json
 import os
 request = {
@@ -103,7 +110,11 @@ request = {
     "temperature": 0.0,
     "seed": 42,
 }
-if os.environ["ORACLE_PROBS"] == "1":
+top_k = int(os.environ["ORACLE_TOP_K"])
+if top_k > 0:
+    request["n_probs"] = top_k
+    request["post_sampling_probs"] = False
+elif os.environ["ORACLE_PROBS"] == "1":
     request["n_probs"] = 1
     request["post_sampling_probs"] = True
 print(json.dumps(request))
@@ -213,6 +224,7 @@ TRACKED_TREE_DIGEST="$tree_digest" \
 WORKTREE_DIGEST="$worktree_digest" \
 FORTAI_LOG_PATH="$fortai_log" LLAMA_LOG_PATH="$llama_log" \
 ORACLE_PROBS="${FORTAI_LLAMA_ORACLE_PROBS:-0}" \
+ORACLE_TOP_K="$oracle_top_k" \
 LLAMA_CLEANUP="verified" LLAMA_SERVER_PATH="$llama_server" \
 LLAMA_SERVER_SHA256="$llama_server_sha256" LLAMA_LIBRARY_DIR="$llama_library_dir" \
 LLAMA_LIBRARY_DIGEST="$llama_library_digest" CPU_MODEL="$cpu_model" \
@@ -251,6 +263,7 @@ result = {
     "fortai_log": os.environ["FORTAI_LOG_PATH"],
     "llama_log": os.environ["LLAMA_LOG_PATH"],
     "llama_oracle_probabilities": os.environ["ORACLE_PROBS"] == "1",
+    "llama_oracle_top_k": int(os.environ["ORACLE_TOP_K"]),
     "llama_server_cleanup": os.environ["LLAMA_CLEANUP"],
     "build_flags": os.environ["BUILD_FLAGS"],
     "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),

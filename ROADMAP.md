@@ -58,8 +58,10 @@ model-level forward and decode path. Kernel microbenchmarks and model-level
 token benchmarks must remain separate.
 
 The tracked trace verifier matches the 0.8B Q8_0 fixture for the eight-token
-oracle run beginning at token 9419. Current CPU evidence covers 0.8B, 2B, and
-4B Q8_0 model-level runs with the server stopped and sequential execution.
+oracle run beginning at token 9419. The centered-logit verifier matches the
+initial 0.8B forward pass, but its multi-step run exposes a later state
+divergence, so FAI-CPU-002 remains open. Current CPU evidence covers 0.8B, 2B,
+and 4B Q8_0 model-level runs with the server stopped and sequential execution.
 The CUDA evidence now includes an experimental device-resident Qwen3.5 path
 for the 0.8B, 2B, and 4B fixtures. The 0.8B eight-token CUDA trace matches
 llama.cpp. CUDA Graph replay was profiled as an A/B and is slower on the tested
