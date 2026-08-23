@@ -31,12 +31,13 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The tournament readiness implementation is revision
-`9fa44405c0aab8064f0c146d023775a1ac9fe6bb`. It refuses a resident
+`3fc6df9d1ac331facfb3311c136272b9d9b9bd08`. It refuses a resident
 `llama-server` before starting any timing, requires at least five repeats for
 each thread candidate, restricts both the wrapper and finalizer to the exact
 0.8B/2B/4B Q8_0 model allowlist, binds the selected median to the exact
-oracle step/top-k/tolerance contract, requires CUDA to remain hidden, and
-checks the independent centered-logit oracle. A successful finalizer also
+oracle step/top-k/tolerance contract, requires CUDA to remain hidden, validates
+the matched-forward metric, and checks the independent centered-logit oracle.
+A successful finalizer also
 emits exact FAI-CPU-003/FAI-CPU lifecycle IDs and explicit open/pending review
 axes without self-promoting the claim. No FAI-CPU-003 timing artifact or
 winner exists yet; the protected PID `268006` on port `8080` keeps this leaf
