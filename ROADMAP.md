@@ -31,10 +31,11 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The tournament readiness implementation is revision
-`3fc6df9d1ac331facfb3311c136272b9d9b9bd08`. It refuses a resident
+`12c08a57c15d2feda69e1dc8d027e60fb342905b`. It refuses a resident
 `llama-server` before starting any timing, requires at least five repeats for
-each thread candidate, restricts both the wrapper and finalizer to the exact
-0.8B/2B/4B Q8_0 model allowlist, binds the selected median to the exact
+each thread candidate, restricts the tournament and direct-repeat wrappers
+and finalizer to the exact 0.8B/2B/4B Q8_0 model allowlist, binds the selected
+median to the exact
 oracle step/top-k/tolerance contract, requires CUDA to remain hidden, validates
 the matched-forward metric, and checks the independent centered-logit oracle.
 A successful finalizer also
