@@ -31,7 +31,7 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The current tournament-readiness implementation anchor is revision
-`78bdb3a`. It refuses any unverified resident `llama-server` before starting
+`963df2960cc96037f67bbca2904bbe8c23baec09`. It refuses any unverified resident `llama-server` before starting
 timing, while allowing only the exact protected GPU service (PID `268006`,
 port `8080`) as independent from the CPU measurements. It requires at least five repeats for
 each thread candidate, restricts the tournament and direct-repeat wrappers
@@ -79,6 +79,21 @@ same token `9419`, context `128`, top-32, and `1.0e-2` tolerance contract:
 All three are explicitly shared-service correctness-only evidence because the
 protected server remains resident; they do not establish any performance
 claim or change the FAI-CPU-003 lifecycle.
+
+The low-level CPU path is not missing an assembly implementation. The tracked
+`src/backend/cpu/fortai_q8_dot.c` contains AVX2/F16C/FMA kernels for Q8 dot,
+activation quantization, dequantization, SiLU, SiLU-product, and GDN steps;
+the historical paired profile at
+`benchmark/profiles/Qwen3.5-0.8B-Q8_0_both_20260819T212359Z` captured Intel-
+syntax disassembly and retired counters. At two threads that profile reported
+FortAI `22.970B` instructions / `14.080B` cycles with `91.70%` of samples in
+`q8_dot_avx2`, versus llama.cpp `30.575B` instructions / `19.047B` cycles
+with `77.88%` in `ggml_vec_dot_q8_0_q8_0`; both were about `1.6` IPC. A
+fresh `llvm-mca -mcpu=znver3` analysis of the AVX2 Q8 inner block estimates a
+three-cycle backend throughput before cache and memory effects. This makes
+the remaining strict 1–64-thread gate a scheduling/parallel graph problem,
+not a missing scalar-to-assembly conversion; no theoretical optimum claim is
+promoted until a reproducible current-runtime profile and tournament pass.
 
 ```text
 leaf_id: FAI-CPU-003

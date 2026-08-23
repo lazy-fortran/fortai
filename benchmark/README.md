@@ -175,10 +175,12 @@ FortAI's median matched-forward rate to be strictly higher than llama.cpp's at
 every screened level. On a machine with fewer than 64 online CPUs, the 64
 thread point is an explicit oversubscription measurement. The finalizer records
 per-level speedups, separate FortAI/llama.cpp optima, and an explicit winner.
-It also checks that the winning thread, binary,
-flags, revision, model, and runtime match the eight-step top-32 logits oracle.
-The wrapper refuses to run while any llama-server is resident; shared-service
-results remain screening evidence and cannot enter the performance gate.
+It also checks that the winning thread, binary, flags, revision, model, and
+runtime match the eight-step top-32 logits oracle. The wrapper refuses any
+unverified resident llama-server; the exact protected GPU service may remain
+resident because the temporary CPU server uses a separately checked port.
+Other shared-service results remain screening evidence and cannot enter the
+performance gate.
 
 For the independent greedy decode gate, run:
 
@@ -206,6 +208,13 @@ top-k token set, and reports the maximum centered-logit error together with
 both model and llama.cpp executable digests. Set `steps` to 1 when isolating
 the initial forward pass. The named eight-step 0.8B Q8_0 gate passes with a
 maximum centered-logit error of `2.431842038852494e-7`.
+
+For instruction-level CPU work, `profile_qwen35_cpu_both.sh` records the
+matched FortAI/llama.cpp `perf stat` counters (including cycles and retired
+instructions), zero-loss call graphs, and Intel-syntax disassembly for both
+the FortAI executable and llama.cpp's `libggml-cpu`. The profiler accepts the
+same verified protected GPU resident service as the CPU comparison wrapper and
+defaults to the b10566 executable/library pair used by the current oracle.
 
 ## Promotion rule
 

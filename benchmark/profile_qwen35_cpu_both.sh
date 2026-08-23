@@ -25,8 +25,8 @@ perf_mmap="${FORTAI_PERF_MMAP:-64}"
 perf_call_graph="${FORTAI_PERF_CALL_GRAPH:-dwarf,32}"
 fortai_delay_ms="${FORTAI_FORTAI_DELAY_MS:-0}"
 llama_delay_ms="${FORTAI_LLAMA_DELAY_MS:-0}"
-llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"
-llama_library_dir="${LLAMA_LIBRARY_DIR:-/home/ert/.local/llama.cpp-b10430-cuda}"
+llama_server="${LLAMA_SERVER:-/home/ert/.local/llama.cpp-b10566-cuda/llama-server}"
+llama_library_dir="${LLAMA_LIBRARY_DIR:-/home/ert/.local/llama.cpp-b10566-cuda}"
 port="${FORTAI_PROFILE_PORT:-18083}"
 base=$(basename "$model_path" .gguf)
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -37,8 +37,24 @@ if [[ ! -x "$llama_server" ]]; then
     echo "llama-server not found: $llama_server" >&2
     exit 2
 fi
+measurement_conditions=isolated
+performance_gate_eligible=true
+protected_gpu_server_independent=false
+protected_gpu_server_pid=""
 if pgrep -x llama-server >/dev/null 2>&1; then
-    if [[ "${FORTAI_ALLOW_EXISTING_LLAMA_SERVER:-0}" == 1 ]]; then
+    if [[ "${FORTAI_ALLOW_PROTECTED_GPU_SERVER:-0}" == 1 ]]; then
+        if ! protected_gpu_server_pid=$(
+            "$root_dir/benchmark/verify_protected_gpu_server.sh"
+        ); then
+            echo "FORTAI_ALLOW_PROTECTED_GPU_SERVER was set, but the resident llama-server is not the verified protected GPU service" >&2
+            pgrep -a -x llama-server >&2 || true
+            exit 2
+        fi
+        protected_gpu_server_independent=true
+        echo "allowing verified protected GPU llama-server PID $protected_gpu_server_pid; CPU profiling remains isolated" >&2
+    elif [[ "${FORTAI_ALLOW_EXISTING_LLAMA_SERVER:-0}" == 1 ]]; then
+        measurement_conditions=shared_service
+        performance_gate_eligible=false
         echo "allowing existing llama-server; this profile is intentionally under shared-service conditions" >&2
         pgrep -a -x llama-server >&2 || true
     else
@@ -76,6 +92,10 @@ events="task-clock,context-switches,cpu-migrations,cycles,instructions,branches,
     printf 'llama_server=%s\n' "$llama_server"
     printf 'llama_server_sha256=%s\n' "$(sha256sum "$llama_server" | awk '{print $1}')"
     printf 'llama_library_dir=%s\n' "$llama_library_dir"
+    printf 'measurement_conditions=%s\n' "$measurement_conditions"
+    printf 'performance_gate_eligible=%s\n' "$performance_gate_eligible"
+    printf 'protected_gpu_server_independent=%s\n' "$protected_gpu_server_independent"
+    printf 'protected_gpu_server_pid=%s\n' "$protected_gpu_server_pid"
 } >"$profile_dir/provenance.txt"
 
 (cd "$root_dir" && fo build --flag "$native_flags") >"$profile_dir/fortai-build.log"
