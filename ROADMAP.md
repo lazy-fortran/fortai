@@ -154,13 +154,37 @@ comparison exists, the result stays unpromoted until one is available.
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
-| FAI-BENCH-001 | persistent CPU reference benchmark | in progress | native fo build, content digest, and result with provenance |
+| FAI-BENCH-001 | persistent CPU reference benchmark | closed | native fo build, content digest, and result with provenance |
 | FAI-BENCH-002 | llama.cpp model benchmark harness | closed | same model, token count, context, output budget, cleanup, and trace gate |
 | FAI-PROV-001 | source fetch and revision records | closed | tracked fetch tooling, ignored fetched trees |
 
 No FortAI versus llama.cpp performance claim is valid until FortAI has a
 model-level forward and decode path. Kernel microbenchmarks and model-level
 token benchmarks must remain separate.
+
+The persistent CPU reference benchmark acceptance is closed at revision
+`b6bc652d17d20d8409bb7adfc761a972fb436fa8`. The fixed `256x256x20` native
+`fo` run produced `cpu_matvec_20260823T145028Z.csv` with SHA-256
+`b447c99cc26a8d14750d63535ec194b6f634d20db8d826469d428215105c3427`.
+It records the empty-patch digest, tracked/worktree digest
+`002d1794678330b495a49804520a9b9d1ecbfad5573409a9136263f49295bad2`,
+validated native flags, compiler, OpenMP affinity, executable SHA-256
+`ba00e1fb7b97ca3a2c86def8d54fd082af4fc183a66028d7cb43a11d2a5c5dd6`,
+positive timing, and deterministic checksum. An independent recomputation
+gave checksum `2364.133735294118` versus reported `2364.13374000` (relative
+error `1.991e-9`). This is a kernel/reference benchmark record, not a model
+performance comparison.
+
+```text
+leaf_id: FAI-BENCH-001
+leaf_status: PASS
+claim_id: FAI-BENCH-001
+claim_status: CLOSED
+parent_id: FAI-BENCH
+parent_status: OPEN
+evidence_gate_verdict: PASS
+review_verdict: PASS
+```
 
 The tracked trace and centered-logit verifiers match the 0.8B Q8_0 fixture for
 the eight-token oracle run beginning at token 9419. The strict top-32 gate
