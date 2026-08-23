@@ -39,7 +39,9 @@ process. The result JSON records `cuda_visible_devices`, the launcher and
 actual process-image digests, the reported llama.cpp version, and every loaded
 `libllama`/`libggml` path and digest. `LLAMA_LIBRARY_DIR` is optional; when it
 is explicitly set, the comparison fails if the process loads those libraries
-from another directory.
+from another directory. The `llama_cpp_provenance` object describes the latest
+machine-local fetched source checkout; the executable, version, and loaded
+library fields identify the runtime used by a comparison.
 
 ## Resident CUDA kernel
 
@@ -151,20 +153,19 @@ token IDs alone does not establish numeric logits parity.
 
 For a numeric CPU diagnostic, compare centered top logits against llama.cpp's
 pre-sampling log probabilities. Centering removes the common log-softmax
-normalization, so the reported values are directly comparable logits. This
-one-step form isolates the initial forward pass:
+normalization, so the reported values are directly comparable logits. The
+eight-step form exercises recurrent and KV-cache state across decode:
 
 ```bash
 OMP_NUM_THREADS=2 benchmark/check_qwen35_cpu_logits.sh \
-  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 1 128 32 1.0e-2
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 8 128 32 1.0e-2
 ```
 
 The checker builds FortAI without fast-math, requires the same top-token and
 top-k token set, and reports the maximum centered-logit error together with
-both model and llama.cpp executable digests. Increase `steps` to 8 for the
-multi-step state gate. The initial-forward check currently passes for the
-named 0.8B fixture, while the multi-step check exposes a later state
-divergence; passing one step does not close FAI-CPU-002.
+both model and llama.cpp executable digests. Set `steps` to 1 when isolating
+the initial forward pass. The named eight-step 0.8B Q8_0 gate passes with a
+maximum centered-logit error of `2.431842038852494e-7`.
 
 ## Promotion rule
 

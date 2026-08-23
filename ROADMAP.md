@@ -11,7 +11,7 @@ and reproducible benchmark tooling.
 | FAI-CPU-001 | Qwen3.5-0.8B text-only CPU reference | experimental | model opens, independent Q8 oracle passes, and the 8-step trace matches llama.cpp |
 | FAI-CPU-001B | Qwen3.5-2B CPU scaling path | experimental | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-001C | Qwen3.5-4B CPU scaling path | experimental | model opens, runs, and benchmark metadata is recorded |
-| FAI-CPU-002 | CPU logits parity and tokenizer path | open | token-by-token logits agree with an independent oracle |
+| FAI-CPU-002 | CPU logits parity and tokenizer path | closed | token-by-token logits agree with an independent oracle |
 | FAI-CPU-003 | native CPU candidate tournament | in progress | compiler flags, thread count, and winner recorded |
 | FAI-CPU-MOE-001 | CPU MoE execution for Qwen3.6-35B | deferred | expert routing, resident weights, and llama.cpp comparison |
 
@@ -57,11 +57,11 @@ No FortAI versus llama.cpp performance claim is valid until FortAI has a
 model-level forward and decode path. Kernel microbenchmarks and model-level
 token benchmarks must remain separate.
 
-The tracked trace verifier matches the 0.8B Q8_0 fixture for the eight-token
-oracle run beginning at token 9419. The centered-logit verifier matches the
-initial 0.8B forward pass, but its multi-step run exposes a later state
-divergence, so FAI-CPU-002 remains open. Current CPU evidence covers 0.8B, 2B,
-and 4B Q8_0 model-level runs with the server stopped and sequential execution.
+The tracked trace and centered-logit verifiers match the 0.8B Q8_0 fixture for
+the eight-token oracle run beginning at token 9419. The strict top-32 gate
+measured a maximum centered-logit error of `2.431842038852494e-7` against its
+`1.0e-2` tolerance. Current CPU evidence covers 0.8B, 2B, and 4B Q8_0
+model-level runs with the server stopped and sequential execution.
 The CUDA evidence now includes an experimental device-resident Qwen3.5 path
 for the 0.8B, 2B, and 4B fixtures. The 0.8B eight-token CUDA trace matches
 llama.cpp. CUDA Graph replay was profiled as an A/B and is slower on the tested
@@ -70,3 +70,28 @@ default. The paired 64-token result remains unpromoted until it matches the
 competing harness. Nsight Compute is attempted and its permission result is
 retained; Nsight Systems remains the fallback timing profile when GPU
 performance-counter access is unavailable.
+
+The immutable FAI-CPU-002 promotion evidence is revision
+`efdcfed023e9878da4cea5d24b39e44f64d86bf6`, reviewed as base
+`7f6dc94bdcc21f14856c62d4f4fd4bd8e7759238` plus patch SHA-256
+`adeb61819468d805c3865c0bfaf7190cb1949720f4caebbe8c30aafa9a52d523`.
+The verifier used Qwen3.5-0.8B Q8_0 model SHA-256
+`091d8deba394f428b67aa42c100ee145fcbecac5a79621935d3655016ca737e5`,
+llama.cpp b10566 executable SHA-256
+`5b07556654335803a4a6f6e8f94b4bec13945e68843f28319bf69852176f935c`,
+Ryzen 9 5950X, two OpenMP threads, context 128, and correctness flags
+`-O2 -fopenmp -fno-fast-math -ffp-contract=off`. It requires the same top
+token and top-32 token set at every step, with centered-logit error at most
+`1.0e-2`; all eight steps passed. This closes only that named CPU gate, not
+other prompts, contexts, quantizations, hardware paths, or performance claims.
+
+```text
+leaf_id: FAI-CPU-002
+leaf_status: PASS
+claim_id: FAI-CPU-002
+claim_status: CLOSED
+parent_id: FAI-CPU
+parent_status: OPEN
+evidence_gate_verdict: PASS
+review_verdict: PASS
+```
