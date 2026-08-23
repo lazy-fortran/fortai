@@ -71,6 +71,7 @@ immutable_keys = (
     "fortai_commit", "fortai_patch_digest", "fortai_tracked_tree_digest",
     "fortai_worktree_digest", "fortai_executable_sha256", "build_flags",
     "compiler", "cpu_model", "omp_num_threads", "omp_proc_bind", "omp_places",
+    "cuda_visible_devices",
     "model_sha256", "token_id", "steps", "context", "llama_launcher_sha256",
     "llama_executable_sha256", "llama_loaded_libraries", "llama_version",
     "measurement_conditions", "shared_service_conditions",

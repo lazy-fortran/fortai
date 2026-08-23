@@ -87,6 +87,8 @@ def validate_summary(summary: dict[str, object], source: str) -> dict[str, objec
         )
     if summary.get("cuda_visible_devices") != "":
         raise ValueError(f"{source}: CPU tournament must hide all CUDA devices")
+    if summary.get("metric") != "matched_forward_steps_per_second":
+        raise ValueError(f"{source}: unsupported tournament metric")
     repeats = int(summary.get("repeats", 0))
     if repeats < 5:
         raise ValueError(f"{source}: at least five repeats are required")
@@ -377,6 +379,7 @@ def self_test() -> None:
             "out_of_scope_model",
         )
         rejects(lambda item: item.update({"cuda_visible_devices": "0"}), "cuda_visible")
+        rejects(lambda item: item.update({"metric": "wall_time"}), "metric")
         rejects(lambda item: item.update({"shared_service_conditions": True}), "shared")
         rejects(lambda item: item["fortai_matched_forward_steps_per_second"].update({"median": 999.0}), "tampered")
         rejects(lambda item: item.update({"fortai_commit": "other"}), "mixed")
