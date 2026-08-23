@@ -31,7 +31,8 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The current tournament-readiness implementation anchor is revision
-`1496c239cce14687e4f2b03f72714785c540a4bb`. It refuses any unverified resident `llama-server` before starting
+`93b32de46fe3d5bc27a819b393b4235e4c4131d0` (building on
+`1496c239cce14687e4f2b03f72714785c540a4bb`). It refuses any unverified resident `llama-server` before starting
 timing, while allowing only the exact protected GPU service (PID `268006`,
 port `8080`) as independent from the CPU measurements. It requires at least five repeats for
 each thread candidate, restricts the tournament and direct-repeat wrappers
@@ -98,6 +99,21 @@ default `OMP_WAIT_POLICY=PASSIVE`, so workers sleep between matvec regions
 while llama.cpp keeps a hot worker pool. A persistent worker region or broader
 forward fusion is a materially larger redesign and remains unpromoted until it
 passes the independent logits oracle and the full seven-level tournament.
+
+Revision `93b32de46fe3d5bc27a819b393b4235e4c4131d0` adds an opt-in
+`FORTAI_ENABLE_PERSISTENT_OPENMP=1` worker region for the Qwen3.5-0.8B shape.
+It keeps the default path unchanged, records the mode in comparison, repeat,
+tournament, oracle, and perf-profile provenance, and passes the isolated
+centered-top-32 oracle (maximum error `2.431842038852494e-7`). A fresh
+seven-level, five-repeat 0.8B run with the mode enabled passed the strict
+median comparison at 1, 2, 16, 32, and 64 threads but failed at 4 and 8
+threads (the finalizer rejected the candidate); no FAI-CPU-003 performance
+promotion is claimed. The clean paired profile
+`benchmark/profiles/Qwen3.5-0.8B-Q8_0_both_20260823T180005Z` used
+`sudo -n perf`, captured zero lost samples, and recorded `q8_dot_avx2` at
+`72.07%` of FortAI samples. The corresponding llama.cpp profile recorded
+`84.06%` in `ggml_vec_dot_q8_0_q8_0`; host perf counters are usable, while
+the remaining gate is still model-level scaling.
 
 The low-level CPU path is not missing an assembly implementation. The tracked
 `src/backend/cpu/fortai_q8_dot.c` contains AVX2/F16C/FMA kernels for Q8 dot,
