@@ -51,9 +51,13 @@ if [[ "${FORTAI_ALLOW_EXISTING_LLAMA_SERVER:-0}" == 1 ]]; then
     exit 2
 fi
 if pgrep -x llama-server >/dev/null 2>&1; then
-    echo 'an existing llama-server prevents isolated tournament timing' >&2
-    pgrep -a -x llama-server >&2 || true
-    exit 2
+    if ! FORTAI_ALLOW_PROTECTED_GPU_SERVER=1 \
+        "$root_dir/benchmark/verify_protected_gpu_server.sh" >/dev/null; then
+        echo 'an unverified resident llama-server prevents isolated tournament timing' >&2
+        pgrep -a -x llama-server >&2 || true
+        exit 2
+    fi
+    echo 'verified protected GPU llama-server is independent; CPU tournament uses temporary CPU servers' >&2
 fi
 if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"; then
     echo "tournament port is already in use: $port" >&2
@@ -95,6 +99,7 @@ for threads in $thread_list; do
     log_file="$log_dir/tournament_${base}_${threads}_${stamp}.log"
     OMP_NUM_THREADS="$threads" OMP_PROC_BIND="${OMP_PROC_BIND:-spread}" \
         OMP_PLACES="${OMP_PLACES:-cores}" FORTAI_NATIVE_FLAGS="$native_flags" \
+        FORTAI_ALLOW_PROTECTED_GPU_SERVER=1 \
         LLAMA_PORT="$port" "$root_dir/benchmark/repeat_compare_qwen35_cpu.sh" \
         "$model_path" "$repeats" "$token_id" "$timing_steps" "$context" >"$log_file" 2>&1
     summary_file=$(sed -n 's/^summary=//p' "$log_file" | tail -n 1)
@@ -123,6 +128,7 @@ oracle_file="$result_dir/tournament_oracle_${base}_${stamp}.json"
 OMP_NUM_THREADS="$best_thread" OMP_PROC_BIND="${OMP_PROC_BIND:-spread}" \
     OMP_PLACES="${OMP_PLACES:-cores}" FORTAI_NATIVE_FLAGS="$native_flags" \
     FORTAI_CORRECTNESS_FLAGS="$native_flags" LLAMA_PORT="$port" \
+    FORTAI_ALLOW_PROTECTED_GPU_SERVER=1 \
     "$root_dir/benchmark/check_qwen35_cpu_logits.sh" "$model_path" "$token_id" \
     "$oracle_steps" "$context" "$oracle_top_k" "$oracle_tolerance" >"$oracle_log" 2>&1
 oracle_payload=$(grep -E '^\{' "$oracle_log" | tail -n 1)

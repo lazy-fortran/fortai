@@ -129,6 +129,8 @@ print(json.dumps({
     "token_id": int(result["token_id"]),
     "context": int(result["context"]),
     "cpu_model": result["cpu_model"],
+    "protected_gpu_server_independent": result["protected_gpu_server_independent"],
+    "protected_gpu_server_pid": result["protected_gpu_server_pid"],
     "llama_launcher_sha256": result["llama_launcher_sha256"],
     "llama_loaded_libraries": result["llama_loaded_libraries"],
     "llama_version": result["llama_version"],

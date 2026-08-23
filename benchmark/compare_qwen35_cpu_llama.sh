@@ -52,8 +52,20 @@ if [[ ! -x "$llama_server" ]]; then
 fi
 measurement_conditions=isolated
 performance_gate_eligible=true
+protected_gpu_server_independent=false
+protected_gpu_server_pid=""
 if pgrep -x llama-server >/dev/null 2>&1; then
-    if [[ "${FORTAI_ALLOW_EXISTING_LLAMA_SERVER:-0}" == 1 ]]; then
+    if [[ "${FORTAI_ALLOW_PROTECTED_GPU_SERVER:-0}" == 1 ]]; then
+        if ! protected_gpu_server_pid=$(
+            "$root_dir/benchmark/verify_protected_gpu_server.sh"
+        ); then
+            echo "FORTAI_ALLOW_PROTECTED_GPU_SERVER was set, but the resident llama-server is not the verified protected GPU service" >&2
+            pgrep -a -x llama-server >&2 || true
+            exit 2
+        fi
+        protected_gpu_server_independent=true
+        echo "allowing verified protected GPU llama-server PID $protected_gpu_server_pid; CPU timing remains isolated" >&2
+    elif [[ "${FORTAI_ALLOW_EXISTING_LLAMA_SERVER:-0}" == 1 ]]; then
         measurement_conditions=shared_service
         performance_gate_eligible=false
         echo "allowing existing llama-server; this comparison is intentionally under shared-service conditions" >&2
@@ -250,6 +262,8 @@ LLAMA_CLEANUP="verified" LLAMA_SERVER_PATH="$llama_server" \
 LLAMA_SERVER_SHA256="$llama_server_sha256" LLAMA_LIBRARY_DIR="$llama_library_dir" \
 LLAMA_LIBRARY_DIGEST="$llama_library_digest" CPU_MODEL="$cpu_model" \
 ONLINE_CPUS="$online_cpus" \
+PROTECTED_GPU_SERVER_INDEPENDENT="$protected_gpu_server_independent" \
+PROTECTED_GPU_SERVER_PID="$protected_gpu_server_pid" \
 LLAMA_RECORD="$llama_record" LLAMA_PROCESS_PROVENANCE="$llama_process_provenance" \
 LLAMA_VERSION="$llama_version" FORTAI_EXECUTABLE="$fortai_executable" \
 FORTAI_EXECUTABLE_SHA256="$fortai_executable_sha256" \
@@ -295,6 +309,9 @@ result = {
     "compiler": os.environ["COMPILER"],
     "cpu_model": os.environ["CPU_MODEL"],
     "online_cpus": int(os.environ["ONLINE_CPUS"]),
+    "protected_gpu_server_independent": os.environ["PROTECTED_GPU_SERVER_INDEPENDENT"] == "true",
+    "protected_gpu_server_pid": int(os.environ["PROTECTED_GPU_SERVER_PID"])
+    if os.environ["PROTECTED_GPU_SERVER_PID"] else None,
     "omp_num_threads": int(os.environ["OMP_NUM_THREADS"]),
     "model": os.environ["MODEL_PATH"],
     "model_sha256": hashlib.sha256(Path(os.environ["MODEL_PATH"]).read_bytes()).hexdigest(),

@@ -33,6 +33,8 @@ COMMON_KEYS = (
     "compiler",
     "cpu_model",
     "online_cpus",
+    "protected_gpu_server_independent",
+    "protected_gpu_server_pid",
     "cuda_visible_devices",
     "fortai_executable_sha256",
     "model",
@@ -115,6 +117,15 @@ def validate_summary(summary: dict[str, object], source: str) -> dict[str, objec
     online_cpus = int(summary.get("online_cpus", 0))
     if online_cpus <= 0:
         raise ValueError(f"{source}: invalid online CPU count")
+    protected_independent = summary.get("protected_gpu_server_independent")
+    if not isinstance(protected_independent, bool):
+        raise ValueError(f"{source}: invalid protected GPU server independence flag")
+    protected_pid = summary.get("protected_gpu_server_pid")
+    if protected_independent:
+        if int(protected_pid or 0) <= 0:
+            raise ValueError(f"{source}: protected GPU server PID is missing")
+    elif protected_pid is not None:
+        raise ValueError(f"{source}: unexpected protected GPU server PID")
 
     for key in ("fortai_matched_forward_steps_per_second", "llama_cpp_matched_forward_steps_per_second"):
         recorded = summary.get(key)
@@ -261,6 +272,8 @@ def finalize(
         "compiler",
         "cpu_model",
         "online_cpus",
+        "protected_gpu_server_independent",
+        "protected_gpu_server_pid",
         "omp_proc_bind",
         "omp_places",
         "llama_launcher_sha256",
@@ -312,6 +325,8 @@ def finalize(
         "compiler": first["compiler"],
         "cpu_model": first["cpu_model"],
         "online_cpus": int(first["online_cpus"]),
+        "protected_gpu_server_independent": first["protected_gpu_server_independent"],
+        "protected_gpu_server_pid": first["protected_gpu_server_pid"],
         "model": first["model"],
         "model_sha256": first["model_sha256"],
         "token_id": first["token_id"],
@@ -378,6 +393,8 @@ def _fixture(thread: int = 2) -> dict[str, object]:
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "cuda_visible_devices": "",
             "online_cpus": 32,
+            "protected_gpu_server_independent": False,
+            "protected_gpu_server_pid": None,
             "steps": 64,
             "token_id": 9419,
             "context": 128,
@@ -414,6 +431,8 @@ def self_test() -> None:
             "fortai_executable_sha256": "same",
             "cuda_visible_devices": "",
             "online_cpus": 32,
+            "protected_gpu_server_independent": False,
+            "protected_gpu_server_pid": None,
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "model_sha256": "same",
             "token_id": 9419,
