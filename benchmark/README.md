@@ -16,6 +16,15 @@ benchmark/run_cpu_reference.sh 1024 1024 20
 The output is stored under `benchmark/results`, which is ignored. The script
 uses OpenMP parallel rows and an OpenMP SIMD reduction over each row. Native
 flags are candidates for measurement, not the independent correctness oracle.
+The default native flags are the strongest screened set that currently passes
+the named eight-step 0.8B logits gate:
+
+```text
+-O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto
+```
+
+Override candidates must pass that behavioral gate before their timing can
+enter a tournament.
 
 ## llama.cpp
 

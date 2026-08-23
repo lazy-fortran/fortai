@@ -106,6 +106,20 @@ for step, oracle_step in enumerate(oracle_steps):
             )
 
 print(json.dumps({
+    "verdict": "PASS",
+    "kind": "llama_cpp_centered_top_k",
+    "fortai_commit": result["fortai_commit"],
+    "fortai_patch_digest": result["fortai_patch_digest"],
+    "fortai_tracked_tree_digest": result["fortai_tracked_tree_digest"],
+    "fortai_worktree_digest": result["fortai_worktree_digest"],
+    "fortai_executable_sha256": result["fortai_executable_sha256"],
+    "build_flags": result["build_flags"],
+    "compiler": result["compiler"],
+    "omp_num_threads": result["omp_num_threads"],
+    "omp_proc_bind": result["omp_proc_bind"],
+    "omp_places": result["omp_places"],
+    "measurement_conditions": result["measurement_conditions"],
+    "performance_gate_eligible": result["performance_gate_eligible"],
     "model_sha256": result["model_sha256"],
     "llama_executable_sha256": result["llama_executable_sha256"],
     "steps": int(result["steps"]),

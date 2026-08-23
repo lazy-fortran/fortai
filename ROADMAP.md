@@ -15,10 +15,20 @@ and reproducible benchmark tooling.
 | FAI-CPU-003 | native CPU candidate tournament | in progress | compiler flags, thread count, and winner recorded |
 | FAI-CPU-MOE-001 | CPU MoE execution for Qwen3.6-35B | deferred | expert routing, resident weights, and llama.cpp comparison |
 
-The CPU implementation should use the available compiler features for the
-machine under test, including `-O3`, `-march=native`, `-mtune=native`, OpenMP,
-SIMD, loop transformation, and link-time optimization where supported. Fast
-math flags belong to measured candidate builds, not the correctness oracle.
+The CPU implementation should use validated compiler features for the machine
+under test, including `-march=native`, `-mtune=native`, OpenMP, SIMD, loop
+transformation, and link-time optimization where supported. Optimization
+levels and fast-math flags are tournament candidates and must pass the logits
+oracle before performance measurement.
+
+The 0.8B Q8_0 native-flags screen rejected the former `-O3 -ffast-math`
+default (first reported over-tolerance error `2.30922698e-2`) and an `-O3`
+no-fast-math candidate (first reported over-tolerance error
+`1.16548542e-2`) against the `1.0e-2` gate. The
+current `-O2 -march=native` default, with loop unrolling, LTO, no fast math,
+and FP contraction disabled, passed all eight steps with maximum error
+`2.431842038852494e-7`. FAI-CPU-003 still requires repeated isolated timing
+evidence before a performance winner can be recorded.
 
 ## GPU path
 

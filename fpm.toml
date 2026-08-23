@@ -13,7 +13,7 @@ auto-tests = true
 native = ["native"]
 
 [features]
-native.flags = "-O3 -march=native -mtune=native -funroll-loops -fopenmp -ffast-math -fno-math-errno -flto"
+native.flags = "-O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto"
 
 [fortran]
 implicit-typing = false
