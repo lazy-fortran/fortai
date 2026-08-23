@@ -160,6 +160,11 @@ def _normalise_threads(threads: list[int]) -> list[int]:
     normalised = sorted(threads)
     if len(set(normalised)) != len(normalised):
         raise ValueError("required thread levels must be unique")
+    if normalised[0] != 1 or any(
+        current != previous * 2
+        for previous, current in zip(normalised, normalised[1:])
+    ):
+        raise ValueError("required thread levels must be a power-of-two sequence")
     return normalised
 
 
@@ -575,6 +580,8 @@ def main() -> None:
         return
     if not args.summaries or args.oracle is None or args.output is None:
         parser.error("summaries, --oracle, and --output are required")
+    if args.required_threads is None:
+        parser.error("--required-threads is required")
     result = finalize(
         [Path(path) for path in args.summaries],
         args.oracle,
