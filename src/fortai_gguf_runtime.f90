@@ -421,13 +421,14 @@ contains
             end if
         end subroutine gguf_tensor_matvec
 
-        subroutine gguf_tensor_matvec_q8(self, vector, values, quantized, scales, stat)
+        subroutine gguf_tensor_matvec_q8(self, vector, values, quantized, scales, stat, task_parallel)
             class(gguf_tensor_t), intent(in) :: self
             real(real32), contiguous, intent(in) :: vector(:)
             real(real32), contiguous, intent(out) :: values(:)
             integer(int8), contiguous, intent(out) :: quantized(:)
             real(real32), contiguous, intent(out) :: scales(:)
             type(status_t), intent(out) :: stat
+            logical, intent(in), optional :: task_parallel
             integer(int64) :: row, block_count
 
             call stat%clear()
@@ -453,6 +454,24 @@ contains
                     values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
                         int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
                 end do
+            else if (present(task_parallel)) then
+                if (task_parallel) then
+                    !$omp taskloop default(none) shared(self, quantized, scales, values, block_count) &
+                    !$omp& private(row) grainsize(256)
+                    do row = 1, self%shape(2)
+                        values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                            int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    end do
+                    !$omp end taskloop
+                else
+                    !$omp parallel do default(none) shared(self, quantized, scales, values, block_count) &
+                    !$omp& private(row) schedule(static)
+                    do row = 1, self%shape(2)
+                        values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                            int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    end do
+                    !$omp end parallel do
+                end if
             else
                 !$omp parallel do default(none) shared(self, quantized, scales, values, block_count) &
                 !$omp& private(row) schedule(static)
@@ -465,13 +484,14 @@ contains
         end subroutine gguf_tensor_matvec_q8
 
         subroutine gguf_tensor_matvec_pair_q8(self, other, vector, values, other_values, &
-                quantized, scales, stat)
+                quantized, scales, stat, task_parallel)
             class(gguf_tensor_t), intent(in) :: self, other
             real(real32), contiguous, intent(in) :: vector(:)
             real(real32), contiguous, intent(out) :: values(:), other_values(:)
             integer(int8), contiguous, intent(out) :: quantized(:)
             real(real32), contiguous, intent(out) :: scales(:)
             type(status_t), intent(out) :: stat
+            logical, intent(in), optional :: task_parallel
             integer(int64) :: row, first_rows, total_rows, block_count
 
             call stat%clear()
@@ -505,6 +525,34 @@ contains
                             int(row - first_rows - 1_int64, c_int64_t), int(block_count, c_int64_t))
                     end if
                 end do
+            else if (present(task_parallel)) then
+                if (task_parallel) then
+                    !$omp taskloop default(none) shared(self, other, quantized, scales, values, &
+                    !$omp& other_values, first_rows, total_rows, block_count) private(row) grainsize(256)
+                    do row = 1, total_rows
+                        if (row <= first_rows) then
+                            values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                                int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        else
+                            other_values(row - first_rows) = fortai_q8_dot(other%bytes, quantized, scales, &
+                                int(row - first_rows - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        end if
+                    end do
+                    !$omp end taskloop
+                else
+                    !$omp parallel do default(none) shared(self, other, quantized, scales, values, &
+                    !$omp& other_values, first_rows, total_rows, block_count) private(row) schedule(static)
+                    do row = 1, total_rows
+                        if (row <= first_rows) then
+                            values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                                int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        else
+                            other_values(row - first_rows) = fortai_q8_dot(other%bytes, quantized, scales, &
+                                int(row - first_rows - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        end if
+                    end do
+                    !$omp end parallel do
+                end if
             else
                 !$omp parallel do default(none) shared(self, other, quantized, scales, values, &
                 !$omp& other_values, first_rows, total_rows, block_count) private(row) schedule(static)
@@ -522,13 +570,14 @@ contains
         end subroutine gguf_tensor_matvec_pair_q8
 
         subroutine gguf_tensor_matvec_triplet_q8(self, second, third, vector, values, &
-                second_values, third_values, quantized, scales, stat)
+                second_values, third_values, quantized, scales, stat, task_parallel)
             class(gguf_tensor_t), intent(in) :: self, second, third
             real(real32), contiguous, intent(in) :: vector(:)
             real(real32), contiguous, intent(out) :: values(:), second_values(:), third_values(:)
             integer(int8), contiguous, intent(out) :: quantized(:)
             real(real32), contiguous, intent(out) :: scales(:)
             type(status_t), intent(out) :: stat
+            logical, intent(in), optional :: task_parallel
             integer(int64) :: row, total_rows, first_rows, second_rows
             integer(int64) :: block_count, index
 
@@ -573,6 +622,46 @@ contains
                             int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
                     end if
                 end do
+            else if (present(task_parallel)) then
+                if (task_parallel) then
+                    !$omp taskloop default(none) shared(self, second, third, quantized, scales, &
+                    !$omp& values, second_values, third_values, first_rows, second_rows, total_rows, &
+                    !$omp& block_count) private(index, row) grainsize(256)
+                    do index = 1, total_rows
+                        if (index <= first_rows) then
+                            values(index) = fortai_q8_dot(self%bytes, quantized, scales, &
+                                int(index - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        else if (index <= first_rows + second_rows) then
+                            row = index - first_rows
+                            second_values(row) = fortai_q8_dot(second%bytes, quantized, scales, &
+                                int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        else
+                            row = index - first_rows - second_rows
+                            third_values(row) = fortai_q8_dot(third%bytes, quantized, scales, &
+                                int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        end if
+                    end do
+                    !$omp end taskloop
+                else
+                    !$omp parallel do default(none) shared(self, second, third, quantized, scales, &
+                    !$omp& values, second_values, third_values, first_rows, second_rows, total_rows, &
+                    !$omp& block_count) private(index, row) schedule(static)
+                    do index = 1, total_rows
+                        if (index <= first_rows) then
+                            values(index) = fortai_q8_dot(self%bytes, quantized, scales, &
+                                int(index - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        else if (index <= first_rows + second_rows) then
+                            row = index - first_rows
+                            second_values(row) = fortai_q8_dot(second%bytes, quantized, scales, &
+                                int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        else
+                            row = index - first_rows - second_rows
+                            third_values(row) = fortai_q8_dot(third%bytes, quantized, scales, &
+                                int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                        end if
+                    end do
+                    !$omp end parallel do
+                end if
             else
                 !$omp parallel do default(none) shared(self, second, third, quantized, scales, &
                 !$omp& values, second_values, third_values, first_rows, second_rows, total_rows, &

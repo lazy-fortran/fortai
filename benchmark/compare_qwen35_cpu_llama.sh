@@ -17,6 +17,7 @@ steps="${3:-${FORTAI_BENCH_STEPS:-8}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 oracle_top_k="${FORTAI_LLAMA_ORACLE_TOP_K:-0}"
 threads="${OMP_NUM_THREADS:-$(nproc)}"
+persistent_openmp="${FORTAI_ENABLE_PERSISTENT_OPENMP:-0}"
 llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"
 llama_library_dir="${LLAMA_LIBRARY_DIR:-}"
 port="${LLAMA_PORT:-18081}"
@@ -33,10 +34,15 @@ if [[ ! "$oracle_top_k" =~ ^[0-9]+$ ]]; then
     echo "FORTAI_LLAMA_ORACLE_TOP_K must be a nonnegative integer: $oracle_top_k" >&2
     exit 2
 fi
+if [[ "$persistent_openmp" != 0 && "$persistent_openmp" != 1 ]]; then
+    echo "FORTAI_ENABLE_PERSISTENT_OPENMP must be 0 or 1: $persistent_openmp" >&2
+    exit 2
+fi
 
 export OMP_NUM_THREADS="$threads"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-spread}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
+export FORTAI_ENABLE_PERSISTENT_OPENMP="$persistent_openmp"
 # The CPU comparison must never touch CUDA even though llama-server links
 # libggml-cuda.so: hide every GPU so backend init finds zero devices.
 export CUDA_VISIBLE_DEVICES=""
@@ -313,6 +319,7 @@ result = {
     "protected_gpu_server_pid": int(os.environ["PROTECTED_GPU_SERVER_PID"])
     if os.environ["PROTECTED_GPU_SERVER_PID"] else None,
     "omp_num_threads": int(os.environ["OMP_NUM_THREADS"]),
+    "persistent_openmp": os.environ["FORTAI_ENABLE_PERSISTENT_OPENMP"] == "1",
     "model": os.environ["MODEL_PATH"],
     "model_sha256": hashlib.sha256(Path(os.environ["MODEL_PATH"]).read_bytes()).hexdigest(),
     "token_id": int(os.environ["TOKEN_ID"]),

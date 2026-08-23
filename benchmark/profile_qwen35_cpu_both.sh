@@ -30,6 +30,7 @@ token_id="${2:-${FORTAI_TOKEN_ID:-9419}}"
 steps="${3:-${FORTAI_PROFILE_STEPS:-128}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 threads="${OMP_NUM_THREADS:-$(nproc)}"
+persistent_openmp="${FORTAI_ENABLE_PERSISTENT_OPENMP:-0}"
 frequency="${FORTAI_PERF_FREQUENCY:-499}"
 perf_mmap="${FORTAI_PERF_MMAP:-64}"
 perf_call_graph="${FORTAI_PERF_CALL_GRAPH:-dwarf,32}"
@@ -81,6 +82,11 @@ fi
 export OMP_NUM_THREADS="$threads"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-spread}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
+if [[ "$persistent_openmp" != 0 && "$persistent_openmp" != 1 ]]; then
+    echo "FORTAI_ENABLE_PERSISTENT_OPENMP must be 0 or 1: $persistent_openmp" >&2
+    exit 2
+fi
+export FORTAI_ENABLE_PERSISTENT_OPENMP="$persistent_openmp"
 export CUDA_VISIBLE_DEVICES=""
 native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto}"
 events="task-clock,context-switches,cpu-migrations,cycles,instructions,branches,branch-misses,cache-references,cache-misses"
@@ -99,6 +105,7 @@ fi
     printf 'omp_num_threads=%s\n' "$OMP_NUM_THREADS"
     printf 'omp_proc_bind=%s\n' "$OMP_PROC_BIND"
     printf 'omp_places=%s\n' "$OMP_PLACES"
+    printf 'persistent_openmp=%s\n' "$persistent_openmp"
     printf 'fortai_perf_delay_ms=%s\n' "$fortai_delay_ms"
     printf 'llama_perf_delay_ms=%s\n' "$llama_delay_ms"
     printf 'perf_mmap=%s\n' "$perf_mmap"

@@ -156,6 +156,8 @@ module fortai_qwen35_cpu
         logical :: cuda_device_pipeline = .false.
         logical :: cuda_graph_enabled = .false.
         logical :: cuda_graph_ready = .false.
+        logical :: persistent_openmp = .false.
+        logical :: persistent_openmp_active = .false.
     contains
         procedure :: close => qwen35_cpu_close
         procedure :: enable_cuda => qwen35_cpu_enable_cuda
@@ -214,6 +216,11 @@ contains
         self % rope_base = self % file % meta_real('qwen35.rope.freq_base', 10000000.0_real32)
         self % max_context = 256_int64
         if (present(max_context)) self % max_context = max_context
+        self%persistent_openmp = .false.
+        if (self%hidden_size == 1536_int32 .and. self%vocabulary_size == 248320_int32 .and. &
+            self%layer_count == 24_int32) then
+            call enable_persistent_openmp(self)
+        end if
         self % bos_token = self % file % meta_int('tokenizer.ggml.bos_token_id', 0_int64)
         self % eos_token = self % file % meta_int('tokenizer.ggml.eos_token_id', 0_int64)
         interval = int(self % file % meta_int('qwen35.full_attention_interval', 4_int64), int32)
@@ -587,6 +594,8 @@ contains
         self % hidden_size = 0
         self % vocabulary_size = 0
         self % layer_count = 0
+        self%persistent_openmp = .false.
+        self%persistent_openmp_active = .false.
     end subroutine qwen35_cpu_close
 
     subroutine qwen35_cpu_reset(self)
@@ -608,6 +617,25 @@ contains
     end subroutine qwen35_cpu_reset
 
     subroutine qwen35_cpu_forward(self, token_id, position, logits, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(int64), intent(in) :: token_id, position
+        real(real32), contiguous, intent(out) :: logits(:)
+        type(status_t), intent(out) :: stat
+
+        if (self%persistent_openmp .and. .not. self%cuda_device_pipeline) then
+            self%persistent_openmp_active = .true.
+            !$omp parallel default(none) shared(self, token_id, position, logits, stat)
+            !$omp single
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat)
+            !$omp end single
+            !$omp end parallel
+            self%persistent_openmp_active = .false.
+        else
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat)
+        end if
+    end subroutine qwen35_cpu_forward
+
+    subroutine qwen35_cpu_forward_body(self, token_id, position, logits, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id, position
         real(real32), contiguous, intent(out) :: logits(:)
@@ -727,7 +755,18 @@ contains
             self % normalized, stat)
         if (.not. stat % is_ok()) return
         call model_matvec(self, self % output, self % normalized, logits, stat)
-    end subroutine qwen35_cpu_forward
+    end subroutine qwen35_cpu_forward_body
+
+    subroutine enable_persistent_openmp(self)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        character(len=8) :: enabled
+        integer :: length
+
+        call get_environment_variable('FORTAI_ENABLE_PERSISTENT_OPENMP', enabled, length=length)
+        if (length > 0) then
+            if (enabled(1:length) == '1') self%persistent_openmp = .true.
+        end if
+    end subroutine enable_persistent_openmp
 
     subroutine forward_recurrent_device(self, layer_index, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
@@ -863,11 +902,12 @@ contains
                 self%file%tensors(layer%attn_gate), input, &
                 self%qkv_work(1:self%recurrent_conv_size), &
                 self%gate_work(1:self%recurrent_inner_size), &
-                self%quantized_input, self%quantized_scales, stat)
+                self%quantized_input, self%quantized_scales, stat, self%persistent_openmp_active)
             if (.not. stat % is_ok()) return
             call self%file%tensors(layer%ssm_alpha)%matvec_pair_q8( &
                 self%file%tensors(layer%ssm_beta), input, self%alpha_work, &
-                self%beta_work, self%quantized_input, self%quantized_scales, stat)
+                self%beta_work, self%quantized_input, self%quantized_scales, stat, &
+                self%persistent_openmp_active)
             if (.not. stat % is_ok()) return
         end if
         call fortai_silu(self % gate_work, int(self % recurrent_inner_size, c_int64_t))
@@ -1214,7 +1254,7 @@ contains
                 return
             end if
             call self % file % tensors(tensor_index) % matvec_q8(input, output, &
-                self % quantized_input, self % quantized_scales, stat)
+                self % quantized_input, self % quantized_scales, stat, self%persistent_openmp_active)
         else
             call self % file % tensors(tensor_index) % matvec(input, output, stat)
         end if
@@ -1252,7 +1292,7 @@ contains
             end if
             call self%file%tensors(first_index)%matvec_pair_q8( &
                 self%file%tensors(second_index), input, first_output, second_output, &
-                self%quantized_input, self%quantized_scales, stat)
+                self%quantized_input, self%quantized_scales, stat, self%persistent_openmp_active)
         else
             call model_matvec(self, first_index, input, first_output, stat)
             if (.not. stat%is_ok()) return
@@ -1296,7 +1336,7 @@ contains
             call self%file%tensors(first_index)%matvec_triplet_q8( &
                 self%file%tensors(second_index), self%file%tensors(third_index), input, &
                 first_output, second_output, third_output, self%quantized_input, &
-                self%quantized_scales, stat)
+                self%quantized_scales, stat, self%persistent_openmp_active)
         else
             call model_matvec(self, first_index, input, first_output, stat)
             if (.not. stat%is_ok()) return
