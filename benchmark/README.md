@@ -168,10 +168,14 @@ benchmark/tournament_qwen35_cpu.sh \
   "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 5 9419 64 128 8 32 1.0e-2
 ```
 
-It screens threads `1 2 4 8 16 32` by default, requires at least five isolated
-runs per thread, recomputes medians and spreads, rejects mixed provenance or
-shared-service timing, and records separate FortAI/llama.cpp optima plus an
-explicit winner. The finalizer also checks that the winning thread, binary,
+It screens every power-of-two thread level through 64 (`1 2 4 8 16 32 64`),
+requires at least five isolated runs per thread, recomputes medians and
+spreads, rejects mixed provenance or shared-service timing, and requires
+FortAI's median matched-forward rate to be strictly higher than llama.cpp's at
+every screened level. On a machine with fewer than 64 online CPUs, the 64
+thread point is an explicit oversubscription measurement. The finalizer records
+per-level speedups, separate FortAI/llama.cpp optima, and an explicit winner.
+It also checks that the winning thread, binary,
 flags, revision, model, and runtime match the eight-step top-32 logits oracle.
 The wrapper refuses to run while any llama-server is resident; shared-service
 results remain screening evidence and cannot enter the performance gate.

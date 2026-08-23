@@ -12,7 +12,7 @@ and reproducible benchmark tooling.
 | FAI-CPU-001B | Qwen3.5-2B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-001C | Qwen3.5-4B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-002 | CPU logits parity and tokenizer path | closed | token-by-token logits agree with an independent oracle |
-| FAI-CPU-003 | native CPU candidate tournament | in progress | isolated repeated medians, bound logits oracle, compiler flags, thread count, and winner recorded |
+| FAI-CPU-003 | native CPU candidate tournament | in progress | isolated repeated medians, bound logits oracle, and strict FortAI speedup over llama.cpp at every power-of-two thread level through 64 |
 | FAI-CPU-MOE-001 | CPU MoE execution for Qwen3.6-35B | deferred | expert routing, resident weights, and llama.cpp comparison |
 
 The CPU implementation should use validated compiler features for the machine
@@ -31,7 +31,7 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The tournament readiness implementation is revision
-`f338f5bd12c8e9ba56c41217d49786dc95f93164`. It refuses a resident
+`d0a77971cdf1a3bec37bbeea204dfeae7009d634`. It refuses a resident
 `llama-server` before starting any timing, requires at least five repeats for
 each thread candidate, restricts the tournament and direct-repeat wrappers
 and finalizer to the exact 0.8B/2B/4B Q8_0 model allowlist, binds the selected
@@ -40,7 +40,11 @@ oracle step/top-k/tolerance contract, requires CUDA to remain hidden, validates
 the matched-forward metric, positive timing steps, positive token/context
 workload dimensions, at least two distinct thread candidates, and SHA-256
 freezes of all summary/oracle inputs from single-read snapshots, and checks
-the independent centered-logit oracle. It writes the final lifecycle record
+the independent centered-logit oracle. It requires the full power-of-two thread
+set `1 2 4 8 16 32 64` and rejects any level where FortAI is not strictly
+faster than llama.cpp by matched-forward median; the 64-thread point is
+explicitly oversubscribed on this machine's 32 online CPUs. It writes the final
+lifecycle record
 through a same-directory fsync-and-replace sequence so a partial output cannot
 be promoted.
 A successful finalizer also
