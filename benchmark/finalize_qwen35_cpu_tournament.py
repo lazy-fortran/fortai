@@ -32,6 +32,7 @@ COMMON_KEYS = (
     "build_flags",
     "compiler",
     "cpu_model",
+    "online_cpus",
     "cuda_visible_devices",
     "fortai_executable_sha256",
     "model",
@@ -111,6 +112,9 @@ def validate_summary(summary: dict[str, object], source: str) -> dict[str, objec
     threads = int(summary.get("omp_num_threads", 0))
     if threads <= 0:
         raise ValueError(f"{source}: invalid OpenMP thread count")
+    online_cpus = int(summary.get("online_cpus", 0))
+    if online_cpus <= 0:
+        raise ValueError(f"{source}: invalid online CPU count")
 
     for key in ("fortai_matched_forward_steps_per_second", "llama_cpp_matched_forward_steps_per_second"):
         recorded = summary.get(key)
@@ -256,6 +260,7 @@ def finalize(
         "context",
         "compiler",
         "cpu_model",
+        "online_cpus",
         "omp_proc_bind",
         "omp_places",
         "llama_launcher_sha256",
@@ -306,6 +311,7 @@ def finalize(
         "build_flags": first["build_flags"],
         "compiler": first["compiler"],
         "cpu_model": first["cpu_model"],
+        "online_cpus": int(first["online_cpus"]),
         "model": first["model"],
         "model_sha256": first["model_sha256"],
         "token_id": first["token_id"],
@@ -314,6 +320,14 @@ def finalize(
         "repeats_per_thread": int(first["repeats"]),
         "threads": sorted(threads),
         "required_thread_levels": required,
+        "parallelism_contract": {
+            "required_levels": required,
+            "max_threads": required[-1],
+            "online_cpus": int(first["online_cpus"]),
+            "oversubscribed_levels": [
+                thread for thread in required if thread > int(first["online_cpus"])
+            ],
+        },
         "metric": "median_matched_forward_steps_per_second",
         "performance_contract": {
             "requirement": "fortai_strictly_faster_at_every_thread_level",
@@ -363,6 +377,7 @@ def _fixture(thread: int = 2) -> dict[str, object]:
             "repeats": 5,
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "cuda_visible_devices": "",
+            "online_cpus": 32,
             "steps": 64,
             "token_id": 9419,
             "context": 128,
@@ -398,6 +413,7 @@ def self_test() -> None:
             "build_flags": "same",
             "fortai_executable_sha256": "same",
             "cuda_visible_devices": "",
+            "online_cpus": 32,
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "model_sha256": "same",
             "token_id": 9419,
@@ -427,6 +443,12 @@ def self_test() -> None:
         assert result["winner"] == "fortai"
         assert result["best_fortai"]["omp_num_threads"] == 1
         assert result["required_thread_levels"] == [1, 2]
+        assert result["parallelism_contract"] == {
+            "required_levels": [1, 2],
+            "max_threads": 2,
+            "online_cpus": 32,
+            "oversubscribed_levels": [],
+        }
         assert result["performance_contract"] == {
             "requirement": "fortai_strictly_faster_at_every_thread_level",
             "all_thread_levels_pass": True,

@@ -88,6 +88,11 @@ print(digest.hexdigest() if digest.digest() != hashlib.sha256().digest() else "n
 PY
 )
 cpu_model=$(LC_ALL=C lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1 || true)
+online_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)
+if [[ ! "$online_cpus" =~ ^[1-9][0-9]*$ ]]; then
+    echo "could not determine online CPU count: $online_cpus" >&2
+    exit 2
+fi
 llama_record="$root_dir/.provenance/records/llama.cpp.txt"
 
 # Run FortAI before starting llama.cpp so the measurements do not compete.
@@ -244,6 +249,7 @@ ORACLE_TOP_K="$oracle_top_k" \
 LLAMA_CLEANUP="verified" LLAMA_SERVER_PATH="$llama_server" \
 LLAMA_SERVER_SHA256="$llama_server_sha256" LLAMA_LIBRARY_DIR="$llama_library_dir" \
 LLAMA_LIBRARY_DIGEST="$llama_library_digest" CPU_MODEL="$cpu_model" \
+ONLINE_CPUS="$online_cpus" \
 LLAMA_RECORD="$llama_record" LLAMA_PROCESS_PROVENANCE="$llama_process_provenance" \
 LLAMA_VERSION="$llama_version" FORTAI_EXECUTABLE="$fortai_executable" \
 FORTAI_EXECUTABLE_SHA256="$fortai_executable_sha256" \
@@ -288,6 +294,7 @@ result = {
     "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
     "compiler": os.environ["COMPILER"],
     "cpu_model": os.environ["CPU_MODEL"],
+    "online_cpus": int(os.environ["ONLINE_CPUS"]),
     "omp_num_threads": int(os.environ["OMP_NUM_THREADS"]),
     "model": os.environ["MODEL_PATH"],
     "model_sha256": hashlib.sha256(Path(os.environ["MODEL_PATH"]).read_bytes()).hexdigest(),

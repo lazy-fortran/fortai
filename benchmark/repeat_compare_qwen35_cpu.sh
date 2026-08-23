@@ -78,7 +78,7 @@ first = results[0]
 immutable_keys = (
     "fortai_commit", "fortai_patch_digest", "fortai_tracked_tree_digest",
     "fortai_worktree_digest", "fortai_executable_sha256", "build_flags",
-    "compiler", "cpu_model", "omp_num_threads", "omp_proc_bind", "omp_places",
+    "compiler", "cpu_model", "online_cpus", "omp_num_threads", "omp_proc_bind", "omp_places",
     "cuda_visible_devices",
     "model_sha256", "token_id", "steps", "context", "llama_launcher_sha256",
     "llama_executable_sha256", "llama_loaded_libraries", "llama_version",
@@ -116,6 +116,7 @@ summary = {
     "performance_gate_eligible": first["performance_gate_eligible"],
     "compiler": first["compiler"],
     "cpu_model": first["cpu_model"],
+    "online_cpus": first["online_cpus"],
     "cuda_visible_devices": first.get("cuda_visible_devices", "unset"),
     "omp_num_threads": first["omp_num_threads"],
     "omp_proc_bind": first["omp_proc_bind"],
