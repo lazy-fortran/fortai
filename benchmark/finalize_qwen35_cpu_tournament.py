@@ -30,6 +30,7 @@ COMMON_KEYS = (
     "build_flags",
     "compiler",
     "cpu_model",
+    "cuda_visible_devices",
     "fortai_executable_sha256",
     "model",
     "model_sha256",
@@ -84,6 +85,8 @@ def validate_summary(summary: dict[str, object], source: str) -> dict[str, objec
             f"{source}: tournament model scope is limited to "
             "Qwen3.5 0.8B/2B/4B Q8_0"
         )
+    if summary.get("cuda_visible_devices") != "":
+        raise ValueError(f"{source}: CPU tournament must hide all CUDA devices")
     repeats = int(summary.get("repeats", 0))
     if repeats < 5:
         raise ValueError(f"{source}: at least five repeats are required")
@@ -165,6 +168,7 @@ def finalize(
         "fortai_worktree_digest",
         "build_flags",
         "fortai_executable_sha256",
+        "cuda_visible_devices",
         "model",
         "model_sha256",
         "token_id",
@@ -243,6 +247,7 @@ def _fixture(thread: int = 2) -> dict[str, object]:
         {
             "repeats": 5,
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
+            "cuda_visible_devices": "",
             "omp_num_threads": thread,
             "measurement_conditions": "isolated",
             "shared_service_conditions": False,
@@ -274,6 +279,7 @@ def self_test() -> None:
             "fortai_worktree_digest": "same",
             "build_flags": "same",
             "fortai_executable_sha256": "same",
+            "cuda_visible_devices": "",
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "model_sha256": "same",
             "token_id": "same",
@@ -335,6 +341,7 @@ def self_test() -> None:
             lambda item: item.update({"model": "/fixtures/Qwen3.8-27B-Q4_K_XL.gguf"}),
             "out_of_scope_model",
         )
+        rejects(lambda item: item.update({"cuda_visible_devices": "0"}), "cuda_visible")
         rejects(lambda item: item.update({"shared_service_conditions": True}), "shared")
         rejects(lambda item: item["fortai_matched_forward_steps_per_second"].update({"median": 999.0}), "tampered")
         rejects(lambda item: item.update({"fortai_commit": "other"}), "mixed")

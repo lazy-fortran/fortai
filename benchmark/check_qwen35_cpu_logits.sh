@@ -118,6 +118,7 @@ print(json.dumps({
     "omp_num_threads": result["omp_num_threads"],
     "omp_proc_bind": result["omp_proc_bind"],
     "omp_places": result["omp_places"],
+    "cuda_visible_devices": result["cuda_visible_devices"],
     "measurement_conditions": result["measurement_conditions"],
     "performance_gate_eligible": result["performance_gate_eligible"],
     "shared_service_conditions": result["shared_service_conditions"],
