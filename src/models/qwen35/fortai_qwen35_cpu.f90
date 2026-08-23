@@ -252,6 +252,14 @@ contains
             call stat % set(FORTAI_INVALID, 'Qwen3.5 GGUF is missing output tensors')
             return
         end if
+        call check_tensor_shape(self, self % token_embedding, 2, self % hidden_size, &
+            self % vocabulary_size, stat)
+        if (.not. stat % is_ok()) return
+        call check_tensor_shape(self, self % output_norm, 1, self % hidden_size, 0, stat)
+        if (.not. stat % is_ok()) return
+        call check_tensor_shape(self, self % output, 2, self % hidden_size, &
+            self % vocabulary_size, stat)
+        if (.not. stat % is_ok()) return
 
         allocate (self % layers(self % layer_count))
         do i = 1, self % layer_count
@@ -1068,18 +1076,93 @@ contains
                 call stat % set(FORTAI_INVALID, 'Qwen3.5 layer is missing an FFN tensor')
                 return
             end if
+            call check_tensor_shape(self, layer % attn_norm, 1, self % hidden_size, 0, stat)
+            if (.not. stat % is_ok()) return
+            call check_tensor_shape(self, layer % post_norm, 1, self % hidden_size, 0, stat)
+            if (.not. stat % is_ok()) return
+            call check_tensor_shape(self, layer % ffn_gate, 2, self % hidden_size, &
+                self % feed_forward_size, stat)
+            if (.not. stat % is_ok()) return
+            call check_tensor_shape(self, layer % ffn_up, 2, self % hidden_size, &
+                self % feed_forward_size, stat)
+            if (.not. stat % is_ok()) return
+            call check_tensor_shape(self, layer % ffn_down, 2, self % feed_forward_size, &
+                self % hidden_size, stat)
+            if (.not. stat % is_ok()) return
             if (layer % recurrent) then
                 if (layer % attn_qkv == 0 .or. layer % attn_gate == 0 .or. layer % ssm_a == 0 &
                     .or. layer % ssm_alpha == 0 .or. layer % ssm_beta == 0 .or. layer % ssm_conv == 0 &
                     .or. layer % ssm_dt == 0 .or. layer % ssm_norm == 0 .or. layer % ssm_out == 0) then
                     call stat % set(FORTAI_INVALID, 'Qwen3.5 recurrent layer is incomplete')
+                else
+                    call check_tensor_shape(self, layer % attn_qkv, 2, self % hidden_size, &
+                        self % recurrent_conv_size, stat)
+                    if (.not. stat % is_ok()) return
+                    call check_tensor_shape(self, layer % attn_gate, 2, self % hidden_size, &
+                        self % recurrent_inner_size, stat)
+                    if (.not. stat % is_ok()) return
+                    call check_tensor_shape(self, layer % ssm_a, 1, self % recurrent_value_heads, 0, stat)
+                    if (.not. stat % is_ok()) return
+                    call check_tensor_shape(self, layer % ssm_alpha, 2, self % hidden_size, &
+                        self % recurrent_value_heads, stat)
+                    if (.not. stat % is_ok()) return
+                    call check_tensor_shape(self, layer % ssm_beta, 2, self % hidden_size, &
+                        self % recurrent_value_heads, stat)
+                    if (.not. stat % is_ok()) return
+                    call check_tensor_shape(self, layer % ssm_conv, 2, self % recurrent_conv_kernel, &
+                        self % recurrent_conv_size, stat)
+                    if (.not. stat % is_ok()) return
+                    call check_tensor_shape(self, layer % ssm_dt, 1, self % recurrent_value_heads, 0, stat)
+                    if (.not. stat % is_ok()) return
+                    call check_tensor_shape(self, layer % ssm_norm, 1, self % recurrent_head_size, 0, stat)
+                    if (.not. stat % is_ok()) return
+                    call check_tensor_shape(self, layer % ssm_out, 2, self % recurrent_inner_size, &
+                        self % hidden_size, stat)
                 end if
             else if (layer % attn_q == 0 .or. layer % attn_k == 0 .or. layer % attn_v == 0 &
                     .or. layer % attn_out == 0 .or. layer % q_norm == 0 .or. layer % k_norm == 0) then
                 call stat % set(FORTAI_INVALID, 'Qwen3.5 attention layer is incomplete')
+            else
+                call check_tensor_shape(self, layer % attn_q, 2, self % hidden_size, &
+                    2 * self % attention_heads * self % attention_head_size, stat)
+                if (.not. stat % is_ok()) return
+                call check_tensor_shape(self, layer % attn_k, 2, self % hidden_size, &
+                    self % attention_heads_kv * self % attention_head_size, stat)
+                if (.not. stat % is_ok()) return
+                call check_tensor_shape(self, layer % attn_v, 2, self % hidden_size, &
+                    self % attention_heads_kv * self % value_length, stat)
+                if (.not. stat % is_ok()) return
+                call check_tensor_shape(self, layer % attn_out, 2, &
+                    self % attention_heads * self % value_length, self % hidden_size, stat)
+                if (.not. stat % is_ok()) return
+                call check_tensor_shape(self, layer % q_norm, 1, self % attention_head_size, 0, stat)
+                if (.not. stat % is_ok()) return
+                call check_tensor_shape(self, layer % k_norm, 1, self % attention_head_size, 0, stat)
             end if
         end associate
     end subroutine bind_layer
+
+    subroutine check_tensor_shape(self, tensor_index, rank, first, second, stat)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index, rank
+        integer(int32), intent(in) :: first, second
+        type(status_t), intent(out) :: stat
+
+        call stat % clear()
+        if (tensor_index <= 0 .or. tensor_index > size(self % file % tensors)) then
+            call stat % set(FORTAI_INVALID, 'Qwen3.5 tensor binding is invalid')
+            return
+        end if
+        if (.not. allocated(self % file % tensors(tensor_index) % shape) .or. &
+            size(self % file % tensors(tensor_index) % shape) /= rank .or. &
+            self % file % tensors(tensor_index) % shape(1) /= int(first, int64)) then
+            call stat % set(FORTAI_INVALID, 'Qwen3.5 tensor shape does not match the model config')
+            return
+        end if
+        if (rank == 2 .and. self % file % tensors(tensor_index) % shape(2) /= int(second, int64)) then
+            call stat % set(FORTAI_INVALID, 'Qwen3.5 tensor shape does not match the model config')
+        end if
+    end subroutine check_tensor_shape
 
     integer function find_layer_tensor(file, layer, suffix)
         type(gguf_file_t), intent(in) :: file
