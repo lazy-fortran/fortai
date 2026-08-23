@@ -31,11 +31,13 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The tournament readiness implementation is revision
-`cb9b12e950eeb34444f5cf438a0db7c5811dfc3b`. It refuses a resident
+`b18b577fbe68e5d0f94714aaca28507fc7553102`. It refuses a resident
 `llama-server` before starting any timing, requires at least five repeats for
-each thread candidate, and binds the selected median to the independent
-centered-logit oracle. No FAI-CPU-003 timing artifact or winner exists yet;
-the protected PID `268006` on port `8080` keeps this leaf evidence-incomplete.
+each thread candidate, restricts both the wrapper and finalizer to the exact
+0.8B/2B/4B Q8_0 model allowlist, and binds the selected median to the
+independent centered-logit oracle. No FAI-CPU-003 timing artifact or winner
+exists yet; the protected PID `268006` on port `8080` keeps this leaf
+evidence-incomplete.
 
 ```text
 leaf_id: FAI-CPU-003
