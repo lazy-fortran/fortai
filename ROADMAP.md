@@ -31,7 +31,7 @@ and FP contraction disabled, passed all eight steps with maximum error
 evidence before a performance winner can be recorded.
 
 The current tournament-readiness implementation anchor is revision
-`963df2960cc96037f67bbca2904bbe8c23baec09`. It refuses any unverified resident `llama-server` before starting
+`1496c239cce14687e4f2b03f72714785c540a4bb`. It refuses any unverified resident `llama-server` before starting
 timing, while allowing only the exact protected GPU service (PID `268006`,
 port `8080`) as independent from the CPU measurements. It requires at least five repeats for
 each thread candidate, restricts the tournament and direct-repeat wrappers
@@ -80,6 +80,15 @@ All three are explicitly shared-service correctness-only evidence because the
 protected server remains resident; they do not establish any performance
 claim or change the FAI-CPU-003 lifecycle.
 
+The same strict centered-top-32 oracle was revalidated at the current
+`1496c239cce14687e4f2b03f72714785c540a4bb` with isolated temporary CPU
+servers, CUDA hidden, empty patch digests, and verified cleanup. The maximum
+centered-logit errors were `2.431842038852494e-7` (0.8B),
+`3.5649993890274345e-7` (2B), and `2.434161379127886e-7` (4B), all below the
+`1.0e-2` tolerance. These current runs close correctness evidence for the
+three permitted small models; they do not close the strict 1–64-thread speed
+gate.
+
 The low-level CPU path is not missing an assembly implementation. The tracked
 `src/backend/cpu/fortai_q8_dot.c` contains AVX2/F16C/FMA kernels for Q8 dot,
 activation quantization, dequantization, SiLU, SiLU-product, and GDN steps;
@@ -100,7 +109,10 @@ current paired capture at
 samples) puts `q8_dot_avx2` at `83.10%` of FortAI samples and
 `ggml_vec_dot_q8_0_q8_0` at `78.07%` of llama.cpp samples. Its host was under
 unrelated load, so it is assembly evidence rather than a promotion-grade
-throughput result; the strict tournament remains the independent gate.
+throughput result; the strict tournament remains the independent gate. The
+current SIMD dispatch also checks FMA before entering the FMA-targeted Q8 dot
+kernel, while the dequantization kernel no longer advertises an unnecessary
+FMA requirement.
 
 ```text
 leaf_id: FAI-CPU-003
