@@ -9,8 +9,8 @@ and reproducible benchmark tooling.
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
 | FAI-CPU-001 | Qwen3.5-0.8B text-only CPU reference | experimental | model opens, independent Q8 oracle passes, and the 8-step trace matches llama.cpp |
-| FAI-CPU-001B | Qwen3.5-2B CPU scaling path | experimental | model opens, runs, and benchmark metadata is recorded |
-| FAI-CPU-001C | Qwen3.5-4B CPU scaling path | experimental | model opens, runs, and benchmark metadata is recorded |
+| FAI-CPU-001B | Qwen3.5-2B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
+| FAI-CPU-001C | Qwen3.5-4B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-002 | CPU logits parity and tokenizer path | closed | token-by-token logits agree with an independent oracle |
 | FAI-CPU-003 | native CPU candidate tournament | in progress | compiler flags, thread count, and winner recorded |
 | FAI-CPU-MOE-001 | CPU MoE execution for Qwen3.6-35B | deferred | expert routing, resident weights, and llama.cpp comparison |
@@ -29,6 +29,49 @@ current `-O2 -march=native` default, with loop unrolling, LTO, no fast math,
 and FP contraction disabled, passed all eight steps with maximum error
 `2.431842038852494e-7`. FAI-CPU-003 still requires repeated isolated timing
 evidence before a performance winner can be recorded.
+
+The 2B and 4B CPU scaling acceptance runs were repeated at revision
+`2b3b135f6fff19148b5613bca4fc294b89a25082` with the validated native flags,
+Q8_0 fixtures, token `9419`, eight steps, context `128`, two OpenMP threads,
+and `CUDA_VISIBLE_DEVICES=""`. The protected llama-server was not used. Both
+results have matching tracked/worktree digest
+`1dd461b76c6cf1f8f1daad793f0dcb40479e02eb0c1b8cb4a7b3084f7c06d162` and the
+empty-patch digest
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`:
+
+* 2B model SHA-256 `30d5d309e77d48b44325fe8eee08f4201f99687752f9a4a77fa66498457b45f4`,
+  result `fortai_Qwen3.5-2B-Q8_0_20260823T143741Z.json` SHA-256
+  `c6a3ecfac771ecbdb63c2b604c74c869eb02ba63de259c0ed10a89ad8ecc2cb5`,
+  24 layers, eight steps, and `7.35294056` tokens/s.
+* 4B model SHA-256 `c3fc7bcaf6f75b8f7ceeead9a769f5a7a9f86a8180af1cfb2b72958dcad8e028`,
+  result `fortai_Qwen3.5-4B-Q8_0_20260823T143848Z.json` SHA-256
+  `d305a5913442f218cd164fe76cd5c1e39ab587bde3c7470732b924167aa20bf3`,
+  32 layers, eight steps, and `2.49143577` tokens/s.
+
+These records close only the model-open/run/metadata claims. They do not
+establish logits parity for the larger fixtures or a performance comparison.
+
+```text
+leaf_id: FAI-CPU-001B
+leaf_status: PASS
+claim_id: FAI-CPU-001B
+claim_status: CLOSED
+parent_id: FAI-CPU
+parent_status: OPEN
+evidence_gate_verdict: PASS
+review_verdict: PASS
+```
+
+```text
+leaf_id: FAI-CPU-001C
+leaf_status: PASS
+claim_id: FAI-CPU-001C
+claim_status: CLOSED
+parent_id: FAI-CPU
+parent_status: OPEN
+evidence_gate_verdict: PASS
+review_verdict: PASS
+```
 
 ## GPU path
 
