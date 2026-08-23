@@ -91,6 +91,10 @@ def validate_summary(summary: dict[str, object], source: str) -> dict[str, objec
         raise ValueError(f"{source}: unsupported tournament metric")
     if int(summary.get("steps", 0)) <= 0:
         raise ValueError(f"{source}: timing step count must be positive")
+    if int(summary.get("token_id", 0)) <= 0:
+        raise ValueError(f"{source}: token ID must be positive")
+    if int(summary.get("context", 0)) <= 0:
+        raise ValueError(f"{source}: context size must be positive")
     repeats = int(summary.get("repeats", 0))
     if repeats < 5:
         raise ValueError(f"{source}: at least five repeats are required")
@@ -272,6 +276,8 @@ def _fixture(thread: int = 2) -> dict[str, object]:
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "cuda_visible_devices": "",
             "steps": 64,
+            "token_id": 9419,
+            "context": 128,
             "omp_num_threads": thread,
             "measurement_conditions": "isolated",
             "shared_service_conditions": False,
@@ -306,8 +312,8 @@ def self_test() -> None:
             "cuda_visible_devices": "",
             "model": "/fixtures/Qwen3.5-0.8B-Q8_0.gguf",
             "model_sha256": "same",
-            "token_id": "same",
-            "context": "same",
+            "token_id": 9419,
+            "context": 128,
             "compiler": "same",
             "cpu_model": "same",
             "omp_proc_bind": "same",
@@ -384,6 +390,8 @@ def self_test() -> None:
         rejects(lambda item: item.update({"cuda_visible_devices": "0"}), "cuda_visible")
         rejects(lambda item: item.update({"metric": "wall_time"}), "metric")
         rejects(lambda item: item.update({"steps": 0}), "steps")
+        rejects(lambda item: item.update({"token_id": 0}), "token")
+        rejects(lambda item: item.update({"context": 0}), "context")
         rejects(lambda item: item.update({"shared_service_conditions": True}), "shared")
         rejects(lambda item: item["fortai_matched_forward_steps_per_second"].update({"median": 999.0}), "tampered")
         rejects(lambda item: item.update({"fortai_commit": "other"}), "mixed")
