@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import statistics
 import tempfile
 from pathlib import Path
@@ -132,6 +133,23 @@ def _load_frozen(path: Path) -> tuple[dict[str, object], str]:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=str(path.parent)
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def finalize(
@@ -375,6 +393,9 @@ def self_test() -> None:
             ],
             "oracle": {"path": str(oracle_path), "sha256": _sha256(oracle_path)},
         }
+        output_path = root / "final.json"
+        _atomic_write_json(output_path, result)
+        assert json.loads(output_path.read_text()) == result
         try:
             finalize([summary_a], oracle_path)
         except ValueError:
@@ -482,7 +503,7 @@ def main() -> None:
         args.oracle_top_k,
         args.oracle_tolerance,
     )
-    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    _atomic_write_json(args.output, result)
     print(json.dumps({"winner": result["winner"], "best_fortai": result["best_fortai"], "best_llama_cpp": result["best_llama_cpp"]}, sort_keys=True))
 
 
