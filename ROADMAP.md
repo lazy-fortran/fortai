@@ -30,8 +30,8 @@ and FP contraction disabled, passed all eight steps with maximum error
 `2.431842038852494e-7`. FAI-CPU-003 still requires repeated isolated timing
 evidence before a performance winner can be recorded.
 
-The tournament readiness implementation is revision
-`a102f45d61b47ef323ed58ce61e61860a8bfe912`. It refuses a resident
+The current tournament-readiness implementation anchor is revision
+`04e98c9edc0728ad5087a3f33ff7ca3e9396cd48`. It refuses a resident
 `llama-server` before starting any timing, requires at least five repeats for
 each thread candidate, restricts the tournament and direct-repeat wrappers
 and finalizer to the exact 0.8B/2B/4B Q8_0 model allowlist, binds the selected
@@ -52,6 +52,26 @@ emits exact FAI-CPU-003/FAI-CPU lifecycle IDs and explicit open/pending review
 axes without self-promoting the claim. No FAI-CPU-003 timing artifact or
 winner exists yet; the protected PID `268006` on port `8080` keeps this leaf
 evidence-incomplete.
+
+The binding hardening in revision `04e98c9edc0728ad5087a3f33ff7ca3e9396cd48`
+now validates the rank and configured dimensions of the global, FFN,
+recurrent/SSM, and full-attention tensors before any Qwen3.5 layer is
+allocated. The permitted 4B fixture opens and executes one CPU step through
+these checks; this is fail-fast diagnostic hardening, not a logits-parity
+fix.
+
+A fresh strict centered-top-32 check for the permitted 2B fixture at the
+previous clean revision `6e9bffa3894a361defcade0912cad140e261fa76` passed all
+eight steps with maximum centered-logit error
+`3.5649993890274345e-7` against tolerance `1.0e-2`. Its result
+`compare_Qwen3.5-2B-Q8_0_20260823T160012Z.json` has SHA-256
+`9a660a2a3c7ea684de88a472d94c57d3996161647dca0c9bdd880ca7ee97a2c5` and is
+explicitly shared-service correctness-only evidence. The corresponding fresh
+4B check remains a hard failure at step 0 (`FortAI=314`, `llama.cpp=11`); its
+result `compare_Qwen3.5-4B-Q8_0_20260823T160115Z.json` has SHA-256
+`3107adef4a76779cb70b8f57c34f0c699ff74d16761351cd92036a47e40fc1b0` and is
+also shared-service correctness-only evidence. Neither result changes the
+FAI-CPU-003 lifecycle or establishes any performance claim.
 
 ```text
 leaf_id: FAI-CPU-003
