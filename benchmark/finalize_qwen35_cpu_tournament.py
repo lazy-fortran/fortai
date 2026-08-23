@@ -152,12 +152,24 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         raise
 
 
+def _normalise_threads(threads: list[int]) -> list[int]:
+    if not threads:
+        raise ValueError("at least one required thread level is needed")
+    if any(thread <= 0 or thread > 64 for thread in threads):
+        raise ValueError("required thread levels must be between 1 and 64")
+    normalised = sorted(threads)
+    if len(set(normalised)) != len(normalised):
+        raise ValueError("required thread levels must be unique")
+    return normalised
+
+
 def finalize(
     summary_paths: list[Path],
     oracle_path: Path,
     oracle_steps: int = DEFAULT_ORACLE_STEPS,
     oracle_top_k: int = DEFAULT_ORACLE_TOP_K,
     oracle_tolerance: float = DEFAULT_ORACLE_TOLERANCE,
+    required_threads: list[int] | None = None,
 ) -> dict[str, object]:
     if len(summary_paths) < 2:
         raise ValueError("at least two thread summaries are required")
@@ -179,6 +191,36 @@ def finalize(
     threads = [int(summary["omp_num_threads"]) for summary in summaries]
     if len(set(threads)) != len(threads):
         raise ValueError("thread summaries must have unique OpenMP thread counts")
+    required = _normalise_threads(required_threads if required_threads is not None else threads)
+    if sorted(threads) != required:
+        raise ValueError(
+            "thread summaries do not cover the required levels: "
+            f"required={required} observed={sorted(threads)}"
+        )
+
+    thread_comparisons = []
+    for summary in summaries:
+        fortai_median = float(
+            summary["fortai_matched_forward_steps_per_second"]["median"]
+        )
+        llama_median = float(
+            summary["llama_cpp_matched_forward_steps_per_second"]["median"]
+        )
+        if not fortai_median > llama_median:
+            raise ValueError(
+                "FortAI must be strictly faster than llama.cpp at every "
+                f"thread level (threads={summary['omp_num_threads']}, "
+                f"fortai={fortai_median}, llama_cpp={llama_median})"
+            )
+        thread_comparisons.append(
+            {
+                "omp_num_threads": int(summary["omp_num_threads"]),
+                "fortai_median_steps_per_second": fortai_median,
+                "llama_cpp_median_steps_per_second": llama_median,
+                "fortai_speedup": fortai_median / llama_median,
+                "fortai_faster": True,
+            }
+        )
 
     best_fortai = max(
         summaries,
@@ -266,7 +308,15 @@ def finalize(
         "context": first["context"],
         "repeats_per_thread": int(first["repeats"]),
         "threads": sorted(threads),
+        "required_thread_levels": required,
         "metric": "median_matched_forward_steps_per_second",
+        "performance_contract": {
+            "requirement": "fortai_strictly_faster_at_every_thread_level",
+            "all_thread_levels_pass": True,
+        },
+        "thread_comparisons": sorted(
+            thread_comparisons, key=lambda item: item["omp_num_threads"]
+        ),
         "measurement_conditions": "isolated",
         "performance_gate_eligible": True,
         "cuda_visible_devices": first["cuda_visible_devices"],
@@ -371,6 +421,12 @@ def self_test() -> None:
         result = finalize([summary_a, summary_b], oracle_path)
         assert result["winner"] == "fortai"
         assert result["best_fortai"]["omp_num_threads"] == 1
+        assert result["required_thread_levels"] == [1, 2]
+        assert result["performance_contract"] == {
+            "requirement": "fortai_strictly_faster_at_every_thread_level",
+            "all_thread_levels_pass": True,
+        }
+        assert all(item["fortai_faster"] for item in result["thread_comparisons"])
         assert result["lifecycle"] == {
             "leaf_id": "FAI-CPU-003",
             "leaf_status": "IN_PROGRESS",
@@ -402,6 +458,28 @@ def self_test() -> None:
             pass
         else:
             raise AssertionError("single-thread candidate was accepted")
+
+        incomplete_levels = root / "incomplete_levels.json"
+        incomplete_levels.write_text(json.dumps(first))
+        try:
+            finalize([summary_a, summary_b], oracle_path, required_threads=[1, 2, 4])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("incomplete thread levels were accepted")
+
+        slower = _fixture(2)
+        slower["fortai_matched_forward_steps_per_second"] = _stats(
+            [8.0, 9.0, 10.0, 11.0, 12.0]
+        )
+        slower_path = root / "slower.json"
+        slower_path.write_text(json.dumps(slower))
+        try:
+            finalize([summary_a, slower_path], oracle_path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("slower FortAI candidate was accepted")
 
         mixed_repeats = _fixture(2)
         mixed_repeats["repeats"] = 6
@@ -488,6 +566,7 @@ def main() -> None:
     parser.add_argument("--oracle-steps", type=int, default=DEFAULT_ORACLE_STEPS)
     parser.add_argument("--oracle-top-k", type=int, default=DEFAULT_ORACLE_TOP_K)
     parser.add_argument("--oracle-tolerance", type=float, default=DEFAULT_ORACLE_TOLERANCE)
+    parser.add_argument("--required-threads", type=int, nargs="+")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -502,6 +581,7 @@ def main() -> None:
         args.oracle_steps,
         args.oracle_top_k,
         args.oracle_tolerance,
+        args.required_threads,
     )
     _atomic_write_json(args.output, result)
     print(json.dumps({"winner": result["winner"], "best_fortai": result["best_fortai"], "best_llama_cpp": result["best_llama_cpp"]}, sort_keys=True))

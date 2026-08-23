@@ -27,7 +27,12 @@ context="${5:-${FORTAI_CONTEXT:-128}}"
 oracle_steps="${6:-${FORTAI_LOGIT_STEPS:-8}}"
 oracle_top_k="${7:-${FORTAI_LOGIT_TOP_K:-32}}"
 oracle_tolerance="${8:-${FORTAI_LOGIT_TOLERANCE:-1.0e-2}}"
-thread_list="${FORTAI_THREAD_LIST:-1 2 4 8 16 32}"
+# The contract covers every power-of-two level through 64 threads.  This
+# machine currently exposes 32 online CPUs, so the 64-thread point is an
+# intentional oversubscription measurement rather than a claim of 64 cores.
+required_thread_args=(1 2 4 8 16 32 64)
+required_thread_list="${required_thread_args[*]}"
+thread_list="${FORTAI_THREAD_LIST:-$required_thread_list}"
 native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto}"
 port="${LLAMA_PORT:-18081}"
 
@@ -71,6 +76,10 @@ for threads in $thread_list; do
 done
 if (( thread_count < 2 )); then
     echo 'tournament requires at least two distinct thread candidates' >&2
+    exit 2
+fi
+if [[ "$thread_list" != "$required_thread_list" ]]; then
+    echo "tournament requires thread levels: $required_thread_list" >&2
     exit 2
 fi
 
@@ -127,6 +136,7 @@ summary_file="$result_dir/tournament_${base}_${stamp}.json"
 mapfile -t summary_paths <"$index_file"
 python3 "$root_dir/benchmark/finalize_qwen35_cpu_tournament.py" \
     "${summary_paths[@]}" --oracle "$oracle_file" --output "$summary_file" \
+    --required-threads "${required_thread_args[@]}" \
     --oracle-steps "$oracle_steps" --oracle-top-k "$oracle_top_k" \
     --oracle-tolerance "$oracle_tolerance"
 printf 'summary=%s\noracle=%s\n' "$summary_file" "$oracle_file"
