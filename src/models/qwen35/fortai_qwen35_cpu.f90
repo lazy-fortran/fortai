@@ -857,17 +857,17 @@ contains
                 self%alpha_work, self%beta_work, stat)
             if (.not. stat%is_ok()) return
         else
-            call layer_matvec(self, layer%attn_qkv, input, self%qkv_work(1:self%recurrent_conv_size), &
-                self % recurrent_conv_size, stat)
+            ! Fuse recurrent projection pairs into one quantization and one
+            ! OpenMP region; the two output widths need not be equal.
+            call self%file%tensors(layer%attn_qkv)%matvec_pair_q8( &
+                self%file%tensors(layer%attn_gate), input, &
+                self%qkv_work(1:self%recurrent_conv_size), &
+                self%gate_work(1:self%recurrent_inner_size), &
+                self%quantized_input, self%quantized_scales, stat)
             if (.not. stat % is_ok()) return
-            call layer_matvec(self, layer%attn_gate, input, self%gate_work(1:self%recurrent_inner_size), &
-                self % recurrent_inner_size, stat)
-            if (.not. stat % is_ok()) return
-            call layer_matvec(self, layer % ssm_alpha, input, self % alpha_work, &
-                self % recurrent_value_heads, stat)
-            if (.not. stat % is_ok()) return
-            call layer_matvec(self, layer % ssm_beta, input, self % beta_work, &
-                self % recurrent_value_heads, stat)
+            call self%file%tensors(layer%ssm_alpha)%matvec_pair_q8( &
+                self%file%tensors(layer%ssm_beta), input, self%alpha_work, &
+                self%beta_work, self%quantized_input, self%quantized_scales, stat)
             if (.not. stat % is_ok()) return
         end if
         call fortai_silu(self % gate_work, int(self % recurrent_inner_size, c_int64_t))

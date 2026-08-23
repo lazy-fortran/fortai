@@ -472,7 +472,7 @@ contains
             integer(int8), contiguous, intent(out) :: quantized(:)
             real(real32), contiguous, intent(out) :: scales(:)
             type(status_t), intent(out) :: stat
-            integer(int64) :: row, block_count
+            integer(int64) :: row, first_rows, total_rows, block_count
 
             call stat%clear()
             if (self%value_type /= GGML_TYPE_Q8_0 .or. other%value_type /= GGML_TYPE_Q8_0) then
@@ -483,7 +483,7 @@ contains
                 call stat%set(FORTAI_INVALID, 'paired activation matvec dimensions do not agree')
                 return
             end if
-            if (self%shape(1) /= other%shape(1) .or. self%shape(2) /= other%shape(2) .or. &
+            if (self%shape(1) /= other%shape(1) .or. &
                 size(vector) /= self%shape(1) .or. size(values) /= self%shape(2) .or. &
                 size(other_values) /= other%shape(2) .or. mod(size(vector), 32) /= 0 .or. &
                 size(quantized) < size(vector) + 2 * ((size(vector) + 31) / 32) .or. &
@@ -493,21 +493,29 @@ contains
             end if
             block_count = size(vector) / 32
             call fortai_q8_quantize(vector, quantized, scales, int(size(vector), c_int64_t))
-            if (self%shape(2) < 128_int64) then
-                do row = 1, self%shape(2)
-                    values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
-                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
-                    other_values(row) = fortai_q8_dot(other%bytes, quantized, scales, &
-                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+            first_rows = self%shape(2)
+            total_rows = first_rows + other%shape(2)
+            if (total_rows < 128_int64) then
+                do row = 1, total_rows
+                    if (row <= first_rows) then
+                        values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                            int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    else
+                        other_values(row - first_rows) = fortai_q8_dot(other%bytes, quantized, scales, &
+                            int(row - first_rows - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    end if
                 end do
             else
                 !$omp parallel do default(none) shared(self, other, quantized, scales, values, &
-                !$omp& other_values, block_count) private(row) schedule(static)
-                do row = 1, self%shape(2)
-                    values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
-                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
-                    other_values(row) = fortai_q8_dot(other%bytes, quantized, scales, &
-                        int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                !$omp& other_values, first_rows, total_rows, block_count) private(row) schedule(static)
+                do row = 1, total_rows
+                    if (row <= first_rows) then
+                        values(row) = fortai_q8_dot(self%bytes, quantized, scales, &
+                            int(row - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    else
+                        other_values(row - first_rows) = fortai_q8_dot(other%bytes, quantized, scales, &
+                            int(row - first_rows - 1_int64, c_int64_t), int(block_count, c_int64_t))
+                    end if
                 end do
                 !$omp end parallel do
             end if
