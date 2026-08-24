@@ -54,9 +54,20 @@ bool fortai_supported_type(int type) {
 
 } // namespace
 
+struct fortai_cuda_q4_weights;
+
+struct fortai_cuda_q4_group_plan {
+    int count = 0;
+    const fortai_cuda_q4_weights *weights[3] = {nullptr, nullptr, nullptr};
+    ggml_context *context = nullptr;
+    ggml_cgraph *graph = nullptr;
+    ggml_backend_t backend = nullptr;
+};
+
 struct fortai_cuda_q4_context {
     ggml_backend_t devices[2] = {nullptr, nullptr};
     ggml_backend_t cpu = nullptr;
+    std::vector<fortai_cuda_q4_group_plan> group_plans;
 };
 
 struct fortai_cuda_q4_weights {
@@ -141,9 +152,20 @@ int fortai_cuda_q4_weights_upload(fortai_cuda_q4_context * context, int value_ty
         fortai_cuda_q4_weights_destroy(created);
         return FORTAI_CUDA_RUNTIME_ERROR;
     }
-    ggml_backend_tensor_set(created->weight, host_weights, 0, weight_bytes);
+    /* Queue model uploads on each device and synchronize once after the full
+     * tensor set is built.  The previous per-tensor synchronous copy made
+     * large UD-Q4_K_XL model open time scale with the tensor count. */
+    ggml_backend_tensor_set_async(created->backend, created->weight, host_weights, 0, weight_bytes);
     created->output_bytes = static_cast<size_t>(rows) * sizeof(float);
     *out = created;
+    return FORTAI_CUDA_OK;
+}
+
+int fortai_cuda_q4_context_synchronize(fortai_cuda_q4_context *context) {
+    if (context == nullptr || context->devices[0] == nullptr || context->devices[1] == nullptr)
+        return FORTAI_CUDA_INVALID;
+    ggml_backend_synchronize(context->devices[0]);
+    if (context->devices[1] != context->devices[0]) ggml_backend_synchronize(context->devices[1]);
     return FORTAI_CUDA_OK;
 }
 
@@ -155,19 +177,131 @@ int fortai_cuda_q4_weights_destroy(fortai_cuda_q4_weights * weights) {
     return FORTAI_CUDA_OK;
 }
 
+static int fortai_cuda_q4_matvec_host_group(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights * const *weights, const void *host_activation,
+    size_t activation_bytes, float * const *host_outputs, const size_t *output_bytes,
+    int count, float *elapsed_ms) {
+    if (context == nullptr || weights == nullptr || host_activation == nullptr ||
+        host_outputs == nullptr || output_bytes == nullptr || count < 1 || count > 3)
+        return FORTAI_CUDA_INVALID;
+    for (int i = 0; i < count; ++i) {
+        if (weights[i] == nullptr || weights[i]->owner != context || host_outputs[i] == nullptr ||
+            activation_bytes != static_cast<size_t>(weights[i]->activation->ne[0]) * sizeof(float) ||
+            output_bytes[i] != weights[i]->output_bytes) return FORTAI_CUDA_INVALID;
+    }
+    auto start = std::chrono::steady_clock::now();
+    /* The synchronous wrapper used to force a host-visible boundary after
+     * every projection.  Queue all work first; projections on different
+     * devices can now overlap and projections on one device have no host gap
+     * between their copies and kernels. */
+    for (int i = 0; i < count; ++i) {
+        const fortai_cuda_q4_weights *weight = weights[i];
+        bool already_queued = false;
+        for (int j = 0; j < i; ++j)
+            if (weights[j]->backend == weight->backend) already_queued = true;
+        if (already_queued) continue;
+
+        int members[3];
+        int member_count = 0;
+        for (int j = i; j < count; ++j)
+            if (weights[j]->backend == weight->backend) members[member_count++] = j;
+        if (member_count == 1) {
+            ggml_backend_tensor_set_async(weight->backend, weight->activation,
+                host_activation, 0, activation_bytes);
+            enum ggml_status status = ggml_backend_sched_graph_compute_async(
+                weight->scheduler, weight->graph);
+            if (status != GGML_STATUS_SUCCESS) return fail(context);
+            ggml_backend_tensor_get_async(weight->backend, weight->output,
+                host_outputs[i], 0, output_bytes[i]);
+            continue;
+        }
+
+        fortai_cuda_q4_group_plan *plan = nullptr;
+        for (auto &candidate : context->group_plans) {
+            if (candidate.count != member_count || candidate.backend != weight->backend) continue;
+            bool match = true;
+            for (int k = 0; k < member_count; ++k)
+                if (candidate.weights[k] != weights[members[k]]) match = false;
+            if (match) {
+                plan = &candidate;
+                break;
+            }
+        }
+        if (plan == nullptr) {
+            fortai_cuda_q4_group_plan candidate;
+            candidate.count = member_count;
+            candidate.backend = weight->backend;
+            candidate.context = weight->graph_context;
+            for (int k = 0; k < member_count; ++k)
+                candidate.weights[k] = weights[members[k]];
+            candidate.graph = ggml_new_graph_custom(candidate.context, GGML_DEFAULT_GRAPH_SIZE, false);
+            if (candidate.graph == nullptr) return fail(context);
+            for (int k = 0; k < member_count; ++k)
+                ggml_build_forward_expand(candidate.graph, candidate.weights[k]->output);
+            context->group_plans.push_back(candidate);
+            plan = &context->group_plans.back();
+        }
+        for (int k = 0; k < member_count; ++k) {
+            const fortai_cuda_q4_weights *member = plan->weights[k];
+            ggml_backend_tensor_set_async(member->backend, member->activation,
+                host_activation, 0, activation_bytes);
+        }
+        enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
+        if (status != GGML_STATUS_SUCCESS) return fail(context);
+        for (int k = 0; k < member_count; ++k) {
+            int output_index = members[k];
+            ggml_backend_tensor_get_async(weight->backend, plan->weights[k]->output,
+                host_outputs[output_index], 0, output_bytes[output_index]);
+        }
+    }
+    /* A group may contain multiple per-weight schedulers, but schedulers on
+     * the same CUDA backend share the backend's stream pool.  Synchronizing
+     * the backend once avoids one host-side scheduler barrier per projection;
+     * retain one barrier per participating device for multi-GPU groups. */
+    for (int i = 0; i < count; ++i) {
+        bool already_synchronized = false;
+        for (int j = 0; j < i; ++j)
+            if (weights[j]->backend == weights[i]->backend) already_synchronized = true;
+        if (!already_synchronized) ggml_backend_synchronize(weights[i]->backend);
+    }
+    auto stop = std::chrono::steady_clock::now();
+    if (elapsed_ms != nullptr)
+        *elapsed_ms = std::chrono::duration<float, std::milli>(stop - start).count();
+    return FORTAI_CUDA_OK;
+}
+
 int fortai_cuda_q4_matvec_host(fortai_cuda_q4_context * context,
     const fortai_cuda_q4_weights * weights, const void * host_activation,
     size_t activation_bytes, float * host_output, size_t output_bytes, float * elapsed_ms) {
-    if (context == nullptr || weights == nullptr || weights->owner != context || host_activation == nullptr ||
-        host_output == nullptr || activation_bytes != static_cast<size_t>(weights->activation->ne[0]) * sizeof(float) ||
-        output_bytes != weights->output_bytes) return FORTAI_CUDA_INVALID;
-    auto start = std::chrono::steady_clock::now();
-    ggml_backend_tensor_set(weights->activation, host_activation, 0, activation_bytes);
-    enum ggml_status status = ggml_backend_sched_graph_compute(weights->scheduler, weights->graph);
-    if (status != GGML_STATUS_SUCCESS) return fail(context);
-    ggml_backend_tensor_get(weights->output, host_output, 0, output_bytes);
-    ggml_backend_synchronize(weights->backend);
-    auto stop = std::chrono::steady_clock::now();
-    if (elapsed_ms != nullptr) *elapsed_ms = std::chrono::duration<float, std::milli>(stop - start).count();
-    return FORTAI_CUDA_OK;
+    const fortai_cuda_q4_weights *group[1] = {weights};
+    float *outputs[1] = {host_output};
+    const size_t bytes[1] = {output_bytes};
+    return fortai_cuda_q4_matvec_host_group(context, group, host_activation,
+        activation_bytes, outputs, bytes, 1, elapsed_ms);
+}
+
+int fortai_cuda_q4_matvec_host_pair(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *first_weights,
+    const fortai_cuda_q4_weights *second_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *elapsed_ms) {
+    const fortai_cuda_q4_weights *group[2] = {first_weights, second_weights};
+    float *outputs[2] = {first_output, second_output};
+    const size_t bytes[2] = {first_output_bytes, second_output_bytes};
+    return fortai_cuda_q4_matvec_host_group(context, group, host_activation,
+        activation_bytes, outputs, bytes, 2, elapsed_ms);
+}
+
+int fortai_cuda_q4_matvec_host_triplet(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *first_weights,
+    const fortai_cuda_q4_weights *second_weights,
+    const fortai_cuda_q4_weights *third_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *third_output,
+    size_t third_output_bytes, float *elapsed_ms) {
+    const fortai_cuda_q4_weights *group[3] = {first_weights, second_weights, third_weights};
+    float *outputs[3] = {first_output, second_output, third_output};
+    const size_t bytes[3] = {first_output_bytes, second_output_bytes, third_output_bytes};
+    return fortai_cuda_q4_matvec_host_group(context, group, host_activation,
+        activation_bytes, outputs, bytes, 3, elapsed_ms);
 }

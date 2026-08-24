@@ -24,6 +24,11 @@ int FORTAI_WEAK fortai_cuda_q4_context_destroy(fortai_cuda_q4_context *context) 
     return FORTAI_CUDA_OK;
 }
 
+int FORTAI_WEAK fortai_cuda_q4_context_synchronize(fortai_cuda_q4_context *context) {
+    (void)context;
+    return FORTAI_CUDA_OK;
+}
+
 int FORTAI_WEAK fortai_cuda_q4_weights_upload(fortai_cuda_q4_context *context, int value_type,
     const void *host_weights, size_t weight_bytes, int rows, int width, int device,
     fortai_cuda_q4_weights **weights) {
@@ -52,6 +57,47 @@ int FORTAI_WEAK fortai_cuda_q4_matvec_host(fortai_cuda_q4_context *context,
     (void)activation_bytes;
     (void)host_output;
     (void)output_bytes;
+    if (elapsed_ms) *elapsed_ms = 0.0f;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q4_matvec_host_pair(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *first_weights,
+    const fortai_cuda_q4_weights *second_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *elapsed_ms) {
+    (void)context;
+    (void)first_weights;
+    (void)second_weights;
+    (void)host_activation;
+    (void)activation_bytes;
+    (void)first_output;
+    (void)first_output_bytes;
+    (void)second_output;
+    (void)second_output_bytes;
+    if (elapsed_ms) *elapsed_ms = 0.0f;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q4_matvec_host_triplet(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *first_weights,
+    const fortai_cuda_q4_weights *second_weights,
+    const fortai_cuda_q4_weights *third_weights, const void *host_activation,
+    size_t activation_bytes, float *first_output, size_t first_output_bytes,
+    float *second_output, size_t second_output_bytes, float *third_output,
+    size_t third_output_bytes, float *elapsed_ms) {
+    (void)context;
+    (void)first_weights;
+    (void)second_weights;
+    (void)third_weights;
+    (void)host_activation;
+    (void)activation_bytes;
+    (void)first_output;
+    (void)first_output_bytes;
+    (void)second_output;
+    (void)second_output_bytes;
+    (void)third_output;
+    (void)third_output_bytes;
     if (elapsed_ms) *elapsed_ms = 0.0f;
     return unavailable();
 }

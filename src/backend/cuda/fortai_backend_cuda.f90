@@ -37,6 +37,7 @@ module fortai_backend_cuda
     contains
         procedure :: create => cuda_q4_context_create
         procedure :: destroy => cuda_q4_context_destroy
+        procedure :: synchronize => cuda_q4_context_synchronize
     end type cuda_q4_context_t
 
     type, public :: cuda_q4_weights_t
@@ -78,6 +79,8 @@ module fortai_backend_cuda
     public :: cuda_q8_matvec_device_f32
     public :: cuda_qwen35_embedding_device
     public :: cuda_q4_matvec_host
+    public :: cuda_q4_matvec_host_pair
+    public :: cuda_q4_matvec_host_triplet
 
     interface
         function c_context_create(device, context) bind(C, name='fortai_cuda_q8_context_create') &
@@ -156,6 +159,12 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_q4_context_destroy
 
+        function c_q4_context_synchronize(context) bind(C, name='fortai_cuda_q4_context_synchronize') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: context
+            integer(c_int) :: code
+        end function c_q4_context_synchronize
+
         function c_q4_weights_upload(context, value_type, host_weights, weight_bytes, rows, width, &
                 device, weights) bind(C, name='fortai_cuda_q4_weights_upload') result(code)
             import c_int, c_int8_t, c_ptr, c_size_t
@@ -185,6 +194,33 @@ module fortai_backend_cuda
             real(c_float), intent(out) :: elapsed_ms
             integer(c_int) :: code
         end function c_q4_matvec_host
+
+        function c_q4_matvec_host_pair(context, first_weights, second_weights, activation, activation_bytes, &
+                first_output, first_output_bytes, second_output, second_output_bytes, elapsed_ms) &
+                bind(C, name='fortai_cuda_q4_matvec_host_pair') result(code)
+            import c_float, c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, first_weights, second_weights
+            real(c_float), target, intent(in) :: activation(*)
+            integer(c_size_t), value :: activation_bytes
+            real(c_float), target, intent(out) :: first_output(*), second_output(*)
+            integer(c_size_t), value :: first_output_bytes, second_output_bytes
+            real(c_float), intent(out) :: elapsed_ms
+            integer(c_int) :: code
+        end function c_q4_matvec_host_pair
+
+        function c_q4_matvec_host_triplet(context, first_weights, second_weights, third_weights, activation, &
+                activation_bytes, first_output, first_output_bytes, second_output, second_output_bytes, &
+                third_output, third_output_bytes, elapsed_ms) bind(C, name='fortai_cuda_q4_matvec_host_triplet') &
+                result(code)
+            import c_float, c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, first_weights, second_weights, third_weights
+            real(c_float), target, intent(in) :: activation(*)
+            integer(c_size_t), value :: activation_bytes
+            real(c_float), target, intent(out) :: first_output(*), second_output(*), third_output(*)
+            integer(c_size_t), value :: first_output_bytes, second_output_bytes, third_output_bytes
+            real(c_float), intent(out) :: elapsed_ms
+            integer(c_int) :: code
+        end function c_q4_matvec_host_triplet
 
         function c_buffer_create(context, bytes, buffer) &
                 bind(C, name='fortai_cuda_q8_device_buffer_create') result(code)
@@ -502,6 +538,21 @@ contains
             'CUDA Q4 context destruction failed')
     end subroutine cuda_q4_context_destroy
 
+    subroutine cuda_q4_context_synchronize(self, stat)
+        class(cuda_q4_context_t), intent(in) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 context synchronization arguments')
+            return
+        end if
+        code = c_q4_context_synchronize(self%handle)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 context synchronization failed')
+    end subroutine cuda_q4_context_synchronize
+
     subroutine cuda_q4_weights_upload(self, context, value_type, host_weights, weight_bytes, rows, width, &
             device, stat)
         class(cuda_q4_weights_t), intent(inout) :: self
@@ -559,6 +610,55 @@ contains
             int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms)
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 matvec failed')
     end subroutine cuda_q4_matvec_host
+
+    subroutine cuda_q4_matvec_host_pair(context, first_weights, second_weights, activation, first_output, &
+            second_output, elapsed_ms, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: first_weights, second_weights
+        real(c_float), contiguous, target, intent(in) :: activation(:)
+        real(c_float), contiguous, target, intent(out) :: first_output(:), second_output(:)
+        real(c_float), intent(out) :: elapsed_ms
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        elapsed_ms = 0.0_c_float
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(second_weights%handle)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 paired matvec arguments')
+            return
+        end if
+        code = c_q4_matvec_host_pair(context%handle, first_weights%handle, second_weights%handle, activation, &
+            int(size(activation) * storage_size(activation(1)) / 8, c_size_t), first_output, &
+            int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
+            int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), elapsed_ms)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 paired matvec failed')
+    end subroutine cuda_q4_matvec_host_pair
+
+    subroutine cuda_q4_matvec_host_triplet(context, first_weights, second_weights, third_weights, activation, &
+            first_output, second_output, third_output, elapsed_ms, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: first_weights, second_weights, third_weights
+        real(c_float), contiguous, target, intent(in) :: activation(:)
+        real(c_float), contiguous, target, intent(out) :: first_output(:), second_output(:), third_output(:)
+        real(c_float), intent(out) :: elapsed_ms
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        elapsed_ms = 0.0_c_float
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(second_weights%handle) .or. .not. c_associated(third_weights%handle)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 triplet matvec arguments')
+            return
+        end if
+        code = c_q4_matvec_host_triplet(context%handle, first_weights%handle, second_weights%handle, &
+            third_weights%handle, activation, int(size(activation) * storage_size(activation(1)) / 8, c_size_t), &
+            first_output, int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
+            int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), third_output, &
+            int(size(third_output) * storage_size(third_output(1)) / 8, c_size_t), elapsed_ms)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 triplet matvec failed')
+    end subroutine cuda_q4_matvec_host_triplet
 
     subroutine cuda_q8_context_create(self, device, stat)
         class(cuda_q8_context_t), intent(inout) :: self

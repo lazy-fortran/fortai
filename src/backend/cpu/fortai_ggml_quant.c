@@ -57,14 +57,42 @@ typedef struct {
     fortai_ggml_cgraph * graph;
 } fortai_ggml_cpu_plan;
 
+/* A decode forward repeatedly evaluates several projections with the same
+ * activation width.  Keep one GGML graph for those projections instead of
+ * entering the backend once per matrix.  This is intentionally limited to
+ * the small groups used by Qwen (Q/K/V and FFN gate/up); the scalar API above
+ * remains the fallback for arbitrary callers. */
+#define FORTAI_GGML_GROUP_MAX 3
+typedef struct {
+    int count;
+    int type[FORTAI_GGML_GROUP_MAX];
+    int64_t rows[FORTAI_GGML_GROUP_MAX];
+    int64_t width;
+    const void *weights_host[FORTAI_GGML_GROUP_MAX];
+    size_t weight_bytes[FORTAI_GGML_GROUP_MAX];
+    fortai_ggml_context *context;
+    fortai_ggml_backend *backend;
+    fortai_ggml_backend_buffer *buffer;
+    fortai_ggml_tensor *weight[FORTAI_GGML_GROUP_MAX];
+    fortai_ggml_tensor *input;
+    fortai_ggml_tensor *output[FORTAI_GGML_GROUP_MAX];
+    fortai_ggml_cgraph *graph;
+} fortai_ggml_cpu_group_plan;
+
 static fortai_ggml_cpu_plan fortai_cpu_plans[256];
 static size_t fortai_cpu_plan_count;
 static size_t fortai_cpu_plan_bytes;
+static fortai_ggml_cpu_group_plan fortai_cpu_group_plans[256];
+static size_t fortai_cpu_group_plan_count;
+static size_t fortai_cpu_group_plan_bytes;
 
 static void * fortai_ggml_handle;
 static int fortai_ggml_attempted;
 static void * fortai_ggml_cpu_handle;
 static int fortai_ggml_cpu_attempted;
+static fortai_ggml_backend *fortai_shared_cpu_backend;
+
+static const char * fortai_dequant_name(int type, int64_t *block_width, size_t *block_bytes);
 
 static void * fortai_open_ggml(void) {
     if (fortai_ggml_attempted) return fortai_ggml_handle;
@@ -104,6 +132,24 @@ static void * fortai_open_ggml_cpu(void) {
     return NULL;
 }
 
+static fortai_ggml_backend *fortai_get_shared_cpu_backend(void *cpu) {
+    if (fortai_shared_cpu_backend != NULL) return fortai_shared_cpu_backend;
+    fortai_ggml_cpu_init_fn cpu_init =
+        (fortai_ggml_cpu_init_fn)dlsym(cpu, "ggml_backend_cpu_init");
+    if (cpu_init == NULL) return NULL;
+    fortai_shared_cpu_backend = cpu_init();
+    if (fortai_shared_cpu_backend != NULL) {
+        fortai_ggml_cpu_threads_fn set_threads =
+            (fortai_ggml_cpu_threads_fn)dlsym(cpu, "ggml_backend_cpu_set_n_threads");
+        if (set_threads != NULL) {
+            const char *text = getenv("OMP_NUM_THREADS");
+            int threads = text == NULL ? 0 : atoi(text);
+            if (threads > 0) set_threads(fortai_shared_cpu_backend, threads);
+        }
+    }
+    return fortai_shared_cpu_backend;
+}
+
 static int fortai_cpu_plan_make(int type, const void * weights, size_t weight_bytes,
     int64_t rows, int64_t width, fortai_ggml_cpu_plan * plan) {
     void * base = fortai_open_ggml();
@@ -117,16 +163,12 @@ static int fortai_cpu_plan_make(int type, const void * weights, size_t weight_by
     fortai_ggml_new_graph_fn new_graph =
         (fortai_ggml_new_graph_fn)dlsym(base, "ggml_new_graph_custom");
     fortai_ggml_build_fn build = (fortai_ggml_build_fn)dlsym(base, "ggml_build_forward_expand");
-    fortai_ggml_cpu_init_fn cpu_init =
-        (fortai_ggml_cpu_init_fn)dlsym(cpu, "ggml_backend_cpu_init");
     fortai_ggml_alloc_ctx_fn alloc_ctx =
         (fortai_ggml_alloc_ctx_fn)dlsym(base, "ggml_backend_alloc_ctx_tensors");
     fortai_ggml_tensor_set_fn tensor_set =
         (fortai_ggml_tensor_set_fn)dlsym(base, "ggml_backend_tensor_set");
-    fortai_ggml_cpu_threads_fn set_threads =
-        (fortai_ggml_cpu_threads_fn)dlsym(cpu, "ggml_backend_cpu_set_n_threads");
     if (init == NULL || free_ctx == NULL || new_tensor == NULL || mul_mat == NULL ||
-        new_graph == NULL || build == NULL || cpu_init == NULL || alloc_ctx == NULL ||
+        new_graph == NULL || build == NULL || alloc_ctx == NULL ||
         tensor_set == NULL) return 1;
     fortai_ggml_init_params params = { 2u * 1024u * 1024u, NULL, true };
     plan->context = init(params);
@@ -137,7 +179,7 @@ static int fortai_cpu_plan_make(int type, const void * weights, size_t weight_by
         mul_mat(plan->context, plan->weight, plan->input);
     plan->graph = plan->output == NULL ? NULL : new_graph(plan->context, 4096, false);
     if (plan->graph != NULL) build(plan->graph, plan->output);
-    plan->backend = cpu_init();
+    plan->backend = fortai_get_shared_cpu_backend(cpu);
     plan->buffer = plan->backend == NULL ? NULL : alloc_ctx(plan->context, plan->backend);
     if (plan->buffer == NULL || plan->weight == NULL || plan->input == NULL ||
         plan->output == NULL || plan->graph == NULL) {
@@ -146,21 +188,11 @@ static int fortai_cpu_plan_make(int type, const void * weights, size_t weight_by
                 (fortai_ggml_buffer_free_fn)dlsym(base, "ggml_backend_buffer_free");
             if (buffer_free != NULL) buffer_free(plan->buffer);
         }
-        if (plan->backend != NULL) {
-            fortai_ggml_backend_free_fn backend_free =
-                (fortai_ggml_backend_free_fn)dlsym(base, "ggml_backend_free");
-            if (backend_free != NULL) backend_free(plan->backend);
-        }
         free_ctx(plan->context);
         memset(plan, 0, sizeof(*plan));
         return 1;
     }
     tensor_set(plan->weight, weights, 0, weight_bytes);
-    if (set_threads != NULL) {
-        const char * text = getenv("OMP_NUM_THREADS");
-        int threads = text == NULL ? 0 : atoi(text);
-        if (threads > 0) set_threads(plan->backend, threads);
-    }
     plan->type = type;
     plan->rows = rows;
     plan->width = width;
@@ -205,6 +237,171 @@ static int fortai_cpu_plan_cached(int type, const void * weights, size_t weight_
     return fortai_cpu_plan_compute(plan, activation, output);
 }
 
+static int fortai_cpu_group_plan_make(int count, const int *types,
+    const void * const *weights, const size_t *weight_bytes, const int64_t *rows,
+    int64_t width, fortai_ggml_cpu_group_plan *plan) {
+    void *base = fortai_open_ggml();
+    void *cpu = fortai_open_ggml_cpu();
+    if (base == NULL || cpu == NULL || plan == NULL || count < 2 ||
+        count > FORTAI_GGML_GROUP_MAX) return 1;
+    fortai_ggml_init_fn init = (fortai_ggml_init_fn)dlsym(base, "ggml_init");
+    fortai_ggml_free_fn free_ctx = (fortai_ggml_free_fn)dlsym(base, "ggml_free");
+    fortai_ggml_new_tensor_2d_fn new_tensor =
+        (fortai_ggml_new_tensor_2d_fn)dlsym(base, "ggml_new_tensor_2d");
+    fortai_ggml_mul_mat_fn mul_mat = (fortai_ggml_mul_mat_fn)dlsym(base, "ggml_mul_mat");
+    fortai_ggml_new_graph_fn new_graph =
+        (fortai_ggml_new_graph_fn)dlsym(base, "ggml_new_graph_custom");
+    fortai_ggml_build_fn build =
+        (fortai_ggml_build_fn)dlsym(base, "ggml_build_forward_expand");
+    fortai_ggml_alloc_ctx_fn alloc_ctx =
+        (fortai_ggml_alloc_ctx_fn)dlsym(base, "ggml_backend_alloc_ctx_tensors");
+    fortai_ggml_backend_free_fn backend_free =
+        (fortai_ggml_backend_free_fn)dlsym(base, "ggml_backend_free");
+    fortai_ggml_buffer_free_fn buffer_free =
+        (fortai_ggml_buffer_free_fn)dlsym(base, "ggml_backend_buffer_free");
+    fortai_ggml_tensor_set_fn tensor_set =
+        (fortai_ggml_tensor_set_fn)dlsym(base, "ggml_backend_tensor_set");
+    if (init == NULL || free_ctx == NULL || new_tensor == NULL || mul_mat == NULL ||
+        new_graph == NULL || build == NULL || backend_free == NULL ||
+        alloc_ctx == NULL || buffer_free == NULL || tensor_set == NULL) return 1;
+
+    fortai_ggml_init_params params = { 2u * 1024u * 1024u, NULL, true };
+    plan->context = init(params);
+    if (plan->context == NULL) return 1;
+    plan->input = new_tensor(plan->context, 0, width, 1);
+    for (int i = 0; i < count; ++i) {
+        plan->weight[i] = new_tensor(plan->context, types[i], width, rows[i]);
+        plan->output[i] = plan->weight[i] == NULL || plan->input == NULL ? NULL :
+            mul_mat(plan->context, plan->weight[i], plan->input);
+    }
+    plan->graph = new_graph(plan->context, 4096, false);
+    if (plan->graph != NULL) {
+        for (int i = 0; i < count; ++i)
+            if (plan->output[i] != NULL) build(plan->graph, plan->output[i]);
+    }
+    plan->backend = fortai_get_shared_cpu_backend(cpu);
+    plan->buffer = plan->backend == NULL ? NULL : alloc_ctx(plan->context, plan->backend);
+    if (plan->buffer == NULL || plan->input == NULL || plan->graph == NULL) {
+        if (plan->buffer != NULL) buffer_free(plan->buffer);
+        free_ctx(plan->context);
+        memset(plan, 0, sizeof(*plan));
+        return 1;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (plan->weight[i] == NULL || plan->output[i] == NULL) {
+            buffer_free(plan->buffer);
+            free_ctx(plan->context);
+            memset(plan, 0, sizeof(*plan));
+            return 1;
+        }
+        tensor_set(plan->weight[i], weights[i], 0, weight_bytes[i]);
+        plan->type[i] = types[i];
+        plan->rows[i] = rows[i];
+        plan->weights_host[i] = weights[i];
+        plan->weight_bytes[i] = weight_bytes[i];
+    }
+    plan->count = count;
+    plan->width = width;
+    return 0;
+}
+
+static int fortai_cpu_group_plan_compute(fortai_ggml_cpu_group_plan *plan,
+    const float *activation, float * const *outputs) {
+    void *base = fortai_open_ggml();
+    if (base == NULL || plan == NULL || activation == NULL || outputs == NULL) return 1;
+    fortai_ggml_tensor_set_fn tensor_set =
+        (fortai_ggml_tensor_set_fn)dlsym(base, "ggml_backend_tensor_set");
+    fortai_ggml_tensor_get_fn tensor_get =
+        (fortai_ggml_tensor_get_fn)dlsym(base, "ggml_backend_tensor_get");
+    fortai_ggml_compute_fn compute =
+        (fortai_ggml_compute_fn)dlsym(base, "ggml_backend_graph_compute");
+    if (tensor_set == NULL || tensor_get == NULL || compute == NULL) return 1;
+    tensor_set(plan->input, activation, 0, (size_t)plan->width * sizeof(float));
+    if (compute(plan->backend, plan->graph) != 0) return 1;
+    for (int i = 0; i < plan->count; ++i)
+        tensor_get(plan->output[i], outputs[i], 0, (size_t)plan->rows[i] * sizeof(float));
+    return 0;
+}
+
+static int fortai_cpu_group_plan_cached(int count, const int *types,
+    const void * const *weights, const size_t *weight_bytes, const int64_t *rows,
+    int64_t width, const float *activation, float * const *outputs) {
+    const char *disabled = getenv("FORTAI_GGML_CPU_CACHE");
+    if (disabled != NULL && strcmp(disabled, "0") == 0) return 1;
+    for (size_t p = 0; p < fortai_cpu_group_plan_count; ++p) {
+        fortai_ggml_cpu_group_plan *plan = &fortai_cpu_group_plans[p];
+        if (plan->count != count || plan->width != width) continue;
+        int match = 1;
+        for (int i = 0; i < count; ++i) {
+            if (plan->type[i] != types[i] || plan->rows[i] != rows[i] ||
+                plan->weights_host[i] != weights[i] || plan->weight_bytes[i] != weight_bytes[i]) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) return fortai_cpu_group_plan_compute(plan, activation, outputs);
+    }
+    if (fortai_cpu_group_plan_count >=
+            sizeof(fortai_cpu_group_plans) / sizeof(fortai_cpu_group_plans[0])) return 1;
+    size_t bytes = 0;
+    for (int i = 0; i < count; ++i) bytes += weight_bytes[i];
+    if (fortai_cpu_group_plan_bytes + bytes > (size_t)4u * 1024u * 1024u * 1024u) return 1;
+    fortai_ggml_cpu_group_plan *plan = &fortai_cpu_group_plans[fortai_cpu_group_plan_count];
+    memset(plan, 0, sizeof(*plan));
+    if (fortai_cpu_group_plan_make(count, types, weights, weight_bytes, rows, width, plan) != 0)
+        return 1;
+    fortai_cpu_group_plan_count++;
+    fortai_cpu_group_plan_bytes += bytes;
+    return fortai_cpu_group_plan_compute(plan, activation, outputs);
+}
+
+static int fortai_ggml_quant_matvec_group(int count, const int *types,
+    const void * const *weights, const size_t *weight_bytes, const int64_t *rows,
+    int64_t width, const float *activation, float * const *outputs) {
+    const char *disabled = getenv("FORTAI_GGML_CPU_GROUP");
+    if (disabled != NULL && strcmp(disabled, "0") == 0) return 1;
+    if (count < 2 || count > FORTAI_GGML_GROUP_MAX || types == NULL || weights == NULL ||
+        weight_bytes == NULL || rows == NULL || activation == NULL || outputs == NULL ||
+        width <= 0) return 1;
+    for (int i = 0; i < count; ++i) {
+        int64_t block_width = 0;
+        size_t block_bytes = 0;
+        if (fortai_dequant_name(types[i], &block_width, &block_bytes) == NULL ||
+            weights[i] == NULL || outputs[i] == NULL || rows[i] <= 0 ||
+            width % block_width != 0 ||
+            (size_t)(width / block_width) * block_bytes * (size_t)rows[i] != weight_bytes[i]) return 1;
+    }
+    return fortai_cpu_group_plan_cached(count, types, weights, weight_bytes, rows,
+        width, activation, outputs);
+}
+
+int fortai_ggml_quant_matvec_pair(int first_type, const void *first_weights,
+    size_t first_weight_bytes, int64_t first_rows, int second_type, const void *second_weights,
+    size_t second_weight_bytes, int64_t second_rows, int64_t width, const float *activation,
+    float *first_output, float *second_output) {
+    const int types[2] = {first_type, second_type};
+    const void *weights[2] = {first_weights, second_weights};
+    const size_t weight_bytes[2] = {first_weight_bytes, second_weight_bytes};
+    const int64_t rows[2] = {first_rows, second_rows};
+    float *outputs[2] = {first_output, second_output};
+    return fortai_ggml_quant_matvec_group(2, types, weights, weight_bytes, rows,
+        width, activation, outputs);
+}
+
+int fortai_ggml_quant_matvec_triplet(int first_type, const void *first_weights,
+    size_t first_weight_bytes, int64_t first_rows, int second_type, const void *second_weights,
+    size_t second_weight_bytes, int64_t second_rows, int third_type, const void *third_weights,
+    size_t third_weight_bytes, int64_t third_rows, int64_t width, const float *activation,
+    float *first_output, float *second_output, float *third_output) {
+    const int types[3] = {first_type, second_type, third_type};
+    const void *weights[3] = {first_weights, second_weights, third_weights};
+    const size_t weight_bytes[3] = {first_weight_bytes, second_weight_bytes, third_weight_bytes};
+    const int64_t rows[3] = {first_rows, second_rows, third_rows};
+    float *outputs[3] = {first_output, second_output, third_output};
+    return fortai_ggml_quant_matvec_group(3, types, weights, weight_bytes, rows,
+        width, activation, outputs);
+}
+
 void fortai_ggml_quant_cache_clear(void) {
     void * base = fortai_open_ggml();
     if (base == NULL) return;
@@ -216,14 +413,24 @@ void fortai_ggml_quant_cache_clear(void) {
     for (size_t i = 0; i < fortai_cpu_plan_count; ++i) {
         if (buffer_free != NULL && fortai_cpu_plans[i].buffer != NULL)
             buffer_free(fortai_cpu_plans[i].buffer);
-        if (backend_free != NULL && fortai_cpu_plans[i].backend != NULL)
-            backend_free(fortai_cpu_plans[i].backend);
         if (free_ctx != NULL && fortai_cpu_plans[i].context != NULL)
             free_ctx(fortai_cpu_plans[i].context);
     }
+    for (size_t i = 0; i < fortai_cpu_group_plan_count; ++i) {
+        if (buffer_free != NULL && fortai_cpu_group_plans[i].buffer != NULL)
+            buffer_free(fortai_cpu_group_plans[i].buffer);
+        if (free_ctx != NULL && fortai_cpu_group_plans[i].context != NULL)
+            free_ctx(fortai_cpu_group_plans[i].context);
+    }
+    if (backend_free != NULL && fortai_shared_cpu_backend != NULL)
+        backend_free(fortai_shared_cpu_backend);
+    fortai_shared_cpu_backend = NULL;
     memset(fortai_cpu_plans, 0, sizeof(fortai_cpu_plans));
     fortai_cpu_plan_count = 0;
     fortai_cpu_plan_bytes = 0;
+    memset(fortai_cpu_group_plans, 0, sizeof(fortai_cpu_group_plans));
+    fortai_cpu_group_plan_count = 0;
+    fortai_cpu_group_plan_bytes = 0;
 }
 
 static const char * fortai_dequant_name(int type, int64_t * block_width, size_t * block_bytes) {

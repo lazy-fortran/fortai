@@ -1,5 +1,5 @@
 module fortai_qwen35_cpu
-    use, intrinsic :: iso_c_binding, only: c_associated, c_float, c_int16_t, c_int64_t, c_int8_t, &
+    use, intrinsic :: iso_c_binding, only: c_associated, c_float, c_int, c_int16_t, c_int64_t, c_int8_t, &
         c_null_ptr, c_ptr, c_size_t
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
     use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, &
@@ -7,11 +7,13 @@ module fortai_qwen35_cpu
         cuda_q8_matvec_host_triplet, cuda_q8_matvec_host_triplet_contiguous, cuda_q8_weights_t, &
         cuda_q8_matvec_device_f32, cuda_qwen35_add_device, cuda_qwen35_copy_device, &
         cuda_qwen35_embedding_device, cuda_qwen35_rms_norm_device
-    use fortai_backend_cuda, only: cuda_q4_context_t, cuda_q4_weights_t, cuda_q4_matvec_host
+    use fortai_backend_cuda, only: cuda_q4_context_t, cuda_q4_weights_t, cuda_q4_matvec_host, &
+        cuda_q4_matvec_host_pair, cuda_q4_matvec_host_triplet
     use fortai_backend_cuda, only: cuda_qwen35_attention_t, cuda_qwen35_recurrent_t
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, &
         GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, gguf_file_t, &
-        gguf_fp16_to_real, gguf_quant_cache_clear, gguf_tensor_t
+        fortai_ggml_quant_matvec_pair, fortai_ggml_quant_matvec_triplet, gguf_fp16_to_real, &
+        gguf_quant_cache_clear, gguf_tensor_t
     use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
     implicit none
     private
@@ -197,7 +199,7 @@ contains
         ! transformer.  llama.cpp intentionally leaves blk.64.* unused;
         ! keep the base model's 64 layers in the native runner as well.
         if (self % layer_count > 64 .and. self % file % find_tensor( &
-                'blk.64.nextn.eh_proj.weight') > 0) self % layer_count = 64
+            'blk.64.nextn.eh_proj.weight') > 0) self % layer_count = 64
         self % feed_forward_size = int(self % file % meta_int( &
             'qwen35.feed_forward_length', 0_int64), int32)
         self % attention_heads = int(self % file % meta_int( &
@@ -381,7 +383,7 @@ contains
         have_q4 = .false.
         do i = 1, size(self%file%tensors)
             if (is_q4_xl_type(self%file%tensors(i)%value_type) .and. &
-                    size(self%file%tensors(i)%shape) == 2) then
+                size(self%file%tensors(i)%shape) == 2) then
                 have_q4 = .true.
                 exit
             end if
@@ -434,6 +436,20 @@ contains
                 q4_bytes(q4_device + 1) = q4_bytes(q4_device + 1) + &
                     int(size(self%file%tensors(i)%bytes), int64)
             end do
+            call self%cuda_q4%synchronize(stat)
+            if (.not. stat%is_ok()) then
+                do j = 1, size(self%cuda_q4_weights)
+                    call self%cuda_q4_weights(j)%destroy(cleanup_stat)
+                end do
+                deallocate(self%cuda_q4_weights)
+                call self%cuda_q4%destroy(cleanup_stat)
+                do j = 1, size(self%cuda_weights)
+                    call self%cuda_weights(j)%destroy(cleanup_stat)
+                end do
+                deallocate(self%cuda_weights)
+                call self%cuda%destroy(cleanup_stat)
+                return
+            end if
         end if
         do i = 1, size(self%layers)
             if (.not. self%layers(i)%recurrent) cycle
@@ -1364,6 +1380,115 @@ contains
         call model_matvec(self, tensor_index, input, output, stat)
     end subroutine layer_matvec
 
+    logical function cuda_q4_single_ready(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+
+        cuda_q4_single_ready = .false.
+        if (.not. self%cuda_enabled) return
+        if (.not. allocated(self%file%tensors)) return
+        if (tensor_index <= 0) return
+        if (tensor_index > size(self%file%tensors)) return
+        if (.not. is_q4_xl_type(self%file%tensors(tensor_index)%value_type)) return
+        if (.not. allocated(self%cuda_q4_weights)) return
+        if (tensor_index > size(self%cuda_q4_weights)) return
+        if (.not. c_associated(self%cuda_q4_weights(tensor_index)%handle)) return
+        cuda_q4_single_ready = .true.
+    end function cuda_q4_single_ready
+
+    logical function cpu_q4_pair_ready(self, first_index, second_index, input)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: first_index, second_index
+        real(real32), intent(in) :: input(:)
+
+        cpu_q4_pair_ready = .false.
+        if (self%cuda_enabled) return
+        if (.not. allocated(self%file%tensors)) return
+        if (first_index <= 0 .or. second_index <= 0) return
+        if (first_index > size(self%file%tensors)) return
+        if (second_index > size(self%file%tensors)) return
+        if (.not. is_q4_xl_type(self%file%tensors(first_index)%value_type)) return
+        if (.not. is_q4_xl_type(self%file%tensors(second_index)%value_type)) return
+        if (.not. allocated(self%file%tensors(first_index)%shape)) return
+        if (.not. allocated(self%file%tensors(second_index)%shape)) return
+        if (size(self%file%tensors(first_index)%shape) /= 2) return
+        if (size(self%file%tensors(second_index)%shape) /= 2) return
+        if (self%file%tensors(first_index)%shape(1) /= self%file%tensors(second_index)%shape(1)) return
+        if (size(input) /= self%file%tensors(first_index)%shape(1)) return
+        cpu_q4_pair_ready = .true.
+    end function cpu_q4_pair_ready
+
+    logical function cuda_q4_pair_ready(self, first_index, second_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: first_index, second_index
+
+        cuda_q4_pair_ready = .false.
+        if (.not. self%cuda_enabled) return
+        if (.not. allocated(self%file%tensors)) return
+        if (first_index <= 0 .or. second_index <= 0) return
+        if (first_index > size(self%file%tensors)) return
+        if (second_index > size(self%file%tensors)) return
+        if (.not. is_q4_xl_type(self%file%tensors(first_index)%value_type)) return
+        if (.not. is_q4_xl_type(self%file%tensors(second_index)%value_type)) return
+        if (.not. allocated(self%cuda_q4_weights)) return
+        if (first_index > size(self%cuda_q4_weights)) return
+        if (second_index > size(self%cuda_q4_weights)) return
+        if (.not. c_associated(self%cuda_q4_weights(first_index)%handle)) return
+        if (.not. c_associated(self%cuda_q4_weights(second_index)%handle)) return
+        cuda_q4_pair_ready = .true.
+    end function cuda_q4_pair_ready
+
+    logical function cpu_q4_triplet_ready(self, first_index, second_index, third_index, input)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: first_index, second_index, third_index
+        real(real32), intent(in) :: input(:)
+
+        cpu_q4_triplet_ready = .false.
+        if (self%cuda_enabled) return
+        if (.not. allocated(self%file%tensors)) return
+        if (first_index <= 0 .or. second_index <= 0 .or. third_index <= 0) return
+        if (first_index > size(self%file%tensors)) return
+        if (second_index > size(self%file%tensors)) return
+        if (third_index > size(self%file%tensors)) return
+        if (.not. is_q4_xl_type(self%file%tensors(first_index)%value_type)) return
+        if (.not. is_q4_xl_type(self%file%tensors(second_index)%value_type)) return
+        if (.not. is_q4_xl_type(self%file%tensors(third_index)%value_type)) return
+        if (.not. allocated(self%file%tensors(first_index)%shape)) return
+        if (.not. allocated(self%file%tensors(second_index)%shape)) return
+        if (.not. allocated(self%file%tensors(third_index)%shape)) return
+        if (size(self%file%tensors(first_index)%shape) /= 2) return
+        if (size(self%file%tensors(second_index)%shape) /= 2) return
+        if (size(self%file%tensors(third_index)%shape) /= 2) return
+        if (self%file%tensors(first_index)%shape(1) /= self%file%tensors(second_index)%shape(1)) return
+        if (self%file%tensors(first_index)%shape(1) /= self%file%tensors(third_index)%shape(1)) return
+        if (size(input) /= self%file%tensors(first_index)%shape(1)) return
+        cpu_q4_triplet_ready = .true.
+    end function cpu_q4_triplet_ready
+
+    logical function cuda_q4_triplet_ready(self, first_index, second_index, third_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: first_index, second_index, third_index
+
+        cuda_q4_triplet_ready = .false.
+        if (.not. self%cuda_enabled) return
+        if (.not. allocated(self%file%tensors)) return
+        if (first_index <= 0 .or. second_index <= 0 .or. third_index <= 0) return
+        if (first_index > size(self%file%tensors)) return
+        if (second_index > size(self%file%tensors)) return
+        if (third_index > size(self%file%tensors)) return
+        if (.not. is_q4_xl_type(self%file%tensors(first_index)%value_type)) return
+        if (.not. is_q4_xl_type(self%file%tensors(second_index)%value_type)) return
+        if (.not. is_q4_xl_type(self%file%tensors(third_index)%value_type)) return
+        if (.not. allocated(self%cuda_q4_weights)) return
+        if (first_index > size(self%cuda_q4_weights)) return
+        if (second_index > size(self%cuda_q4_weights)) return
+        if (third_index > size(self%cuda_q4_weights)) return
+        if (.not. c_associated(self%cuda_q4_weights(first_index)%handle)) return
+        if (.not. c_associated(self%cuda_q4_weights(second_index)%handle)) return
+        if (.not. c_associated(self%cuda_q4_weights(third_index)%handle)) return
+        cuda_q4_triplet_ready = .true.
+    end function cuda_q4_triplet_ready
+
     subroutine model_matvec(self, tensor_index, input, output, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer, intent(in) :: tensor_index
@@ -1390,10 +1515,7 @@ contains
             end if
             call self % file % tensors(tensor_index) % matvec_q8(input, output, &
                 self % quantized_input, self % quantized_scales, stat, self%persistent_openmp_active)
-        else if (is_q4_xl_type(self % file % tensors(tensor_index) % value_type) .and. &
-                self%cuda_enabled .and. allocated(self%cuda_q4_weights) .and. &
-                tensor_index <= size(self%cuda_q4_weights) .and. &
-                c_associated(self%cuda_q4_weights(tensor_index)%handle)) then
+        else if (cuda_q4_single_ready(self, tensor_index)) then
             call cuda_q4_matvec_host(self%cuda_q4, self%cuda_q4_weights(tensor_index), input, output, &
                 elapsed_ms, stat)
         else
@@ -1408,10 +1530,28 @@ contains
         real(real32), contiguous, intent(in) :: input(:)
         real(real32), contiguous, intent(out) :: first_output(:), second_output(:)
         type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+        real(c_float) :: elapsed_ms
 
         call stat%clear()
         if (first_index == 0 .or. second_index == 0) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CPU paired tensor binding is invalid')
+            return
+        end if
+        if (cpu_q4_pair_ready(self, first_index, second_index, input)) then
+            code = fortai_ggml_quant_matvec_pair( &
+                int(self%file%tensors(first_index)%value_type, c_int), self%file%tensors(first_index)%bytes, &
+                int(size(self%file%tensors(first_index)%bytes), c_size_t), &
+                self%file%tensors(first_index)%shape(2), &
+                int(self%file%tensors(second_index)%value_type, c_int), self%file%tensors(second_index)%bytes, &
+                int(size(self%file%tensors(second_index)%bytes), c_size_t), &
+                self%file%tensors(second_index)%shape(2), self%file%tensors(first_index)%shape(1), input, &
+                first_output, second_output)
+            if (code == 0_c_int) return
+        end if
+        if (cuda_q4_pair_ready(self, first_index, second_index)) then
+            call cuda_q4_matvec_host_pair(self%cuda_q4, self%cuda_q4_weights(first_index), &
+                self%cuda_q4_weights(second_index), input, first_output, second_output, elapsed_ms, stat)
             return
         end if
         if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &
@@ -1448,10 +1588,32 @@ contains
         real(real32), contiguous, intent(in) :: input(:)
         real(real32), contiguous, intent(out) :: first_output(:), second_output(:), third_output(:)
         type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+        real(c_float) :: elapsed_ms
 
         call stat%clear()
         if (first_index == 0 .or. second_index == 0 .or. third_index == 0) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CPU triplet tensor binding is invalid')
+            return
+        end if
+        if (cpu_q4_triplet_ready(self, first_index, second_index, third_index, input)) then
+            code = fortai_ggml_quant_matvec_triplet( &
+                int(self%file%tensors(first_index)%value_type, c_int), self%file%tensors(first_index)%bytes, &
+                int(size(self%file%tensors(first_index)%bytes), c_size_t), &
+                self%file%tensors(first_index)%shape(2), &
+                int(self%file%tensors(second_index)%value_type, c_int), self%file%tensors(second_index)%bytes, &
+                int(size(self%file%tensors(second_index)%bytes), c_size_t), &
+                self%file%tensors(second_index)%shape(2), &
+                int(self%file%tensors(third_index)%value_type, c_int), self%file%tensors(third_index)%bytes, &
+                int(size(self%file%tensors(third_index)%bytes), c_size_t), &
+                self%file%tensors(third_index)%shape(2), self%file%tensors(first_index)%shape(1), input, &
+                first_output, second_output, third_output)
+            if (code == 0_c_int) return
+        end if
+        if (cuda_q4_triplet_ready(self, first_index, second_index, third_index)) then
+            call cuda_q4_matvec_host_triplet(self%cuda_q4, self%cuda_q4_weights(first_index), &
+                self%cuda_q4_weights(second_index), self%cuda_q4_weights(third_index), input, first_output, &
+                second_output, third_output, elapsed_ms, stat)
             return
         end if
         if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &

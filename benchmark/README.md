@@ -38,7 +38,8 @@ runner and fair comparison wrapper are `run_qwen35_cpu.sh` and
 For the mixed-quant Qwen3.8-27B `UD-Q4_K_XL` format, the native FortAI CUDA
 runner uses the exact GGML CUDA kernels for every tensor encoding and balances
 active tensors across two visible GPUs. The native CPU path uses the GGML CPU
-quantized matvec backend, with a bounded persistent plan cache. Build it with:
+quantized matvec backend, sharing its thread pool and caching grouped projection
+graphs. Build it with:
 
 ```bash
 FORTAI_GGML_PREFIX=/home/ert/.local/llama.cpp-upstream-main-650913862 \

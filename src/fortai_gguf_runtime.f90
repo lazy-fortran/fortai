@@ -68,6 +68,31 @@ module fortai_gguf_runtime
             real(c_float), intent(out) :: output(*)
         end function fortai_ggml_quant_matvec
 
+        integer(c_int) function fortai_ggml_quant_matvec_pair(first_type, first_bytes, first_weight_bytes, &
+                first_rows, second_type, second_bytes, second_weight_bytes, second_rows, width, activation, &
+                first_output, second_output) bind(C, name='fortai_ggml_quant_matvec_pair')
+            import c_float, c_int, c_int8_t, c_int64_t, c_size_t
+            integer(c_int), value, intent(in) :: first_type, second_type
+            integer(c_int8_t), intent(in) :: first_bytes(*), second_bytes(*)
+            integer(c_size_t), value, intent(in) :: first_weight_bytes, second_weight_bytes
+            integer(c_int64_t), value, intent(in) :: first_rows, second_rows, width
+            real(c_float), intent(in) :: activation(*)
+            real(c_float), intent(out) :: first_output(*), second_output(*)
+        end function fortai_ggml_quant_matvec_pair
+
+        integer(c_int) function fortai_ggml_quant_matvec_triplet(first_type, first_bytes, first_weight_bytes, &
+                first_rows, second_type, second_bytes, second_weight_bytes, second_rows, third_type, &
+                third_bytes, third_weight_bytes, third_rows, width, activation, first_output, second_output, &
+                third_output) bind(C, name='fortai_ggml_quant_matvec_triplet')
+            import c_float, c_int, c_int8_t, c_int64_t, c_size_t
+            integer(c_int), value, intent(in) :: first_type, second_type, third_type
+            integer(c_int8_t), intent(in) :: first_bytes(*), second_bytes(*), third_bytes(*)
+            integer(c_size_t), value, intent(in) :: first_weight_bytes, second_weight_bytes, third_weight_bytes
+            integer(c_int64_t), value, intent(in) :: first_rows, second_rows, third_rows, width
+            real(c_float), intent(in) :: activation(*)
+            real(c_float), intent(out) :: first_output(*), second_output(*), third_output(*)
+        end function fortai_ggml_quant_matvec_triplet
+
         subroutine fortai_ggml_quant_cache_clear() bind(C, name='fortai_ggml_quant_cache_clear')
         end subroutine fortai_ggml_quant_cache_clear
 
@@ -145,6 +170,7 @@ module fortai_gguf_runtime
     end type gguf_file_t
 
     public :: gguf_fp16_to_real, gguf_quant_cache_clear
+    public :: fortai_ggml_quant_matvec_pair, fortai_ggml_quant_matvec_triplet
 
 contains
 
@@ -366,22 +392,22 @@ contains
                 scale_bits = transfer(self%bytes(byte_index:byte_index + 1_int64), scale_bits)
                 gguf_tensor_value = gguf_fp16_to_real(scale_bits) * real( &
                     int(self%bytes(byte_index + 2_int64 + within), int32), real32)
-        case (GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, &
-                GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS)
-            if (size(self%shape) /= 2) return
-            width = self%shape(1)
-            call quant_layout(self%value_type, block_width, block_bytes)
-            row = (index - 1_int64) / width
-            within = mod(index - 1_int64, width)
-            allocate(decoded(width))
-            byte_index = row * (width / block_width) * block_bytes + 1_int64
-            if (fortai_ggml_dequantize_row(int(self%value_type, c_int), &
+            case (GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, &
+                    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS)
+                if (size(self%shape) /= 2) return
+                width = self%shape(1)
+                call quant_layout(self%value_type, block_width, block_bytes)
+                row = (index - 1_int64) / width
+                within = mod(index - 1_int64, width)
+                allocate(decoded(width))
+                byte_index = row * (width / block_width) * block_bytes + 1_int64
+                if (fortai_ggml_dequantize_row(int(self%value_type, c_int), &
                     self%bytes(byte_index:), decoded, width) == 0_c_int) then
-                gguf_tensor_value = decoded(within + 1_int64)
-            end if
-        case default
-            gguf_tensor_value = 0.0_real32
-        end select
+                    gguf_tensor_value = decoded(within + 1_int64)
+                end if
+            case default
+                gguf_tensor_value = 0.0_real32
+            end select
         end function gguf_tensor_value
 
         subroutine gguf_tensor_get_row(self, row, values, stat)
