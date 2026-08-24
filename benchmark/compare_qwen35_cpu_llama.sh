@@ -45,8 +45,13 @@ if [[ ! "$parallel" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 export OMP_NUM_THREADS="$threads"
-export OMP_PROC_BIND="${OMP_PROC_BIND:-spread}"
-export OMP_PLACES="${OMP_PLACES:-cores}"
+# The installed ggml CPU backend is itself OpenMP-based.  Binding the
+# Fortran process to OpenMP places before llama.cpp creates its team can make
+# the two implementations inherit a different CPU mask at high thread
+# counts.  Keep both sides on the scheduler's full allowed mask by default;
+# callers can request an explicit policy for an affinity study.
+export OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-false}"
+export OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-cores}"
 export FORTAI_ENABLE_PERSISTENT_OPENMP="$persistent_openmp"
 # The CPU comparison must never touch CUDA even though llama-server links
 # libggml-cuda.so: hide every GPU so backend init finds zero devices.
@@ -119,12 +124,13 @@ fi
 llama_record="$root_dir/.provenance/records/llama.cpp.txt"
 
 # Run FortAI before starting llama.cpp so the measurements do not compete.
+fortai_executable="$root_dir/build/fo/app/fortai_cpu_run"
 (cd "$root_dir" && fo build --flag "$native_flags" && \
     env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" \
         OMP_PLACES="$OMP_PLACES" FORTAI_EXCLUDE_PROMPT=1 \
-        fo exec --no-build fortai_cpu_run \
+        "$fortai_executable" \
         "$model_path" "$token_id" "$steps" "$context") >"$fortai_log"
-fortai_executable=$(readlink -f "$root_dir/build/fo/app/fortai_cpu_run")
+fortai_executable=$(readlink -f "$fortai_executable")
 if [[ ! -x "$fortai_executable" ]]; then
     echo "FortAI CPU runner not found after build: $fortai_executable" >&2
     exit 1
