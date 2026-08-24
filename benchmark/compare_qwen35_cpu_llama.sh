@@ -50,8 +50,8 @@ export OMP_NUM_THREADS="$threads"
 # the two implementations inherit a different CPU mask at high thread
 # counts.  Keep both sides on the scheduler's full allowed mask by default;
 # callers can request an explicit policy for an affinity study.
-export OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-false}"
-export OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-cores}"
+export OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}"
+export OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-${OMP_PLACES:-cores}}"
 export FORTAI_ENABLE_PERSISTENT_OPENMP="$persistent_openmp"
 # The CPU comparison must never touch CUDA even though llama-server links
 # libggml-cuda.so: hide every GPU so backend init finds zero devices.
