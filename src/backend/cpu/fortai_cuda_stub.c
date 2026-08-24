@@ -109,6 +109,14 @@ int FORTAI_WEAK fortai_cuda_q8_context_create(int device,
     return unavailable();
 }
 
+int FORTAI_WEAK fortai_cuda_memory_info(int device, size_t *free_bytes,
+    size_t *total_bytes) {
+    (void)device;
+    if (free_bytes) *free_bytes = 0;
+    if (total_bytes) *total_bytes = 0;
+    return unavailable();
+}
+
 int FORTAI_WEAK fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context) {
     (void)context;
     return FORTAI_CUDA_OK;

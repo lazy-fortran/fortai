@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -169,6 +170,82 @@ typedef struct {
 static fortai_llama_api fortai_api;
 static int fortai_api_attempted;
 static int fortai_backend_initialized;
+
+/* The model runner is also used underneath the local llama.cpp-compatible
+ * service.  Keep the fast adapter late-bound, but honor the same small set of
+ * model/context controls through environment variables.  The LLAMACPP_* and
+ * LLAMA_ARG_* aliases make the service profile usable without a second config
+ * translation layer; FORTAI_* remains the explicit per-process override. */
+static const char *fortai_env3(const char *fortai_name, const char *llama_name,
+    const char *service_name) {
+    const char *value = getenv(fortai_name);
+    if (value != NULL && value[0] != '\0') return value;
+    value = getenv(llama_name);
+    if (value != NULL && value[0] != '\0') return value;
+    value = getenv(service_name);
+    if (value != NULL && value[0] != '\0') return value;
+    return NULL;
+}
+
+static int fortai_parse_bool(const char *value, int fallback) {
+    if (value == NULL || value[0] == '\0') return fallback;
+    if (strcasecmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "on") == 0 || strcasecmp(value, "yes") == 0)
+        return 1;
+    if (strcasecmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "off") == 0 || strcasecmp(value, "no") == 0)
+        return 0;
+    return fallback;
+}
+
+static int fortai_parse_int(const char *value, int fallback, int minimum, int maximum) {
+    char *end = NULL;
+    long parsed;
+    if (value == NULL || value[0] == '\0') return fallback;
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < minimum || parsed > maximum)
+        return fallback;
+    return (int)parsed;
+}
+
+static int fortai_parse_flash_attn(const char *value, int fallback) {
+    if (value == NULL || value[0] == '\0') return fallback;
+    if (strcasecmp(value, "auto") == 0) return -1;
+    if (strcasecmp(value, "on") == 0 || strcasecmp(value, "true") == 0)
+        return 1;
+    if (strcasecmp(value, "off") == 0 || strcasecmp(value, "false") == 0)
+        return 0;
+    return fallback;
+}
+
+static int fortai_parse_cache_type(const char *value, int fallback) {
+    if (value == NULL || value[0] == '\0') return fallback;
+    if (strcasecmp(value, "f32") == 0) return 0;
+    if (strcasecmp(value, "f16") == 0) return 1;
+    if (strcasecmp(value, "q4_0") == 0) return 2;
+    if (strcasecmp(value, "q4_1") == 0) return 3;
+    if (strcasecmp(value, "q5_0") == 0) return 6;
+    if (strcasecmp(value, "q5_1") == 0) return 7;
+    if (strcasecmp(value, "q8_0") == 0) return 8;
+    return fallback;
+}
+
+static const float *fortai_parse_tensor_split(const char *value) {
+    static float split[16];
+    char *end;
+    int count = 0;
+    if (value == NULL || value[0] == '\0') return NULL;
+    while (*value != '\0' && count < (int)(sizeof(split) / sizeof(split[0]))) {
+        float ratio = strtof(value, &end);
+        if (end == value || ratio <= 0.0f) return NULL;
+        split[count++] = ratio;
+        if (*end == '\0') break;
+        if (*end != ',') return NULL;
+        value = end + 1;
+    }
+    if (count == 0 || *value != '\0') return NULL;
+    return split;
+}
 
 #if (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__)
 static __attribute__((target("avx2"))) int fortai_argmax_avx2(const float *values, int count,
@@ -357,6 +434,15 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     model_params.main_gpu = main_gpu;
     model_params.use_extra_bufts = true;
     model_params.load_mtp = false;
+    const char *tensor_split = fortai_env3("FORTAI_TENSOR_SPLIT",
+        "LLAMA_ARG_TENSOR_SPLIT", "LLAMACPP_TENSOR_SPLIT");
+    const float *split_values = fortai_parse_tensor_split(tensor_split);
+    if (split_values != NULL && gpu_layers != 0) {
+        model_params.split_mode = fortai_parse_int(fortai_env3(
+            "FORTAI_SPLIT_MODE", "LLAMA_ARG_SPLIT_MODE", "LLAMACPP_SPLIT_MODE"),
+            1, 0, 2);
+        model_params.tensor_split = split_values;
+    }
     fortai_llama_context_params context_params = handle->api.context_default();
     /* Pass the requested context through unchanged.  llama.cpp applies the
      * same minimum/slot normalization internally as llama-server; doing the
@@ -369,14 +455,25 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     /* FortAI drives one causal sequence at a time.  The server defaults to
      * four slots for concurrent requests, but reserving those slots here
      * needlessly enlarges the recurrent/KV graph and hurts CPU scaling. */
-    context_params.n_seq_max = 1;
+    context_params.n_seq_max = (uint32_t)fortai_parse_int(fortai_env3(
+        "FORTAI_PARALLEL", "LLAMA_ARG_PARALLEL", "LLAMACPP_PARALLEL"), 1, 1, 512);
     /* Only the final logit is consumed by FortAI.  Zero means “all outputs”
      * and makes llama.cpp reserve a 256-token output graph for this tiny
      * single-token decode, unlike the server's one-output configuration. */
     context_params.n_outputs_max = 1;
     context_params.n_outputs_max_per_seq = 1;
+    const char *batch_value = fortai_env3("FORTAI_BATCH", "LLAMA_ARG_BATCH", "LLAMACPP_BATCH");
+    const char *ubatch_value = fortai_env3("FORTAI_UBATCH", "LLAMA_ARG_UBATCH", "LLAMACPP_UBATCH");
+    if (batch_value != NULL)
+        context_params.n_batch = (uint32_t)fortai_parse_int(batch_value,
+            (int)context_params.n_batch, 1, 1 << 20);
+    if (ubatch_value != NULL)
+        context_params.n_ubatch = (uint32_t)fortai_parse_int(ubatch_value,
+            (int)context_params.n_ubatch, 1, 1 << 20);
     context_params.n_threads = threads;
-    context_params.n_threads_batch = threads;
+    context_params.n_threads_batch = fortai_parse_int(fortai_env3(
+        "FORTAI_THREADS_BATCH", "LLAMA_ARG_THREADS_BATCH", "LLAMACPP_THREADS_BATCH"),
+        threads, 1, 4096);
     /* FortAI measures its own wall-clock loop and does not consume llama's
      * per-node accounting.  Avoid that bookkeeping on the CPU fast path;
      * retain the reference setting for CUDA unless explicitly overridden. */
@@ -388,13 +485,28 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
      * generic host-op offload below.  The CPU backend keeps these tensors on
      * host memory, but the flag still selects the same graph construction and
      * memory path as the reference server. */
-    context_params.offload_kqv = true;
+    context_params.offload_kqv = fortai_parse_bool(fortai_env3(
+        "FORTAI_OFFLOAD_KQV", "LLAMA_ARG_OFFLOAD_KQV", "LLAMACPP_OFFLOAD_KQV"), 1);
     context_params.op_offload = gpu_layers == 0 ? false : true;
+    context_params.op_offload = fortai_parse_bool(fortai_env3(
+        "FORTAI_OP_OFFLOAD", "LLAMA_ARG_OP_OFFLOAD", "LLAMACPP_OP_OFFLOAD"),
+        context_params.op_offload);
+    context_params.flash_attn_type = fortai_parse_flash_attn(fortai_env3(
+        "FORTAI_FLASH_ATTN", "LLAMA_ARG_FLASH_ATTN", "LLAMACPP_FLASH_ATTN"),
+        context_params.flash_attn_type);
+    context_params.type_k = fortai_parse_cache_type(fortai_env3(
+        "FORTAI_CACHE_TYPE_K", "LLAMA_ARG_CACHE_TYPE_K", "LLAMACPP_CACHE_TYPE_K"),
+        context_params.type_k);
+    context_params.type_v = fortai_parse_cache_type(fortai_env3(
+        "FORTAI_CACHE_TYPE_V", "LLAMA_ARG_CACHE_TYPE_V", "LLAMACPP_CACHE_TYPE_V"),
+        context_params.type_v);
     /* llama-server leaves the recurrent sliding-window cache compact unless
      * --swa-full is explicitly requested.  The public context default is the
      * opposite, so set this explicitly to keep the graph identical. */
-    context_params.swa_full = false;
-    context_params.kv_unified = false;
+    context_params.swa_full = fortai_parse_bool(fortai_env3(
+        "FORTAI_SWA_FULL", "LLAMA_ARG_SWA_FULL", "LLAMACPP_SWA_FULL"), 0);
+    context_params.kv_unified = fortai_parse_bool(fortai_env3(
+        "FORTAI_KV_UNIFIED", "LLAMA_ARG_KV_UNIFIED", "LLAMACPP_KV_UNIFIED"), 0);
     handle->model = handle->api.model_load(path, model_params);
     if (handle->model != NULL)
         handle->context = handle->api.context_init(handle->model, context_params);

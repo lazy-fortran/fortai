@@ -67,6 +67,14 @@ benchmark/run_qwen35_cpu.sh .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.
 # llama.cpp ABI fast path (automatic when the resident library is available)
 FORTAI_LLAMA_FASTPATH=cpu benchmark/run_qwen35_cpu.sh MODEL.gguf
 FORTAI_LLAMA_FASTPATH=cuda benchmark/compare_qwen35_cuda_llama.sh MODEL.gguf
+
+# pass llama.cpp model/context controls through the resident fast path
+FORTAI_LLAMA_FASTPATH=cuda \
+  FORTAI_FLASH_ATTN=on \
+  LLAMACPP_BATCH=2048 LLAMACPP_UBATCH=256 LLAMACPP_PARALLEL=1 \
+  LLAMACPP_CACHE_TYPE_K=q8_0 LLAMACPP_CACHE_TYPE_V=q8_0 \
+  LLAMACPP_TENSOR_SPLIT=0.57,0.43 \
+  benchmark/compare_qwen35_cuda_llama.sh MODEL.gguf
 # force the native Fortran/GGML fallback for diagnostics
 FORTAI_LLAMA_FASTPATH=native benchmark/run_qwen35_cpu.sh MODEL.gguf
 
@@ -129,6 +137,17 @@ fo
 The model runner accepts a GGUF file, an initial Qwen tokenizer ID, a decode
 step count, and a context limit. The persistent model fetch manifest is in
 `.provenance/models.tsv`.
+
+The resident llama.cpp adapter honors the corresponding `FORTAI_*`,
+`LLAMA_ARG_*`, and local service `LLAMACPP_*` settings for flash attention,
+batch/ubatch sizes, parallel sequence count, K/V cache types, KQV and generic
+operation offload, SWA/KV-unified mode, thread-batch count, and multi-GPU
+tensor splitting. The CUDA runner reports `vram_*_bytes` before and after
+loading so the memory delta can be compared with llama.cpp under the same
+profile. External draft-model speculative decoding and multimodal projector
+execution remain outside this direct single-sequence runner; use the upstream
+server compatibility path for those features until their FortAI integration is
+promoted.
 
 Benchmark results, logs, and perf data stay machine-local under
 `benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts

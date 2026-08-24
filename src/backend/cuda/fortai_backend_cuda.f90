@@ -81,6 +81,7 @@ module fortai_backend_cuda
     public :: cuda_q4_matvec_host
     public :: cuda_q4_matvec_host_pair
     public :: cuda_q4_matvec_host_triplet
+    public :: cuda_memory_info
 
     interface
         function c_context_create(device, context) bind(C, name='fortai_cuda_q8_context_create') &
@@ -97,6 +98,14 @@ module fortai_backend_cuda
             type(c_ptr), value :: context
             integer(c_int) :: code
         end function c_context_destroy
+
+        function c_memory_info(device, free_bytes, total_bytes) &
+                bind(C, name='fortai_cuda_memory_info') result(code)
+            import c_int, c_size_t
+            integer(c_int), value :: device
+            integer(c_size_t) :: free_bytes, total_bytes
+            integer(c_int) :: code
+        end function c_memory_info
 
         function c_context_set_position(context, position) &
                 bind(C, name='fortai_cuda_q8_context_set_position') result(code)
@@ -509,6 +518,21 @@ module fortai_backend_cuda
     end interface
 
 contains
+
+    subroutine cuda_memory_info(device, free_bytes, total_bytes, stat)
+        integer, intent(in) :: device
+        integer(c_size_t), intent(out) :: free_bytes, total_bytes
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        free_bytes = 0_c_size_t
+        total_bytes = 0_c_size_t
+        code = c_memory_info(int(device, c_int), free_bytes, total_bytes)
+        call stat%clear()
+        if (code /= FORTAI_CUDA_OK) then
+            call stat%set(FORTAI_UNSUPPORTED, 'CUDA memory query unavailable')
+        end if
+    end subroutine cuda_memory_info
 
     subroutine cuda_q4_context_create(self, first_device, second_device, stat)
         class(cuda_q4_context_t), intent(inout) :: self

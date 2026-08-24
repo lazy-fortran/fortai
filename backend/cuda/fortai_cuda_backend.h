@@ -21,6 +21,7 @@ enum {
 
 int fortai_cuda_q8_context_create(int device, fortai_cuda_q8_context **context);
 int fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context);
+int fortai_cuda_memory_info(int device, size_t *free_bytes, size_t *total_bytes);
 int fortai_cuda_q8_context_set_position(fortai_cuda_q8_context *context, int position);
 int fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_capture_end(fortai_cuda_q8_context *context);

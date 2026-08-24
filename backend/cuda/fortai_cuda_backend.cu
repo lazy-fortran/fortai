@@ -1021,6 +1021,14 @@ extern "C" int fortai_cuda_q8_context_create(int device,
     return FORTAI_CUDA_OK;
 }
 
+extern "C" int fortai_cuda_memory_info(int device, size_t *free_bytes,
+    size_t *total_bytes) {
+    if (device < 0 || !free_bytes || !total_bytes) return FORTAI_CUDA_INVALID;
+    if (cudaSetDevice(device) != cudaSuccess) return FORTAI_CUDA_RUNTIME_ERROR;
+    const cudaError_t error = cudaMemGetInfo(free_bytes, total_bytes);
+    return error == cudaSuccess ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
+}
+
 extern "C" int fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context) {
     if (!context) return FORTAI_CUDA_OK;
     cudaSetDevice(context->impl.device);

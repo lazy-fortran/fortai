@@ -1,5 +1,7 @@
 program fortai_cuda_run
+    use, intrinsic :: iso_c_binding, only: c_size_t
     use, intrinsic :: iso_fortran_env, only: int64, real32
+    use fortai_backend_cuda, only: cuda_memory_info
     use fortai_qwen35_cpu, only: qwen35_cpu_model_t
     use fortai_status, only: status_t
     implicit none
@@ -21,6 +23,9 @@ program fortai_cuda_run
     character(len=8) :: disable_cuda_env
     character(len=16) :: exclude_prompt_text
     integer :: exclude_prompt_length
+    integer(c_size_t) :: vram_free_before, vram_total_before
+    integer(c_size_t) :: vram_free_after, vram_total_after
+    logical :: vram_before_ok, vram_after_ok
     real(real32) :: maximum_logit
 
     call get_command_argument(1, model_path)
@@ -41,6 +46,8 @@ program fortai_cuda_run
     call get_command_argument(5, argument)
     if (len_trim(argument) > 0) read (argument, *, iostat=ios) device
     if (steps <= 0_int64 .or. context <= 0_int64 .or. device < 0) error stop 2
+    call cuda_memory_info(device, vram_free_before, vram_total_before, stat)
+    vram_before_ok = stat%is_ok()
     call get_environment_variable('FORTAI_TRACE_TOKENS', trace_tokens, length=trace_length)
     trace_enabled = .false.
     if (trace_length > 0) trace_enabled = trace_tokens(1:trace_length) == '1'
@@ -69,6 +76,8 @@ program fortai_cuda_run
             error stop 1
         end if
     end if
+    call cuda_memory_info(device, vram_free_after, vram_total_after, stat)
+    vram_after_ok = stat%is_ok()
     call system_clock(load_end)
     allocate (logits(model%vocabulary_size))
     if (top_count > 0) allocate (ranked_logits(model%vocabulary_size))
@@ -174,5 +183,16 @@ program fortai_cuda_run
     print '(a,es16.8)', 'sample_seconds=', sample_seconds
     print '(a,es16.8)', 'elapsed_seconds=', elapsed
     print '(a,es16.8)', 'tokens_per_second=', tokens_per_second
+    if (vram_before_ok) then
+        print '(a,i0)', 'vram_total_before_bytes=', vram_total_before
+        print '(a,i0)', 'vram_free_before_bytes=', vram_free_before
+    end if
+    if (vram_after_ok) then
+        print '(a,i0)', 'vram_total_after_bytes=', vram_total_after
+        print '(a,i0)', 'vram_free_after_bytes=', vram_free_after
+        if (vram_before_ok .and. vram_free_before >= vram_free_after) then
+            print '(a,i0)', 'vram_delta_bytes=', vram_free_before - vram_free_after
+        end if
+    end if
     call model%close()
 end program fortai_cuda_run
