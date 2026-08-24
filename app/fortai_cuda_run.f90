@@ -97,7 +97,7 @@ program fortai_cuda_run
             end do
         end if
         first_position = 1_int64
-        last_position = steps
+        last_position = steps - 1_int64
     end if
     checksum = 0.0_real32
     sample_seconds = 0.0_real32
@@ -109,9 +109,6 @@ program fortai_cuda_run
             error stop 1
         end if
         checksum = checksum + sum(logits)
-        ! Keep the final decode in the generated-token timing scope, but
-        ! match llama.cpp's completion output length.
-        if (exclude_prompt .and. position == steps) cycle
         call system_clock(sample_start)
         max_index = maxloc(logits, dim=1)
         call system_clock(sample_end)

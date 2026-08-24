@@ -89,7 +89,7 @@ program fortai_cpu_run
             end do
         end if
         first_position = 1_int64
-        last_position = steps
+        last_position = steps - 1_int64
     end if
     checksum = 0.0_real32
     sample_seconds = 0.0_real32
@@ -101,11 +101,6 @@ program fortai_cpu_run
             error stop 1
         end if
         checksum = checksum + sum(logits)
-        ! The llama.cpp predicted-token timer includes the decode of the
-        ! final sampled token, while its completion trace stops at that
-        ! token.  Keep that final forward in the timed scope but do not emit
-        ! a ninth trace item.
-        if (exclude_prompt .and. position == steps) cycle
         if (top_count > 0) then
             maximum_logit = maxval(logits)
             ranked_logits = logits
