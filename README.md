@@ -128,11 +128,11 @@ and their provenance logic are tracked.
 
 Version 0.1.0 includes an experimental model-level Qwen3.5 CPU runtime for
 Q8_0 GGUF and a device-resident CUDA Qwen3.5 path. The CPU path is benchmarked
-against llama.cpp on the 0.8B, 2B, and 4B fixtures; the CUDA path has matched
-trace tests on 0.8B and smoke coverage on all three fixtures. Neither is
-promoted until the named workload gate passes. CUDA Graph replay, Q4
-repacking, and full CUDA Qwen3.8-27B with its required multi-GPU split remain
-on the roadmap. See [ROADMAP.md](ROADMAP.md).
+against llama.cpp on the 0.8B, 2B, and 4B fixtures. The CUDA path has exact
+eight-token trace parity on all three fixtures and repeated model-level paired
+runs at effective llama.cpp throughput parity on the tested RTX 5060 Ti.
+CUDA Graph replay remains opt-in; Q4 repacking and full CUDA Qwen3.8-27B with
+its required multi-GPU split remain on the roadmap. See [ROADMAP.md](ROADMAP.md).
 
 FortAI will only promote a production candidate for a named workload after it
 matches or beats the fastest fair competing harness under the same conditions.

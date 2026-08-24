@@ -305,10 +305,10 @@ review_verdict: PASS
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
-| FAI-CUDA-001 | single-device CUDA backend | experimental, device-resident Qwen path | independent ABI oracle, model trace parity, and paired llama.cpp benchmark |
+| FAI-CUDA-001 | single-device CUDA backend | experimental, device-resident Qwen path at measured parity | independent ABI oracle, model trace parity, and paired llama.cpp benchmark |
 | FAI-CUDA-001A | host-controlled Qwen3.5 CUDA integration slice | experimental, measured slower | weights resident, model correctness smoke, persistent transfer/launch profile; cannot be promoted |
-| FAI-CUDA-001B | device-resident Qwen3.5 recurrent, attention, KV, and FFN path | experimental, measured slower | 0.8B/2B/4B smoke, CUDA trace parity, and fewer host activation round trips |
-| FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | experimental, opt-in and slower on RTX 5060 Ti | matched Nsight profile and end-to-end speed at least equal to the direct resident plan and llama.cpp |
+| FAI-CUDA-001B | device-resident Qwen3.5 recurrent, attention, KV, and FFN path | experimental, measured at llama.cpp parity | 0.8B/2B/4B smoke, CUDA trace parity, and fewer host activation round trips |
+| FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | experimental, opt-in, variance-sensitive on RTX 5060 Ti | matched Nsight profile and end-to-end speed at least equal to the direct resident plan and llama.cpp |
 | FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | deferred | two-device placement, transfer accounting, and stable generation |
 | FAI-CUDA-002 | Q4 repack and fused GDN kernels | deferred | validated kernel tournament on named GPUs |
 | FAI-CUDA-003 | CUDA MTP and speculative decoding | deferred | acceptance rate and end-to-end throughput |
@@ -370,13 +370,14 @@ model-level runs with sequential FortAI execution. The 0.8B paired oracle
 run is explicitly shared-service correctness evidence and performance-
 ineligible; the 2B and 4B scaling runs do not start a llama-server.
 The CUDA evidence now includes an experimental device-resident Qwen3.5 path
-for the 0.8B, 2B, and 4B fixtures. The 0.8B eight-token CUDA trace matches
-llama.cpp. CUDA Graph replay was profiled as an A/B and is slower on the tested
-RTX 5060 Ti, so it is opt-in while the direct resident launch plan remains the
-default. The paired 64-token result remains unpromoted until it matches the
-competing harness. Nsight Compute is attempted and its permission result is
-retained; Nsight Systems remains the fallback timing profile when GPU
-performance-counter access is unavailable.
+for the 0.8B, 2B, and 4B fixtures. The eight-token CUDA token traces match
+llama.cpp on all three fixtures. Repeated 64-token paired runs put the direct
+and graph launch plans within normal run-to-run variance of llama.cpp (the
+observed medians range from a small deficit to a small lead), so this is an
+effective-parity result rather than a winner claim. CUDA Graph replay remains
+opt-in while its variance-sensitive behavior is characterized. Nsight Compute
+is attempted and its permission result is retained; Nsight Systems remains the
+fallback timing profile when GPU performance-counter access is unavailable.
 
 The source/model provenance acceptance is closed at revision
 `0fe922dbc7dd02240262e40dcede203ab44905cf`. An end-to-end local source clone

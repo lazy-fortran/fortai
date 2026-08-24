@@ -118,10 +118,11 @@ FORTAI_ENABLE_CUDA_GRAPH=1 benchmark/compare_qwen35_cuda_llama.sh \
   "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 64 128 0
 ```
 
-On the tested RTX 5060 Ti, the graph A/B is retained as evidence but is slower
-than the direct resident launch plan, so graph replay is disabled by default.
-Its results remain marked `not_promoted_cuda_graph_or_full_parity` until the
-complete model-level gate reaches the competing harness.
+On the tested RTX 5060 Ti, repeated graph and direct A/B runs are within normal
+timing variance of each other and llama.cpp. Graph replay is therefore retained
+as an opt-in optimization while the direct resident launch plan remains the
+default. Results remain marked `not_promoted_cuda_graph_or_full_parity` because
+this repository records effective parity, not an unsupported winner claim.
 
 The `_llama` profiler stores paired Nsight Systems reports and API/kernel CSV
 summaries for FortAI and llama.cpp under one provenance directory. The current

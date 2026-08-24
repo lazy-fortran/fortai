@@ -13,6 +13,8 @@ namespace {
 
 constexpr int q8_block_width = 32;
 constexpr int q8_block_bytes = 34;
+constexpr int q8_activation_block_bytes = 36;
+constexpr int q8_activation_data_offset = 4;
 
 struct fortai_cuda_q8_context_impl {
     int device = 0;
@@ -21,6 +23,8 @@ struct fortai_cuda_q8_context_impl {
     cudaEvent_t stop = nullptr;
     int8_t *scratch_activation = nullptr;
     size_t scratch_activation_bytes = 0;
+    int8_t *scratch_raw = nullptr;
+    size_t scratch_raw_bytes = 0;
     float *scratch_output = nullptr;
     size_t scratch_output_bytes = 0;
     float *scratch_aux = nullptr;
@@ -38,6 +42,9 @@ struct fortai_cuda_q8_weights_impl {
     int blocks = 0;
     int8_t *device_data = nullptr;
 };
+
+static void launch_q8_repack_activation(const int8_t *raw, int8_t *padded,
+    int blocks, cudaStream_t stream);
 
 static int fail(fortai_cuda_q8_context_impl *context, int code,
     const char *operation, cudaError_t error = cudaSuccess) {
@@ -71,13 +78,13 @@ __global__ void q8_gemv_one_warp(const int8_t *__restrict__ weights,
     float accumulator = 0.0f;
     for (int block = lane; block < blocks; block += 32) {
         const int8_t *weight_block = row_weights + block * q8_block_bytes;
-        const int8_t *activation_block = activation + block * q8_block_bytes;
+        const int8_t *activation_block = activation + block * q8_activation_block_bytes;
         const float scale = block_scale(weight_block) * block_scale(activation_block);
         int dot = 0;
 #pragma unroll
         for (int i = 0; i < q8_block_width; i += 4)
             dot = __dp4a(load_i32(weight_block + 2 + i),
-                load_i32(activation_block + 2 + i), dot);
+                load_i32(activation_block + q8_activation_data_offset + i), dot);
         accumulator = fmaf(scale, static_cast<float>(dot), accumulator);
     }
     for (int offset = 16; offset; offset >>= 1)
@@ -100,7 +107,7 @@ __global__ void q8_gemv_four_warp(const int8_t *__restrict__ weights,
     constexpr int blocks_per_wave = 128 / lanes_per_block;
     for (int block = tid / lanes_per_block; block < blocks; block += blocks_per_wave) {
         const int8_t *weight_block = row_weights + block * q8_block_bytes;
-        const int8_t *activation_block = activation + block * q8_block_bytes;
+        const int8_t *activation_block = activation + block * q8_activation_block_bytes;
         const float scale = block_scale(weight_block) * block_scale(activation_block);
         const int first_int = (tid % lanes_per_block) * 2;
         int dot = 0;
@@ -108,7 +115,7 @@ __global__ void q8_gemv_four_warp(const int8_t *__restrict__ weights,
         for (int i = 0; i < 2; ++i) {
             const int offset = 2 + 4 * (first_int + i);
             dot = __dp4a(load_i32(weight_block + offset),
-                load_i32(activation_block + offset), dot);
+                load_i32(activation_block + q8_activation_data_offset + 4 * (first_int + i)), dot);
         }
         accumulator = fmaf(scale, static_cast<float>(dot), accumulator);
     }
@@ -175,13 +182,13 @@ __global__ void q8_gemv_fused4(const int8_t *weights0, int rows0, float *output0
     const int8_t *row_weights = weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
     for (int block = lane; block < blocks; block += 32) {
         const int8_t *weight_block = row_weights + block * q8_block_bytes;
-        const int8_t *activation_block = activation + block * q8_block_bytes;
+        const int8_t *activation_block = activation + block * q8_activation_block_bytes;
         const float scale = block_scale(weight_block) * block_scale(activation_block);
         int dot = 0;
 #pragma unroll
         for (int i = 0; i < q8_block_width; i += 4)
             dot = __dp4a(load_i32(weight_block + 2 + i),
-                load_i32(activation_block + 2 + i), dot);
+                load_i32(activation_block + q8_activation_data_offset + i), dot);
         accumulator = fmaf(scale, static_cast<float>(dot), accumulator);
     }
     for (int offset = 16; offset; offset >>= 1)
@@ -189,16 +196,110 @@ __global__ void q8_gemv_fused4(const int8_t *weights0, int rows0, float *output0
     if (lane == 0) output[row] = accumulator;
 }
 
+__global__ void q8_gemv_fused4_four_warp(const int8_t *weights0, int rows0, float *output0,
+    const int8_t *weights1, int rows1, float *output1,
+    const int8_t *weights2, int rows2, float *output2,
+    const int8_t *weights3, int rows3, float *output3,
+    const int8_t *activation, const int blocks) {
+    const int global_row = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int lane_in_group = lane & 3;
+    const int group_leader = lane - lane_in_group;
+    const int8_t *weights = nullptr;
+    float *output = nullptr;
+    int row = global_row;
+    if (row < rows0) {
+        weights = weights0;
+        output = output0;
+    } else if ((row -= rows0) < rows1) {
+        weights = weights1;
+        output = output1;
+    } else if ((row -= rows1) < rows2) {
+        weights = weights2;
+        output = output2;
+    } else {
+        row -= rows2;
+        if (row >= rows3) return;
+        weights = weights3;
+        output = output3;
+    }
+
+    float accumulator = 0.0f;
+    constexpr int ints_per_block = q8_block_width / 4;
+    constexpr int lanes_per_block = ints_per_block / 2;
+    constexpr int blocks_per_wave = 128 / lanes_per_block;
+    const int8_t *row_weights = weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
+    for (int block = tid / lanes_per_block; block < blocks; block += blocks_per_wave) {
+        const int8_t *weight_block = row_weights + block * q8_block_bytes;
+        const int8_t *activation_block = activation + block * q8_activation_block_bytes;
+        float scale = 0.0f;
+        if (lane_in_group == 0)
+            scale = block_scale(weight_block) * block_scale(activation_block);
+        scale = __shfl_sync(0xffffffffu, scale, group_leader);
+        const int first_int = lane_in_group * 2;
+        int dot = 0;
+#pragma unroll 2
+        for (int i = 0; i < 2; ++i) {
+            const int offset = 2 + 4 * (first_int + i);
+            dot = __dp4a(load_i32(weight_block + offset),
+                load_i32(activation_block + q8_activation_data_offset + 4 * (first_int + i)), dot);
+        }
+        accumulator = fmaf(scale, static_cast<float>(dot), accumulator);
+    }
+    for (int offset = 16; offset; offset >>= 1)
+        accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
+    __shared__ float partial[4];
+    if (lane == 0) partial[warp] = accumulator;
+    __syncthreads();
+    if (warp == 0) {
+        accumulator = lane < 4 ? partial[lane] : 0.0f;
+        for (int offset = 2; offset; offset >>= 1)
+            accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
+        if (lane == 0) output[row] = accumulator;
+    }
+}
+
+static void launch_q8_fused4(const int8_t *weights0, int rows0, float *output0,
+    const int8_t *weights1, int rows1, float *output1,
+    const int8_t *weights2, int rows2, float *output2,
+    const int8_t *weights3, int rows3, float *output3,
+    const int8_t *activation, int blocks, cudaStream_t stream) {
+    const int rows = rows0 + rows1 + rows2 + rows3;
+    if (blocks == 64 || blocks >= 128) {
+        q8_gemv_fused4_four_warp<<<rows, 128, 0, stream>>>(
+            weights0, rows0, output0, weights1, rows1, output1,
+            weights2, rows2, output2, weights3, rows3, output3,
+            activation, blocks);
+    } else {
+        q8_gemv_fused4<<<rows, 32, 0, stream>>>(
+            weights0, rows0, output0, weights1, rows1, output1,
+            weights2, rows2, output2, weights3, rows3, output3,
+            activation, blocks);
+    }
+}
+
 static cudaError_t ensure_host_matvec_scratch(fortai_cuda_q8_context_impl *context,
     size_t activation_bytes, size_t output_bytes) {
-    if (activation_bytes > context->scratch_activation_bytes) {
+    const size_t blocks = activation_bytes / q8_block_bytes;
+    const size_t padded_activation_bytes = blocks * q8_activation_block_bytes;
+    if (activation_bytes > context->scratch_raw_bytes) {
+        cudaError_t error = cudaFree(context->scratch_raw);
+        if (error != cudaSuccess) return error;
+        context->scratch_raw = nullptr;
+        error = cudaMalloc(reinterpret_cast<void **>(&context->scratch_raw), activation_bytes);
+        if (error != cudaSuccess) return error;
+        context->scratch_raw_bytes = activation_bytes;
+    }
+    if (padded_activation_bytes > context->scratch_activation_bytes) {
         cudaError_t error = cudaFree(context->scratch_activation);
         if (error != cudaSuccess) return error;
         context->scratch_activation = nullptr;
         error = cudaMalloc(reinterpret_cast<void **>(&context->scratch_activation),
-            activation_bytes);
+            padded_activation_bytes);
         if (error != cudaSuccess) return error;
-        context->scratch_activation_bytes = activation_bytes;
+        context->scratch_activation_bytes = padded_activation_bytes;
     }
     if (output_bytes > context->scratch_output_bytes) {
         cudaError_t error = cudaFree(context->scratch_output);
@@ -238,12 +339,12 @@ static void launch_q8_grouped(const host_matvec_request *requests, int count,
     const int rows1 = weights1 ? weights1->rows : 0;
     const int rows2 = weights2 ? weights2->rows : 0;
     const int rows3 = weights3 ? weights3->rows : 0;
-    q8_gemv_fused4<<<rows0 + rows1 + rows2 + rows3, 32, 0, stream>>>(
+    launch_q8_fused4(
         weights0->device_data, rows0, requests[0].output,
         weights1 ? weights1->device_data : nullptr, rows1, count > 1 ? requests[1].output : nullptr,
         weights2 ? weights2->device_data : nullptr, rows2, count > 2 ? requests[2].output : nullptr,
         weights3 ? weights3->device_data : nullptr, rows3, count > 3 ? requests[3].output : nullptr,
-        activation, weights0->blocks);
+        activation, weights0->blocks, stream);
 }
 
 static int matvec_host_many(fortai_cuda_q8_context_impl *context,
@@ -273,8 +374,13 @@ static int matvec_host_many(fortai_cuda_q8_context_impl *context,
     cudaError_t error = ensure_host_matvec_scratch(context, expected_activation, output_bytes);
     if (error == cudaSuccess) error = cudaEventRecord(context->start, context->stream);
     if (error == cudaSuccess)
-        error = cudaMemcpyAsync(context->scratch_activation, host_activation,
+        error = cudaMemcpyAsync(context->scratch_raw, host_activation,
             expected_activation, cudaMemcpyHostToDevice, context->stream);
+    if (error == cudaSuccess) {
+        launch_q8_repack_activation(context->scratch_raw, context->scratch_activation,
+            first->blocks, context->stream);
+        error = cudaGetLastError();
+    }
     if (error == cudaSuccess && fused) {
         host_matvec_request device_requests[4] = {};
         size_t output_offset = 0;
@@ -352,7 +458,7 @@ __global__ void q8_gemv_silu_product_four_warp(const int8_t *gate_weights,
     for (int block = tid / lanes_per_block; block < blocks; block += blocks_per_wave) {
         const int8_t *gate_block = gate_row + block * q8_block_bytes;
         const int8_t *up_block = up_row + block * q8_block_bytes;
-        const int8_t *activation_block = activation + block * q8_block_bytes;
+        const int8_t *activation_block = activation + block * q8_activation_block_bytes;
         float activation_scale = 0.0f;
         float gate_scale = 0.0f;
         float up_scale = 0.0f;
@@ -371,7 +477,7 @@ __global__ void q8_gemv_silu_product_four_warp(const int8_t *gate_weights,
 #pragma unroll 2
         for (int i = 0; i < 2; ++i) {
             const int offset = 2 + 4 * (first_int + i);
-            const int activation_values = load_i32(activation_block + offset);
+            const int activation_values = load_i32(activation_block + q8_activation_data_offset + 4 * (first_int + i));
             gate_dot = __dp4a(load_i32(gate_block + offset), activation_values, gate_dot);
             up_dot = __dp4a(load_i32(up_block + offset), activation_values, up_dot);
         }
@@ -413,14 +519,14 @@ __global__ void q8_gemv_silu_product_one_warp(const int8_t *gate_weights,
     for (int block = lane; block < blocks; block += 32) {
         const int8_t *gate_block = gate_row + block * q8_block_bytes;
         const int8_t *up_block = up_row + block * q8_block_bytes;
-        const int8_t *activation_block = activation + block * q8_block_bytes;
+        const int8_t *activation_block = activation + block * q8_activation_block_bytes;
         const float gate_scale = block_scale(gate_block) * block_scale(activation_block);
         const float up_scale = block_scale(up_block) * block_scale(activation_block);
         int gate_dot = 0;
         int up_dot = 0;
 #pragma unroll
         for (int i = 0; i < q8_block_width; i += 4) {
-            const int activation_values = load_i32(activation_block + 2 + i);
+            const int activation_values = load_i32(activation_block + q8_activation_data_offset + i);
             gate_dot = __dp4a(load_i32(gate_block + 2 + i), activation_values, gate_dot);
             up_dot = __dp4a(load_i32(up_block + 2 + i), activation_values, up_dot);
         }
@@ -437,16 +543,16 @@ __global__ void q8_gemv_silu_product_one_warp(const int8_t *gate_weights,
 static void launch_q8_silu_product(fortai_cuda_q8_weights_impl *gate,
     fortai_cuda_q8_weights_impl *up, const int8_t *activation, float *output,
     float *auxiliary, cudaStream_t stream) {
-    if (gate->blocks <= 64) {
+    if (gate->blocks <= 96) {
         q8_gemv_silu_product_one_warp<<<gate->rows, 32, 0, stream>>>(gate->device_data,
             up->device_data, activation, output, gate->rows, gate->blocks);
     } else if (gate->blocks < 128) {
         q8_gemv_silu_product_four_warp<<<gate->rows, 128, 0, stream>>>(gate->device_data,
             up->device_data, activation, output, gate->rows, gate->blocks);
     } else {
-        q8_gemv_fused4<<<gate->rows + up->rows, 32, 0, stream>>>(
+        launch_q8_fused4(
             gate->device_data, gate->rows, output, up->device_data, up->rows, auxiliary,
-            nullptr, 0, nullptr, nullptr, 0, nullptr, activation, gate->blocks);
+            nullptr, 0, nullptr, nullptr, 0, nullptr, activation, gate->blocks, stream);
         qwen_silu_product<<<(gate->rows + 255) / 256, 256, 0, stream>>>(
             output, auxiliary, gate->rows);
     }
@@ -551,7 +657,7 @@ __global__ void qwen_quantize_q8(const float *input, int8_t *output, int blocks)
     const int block = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (block >= blocks) return;
     const int input_offset = block * q8_block_width;
-    const int output_offset = block * q8_block_bytes;
+    const int output_offset = block * q8_activation_block_bytes;
     float maximum = 0.0f;
     for (int i = 0; i < q8_block_width; ++i)
         maximum = fmaxf(maximum, fabsf(input[input_offset + i]));
@@ -559,9 +665,25 @@ __global__ void qwen_quantize_q8(const float *input, int8_t *output, int blocks)
     const float inverse = maximum != 0.0f ? 127.0f / maximum : 0.0f;
     const uint16_t scale_bits = __half_as_ushort(__float2half_rn(scale));
     reinterpret_cast<uint16_t *>(output + output_offset)[0] = scale_bits;
+    reinterpret_cast<uint16_t *>(output + output_offset + 2)[0] = 0;
     for (int i = 0; i < q8_block_width; ++i)
-        output[output_offset + 2 + i] = static_cast<int8_t>(__float2int_rn(
+        output[output_offset + q8_activation_data_offset + i] = static_cast<int8_t>(__float2int_rn(
         input[input_offset + i] * inverse));
+}
+
+__global__ void q8_repack_activation(const int8_t *raw, int8_t *padded, int blocks) {
+    const int block = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (block >= blocks || lane >= q8_block_width) return;
+    const int raw_offset = block * q8_block_bytes;
+    const int padded_offset = block * q8_activation_block_bytes;
+    if (lane < 2) padded[padded_offset + lane] = raw[raw_offset + lane];
+    padded[padded_offset + q8_activation_data_offset + lane] = raw[raw_offset + 2 + lane];
+}
+
+static void launch_q8_repack_activation(const int8_t *raw, int8_t *padded,
+    int blocks, cudaStream_t stream) {
+    q8_repack_activation<<<blocks, 32, 0, stream>>>(raw, padded, blocks);
 }
 
 __global__ void qwen_embedding_lookup_q8(const int8_t *weights, int64_t token_id,
@@ -584,11 +706,11 @@ __global__ void qwen_add_float(const float *left, const float *right, float *out
 
 __global__ void qwen_rms_norm_float(const float *input, const float *weights,
     float *output, int elements, float epsilon) {
-    extern __shared__ double norm_partial[];
+    extern __shared__ float norm_partial[];
     const int lane = static_cast<int>(threadIdx.x);
-    double sum = 0.0;
+    float sum = 0.0f;
     for (int index = lane; index < elements; index += blockDim.x) {
-        const double value = static_cast<double>(input[index]);
+        const float value = input[index];
         sum += value * value;
     }
     norm_partial[lane] = sum;
@@ -597,8 +719,7 @@ __global__ void qwen_rms_norm_float(const float *input, const float *weights,
         if (lane < stride) norm_partial[lane] += norm_partial[lane + stride];
         __syncthreads();
     }
-    const float inverse = 1.0f / sqrtf(static_cast<float>(norm_partial[0] /
-        static_cast<double>(elements)) + epsilon);
+    const float inverse = 1.0f / sqrtf(norm_partial[0] / static_cast<float>(elements) + epsilon);
     for (int index = lane; index < elements; index += blockDim.x)
         output[index] = input[index] * inverse * weights[index];
 }
@@ -907,6 +1028,7 @@ extern "C" int fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context) {
     cudaGraphDestroy(context->impl.graph);
     cudaFree(context->impl.position);
     cudaFree(context->impl.scratch_activation);
+    cudaFree(context->impl.scratch_raw);
     cudaFree(context->impl.scratch_output);
     cudaFree(context->impl.scratch_aux);
     cudaEventDestroy(context->impl.start);
@@ -1062,10 +1184,21 @@ extern "C" int fortai_cuda_q8_matvec_resident(fortai_cuda_q8_context *context,
     if (!context || !weights || weights->impl.context != &context->impl ||
         !device_activation || !device_output || !kernel_ms) return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);
-    cudaError_t error = cudaEventRecord(context->impl.start, context->impl.stream);
+    const size_t activation_bytes = static_cast<size_t>(weights->impl.blocks) * q8_block_bytes;
+    cudaError_t error = ensure_host_matvec_scratch(&context->impl, activation_bytes,
+        static_cast<size_t>(weights->impl.rows) * sizeof(float));
+    if (error == cudaSuccess)
+        error = cudaMemcpyAsync(context->impl.scratch_raw, device_activation, activation_bytes,
+            cudaMemcpyDeviceToDevice, context->impl.stream);
+    if (error == cudaSuccess) {
+        launch_q8_repack_activation(context->impl.scratch_raw, context->impl.scratch_activation,
+            weights->impl.blocks, context->impl.stream);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) error = cudaEventRecord(context->impl.start, context->impl.stream);
     if (error == cudaSuccess) {
         launch_q8(const_cast<fortai_cuda_q8_weights_impl *>(&weights->impl),
-            static_cast<const int8_t *>(device_activation),
+            context->impl.scratch_activation,
             static_cast<float *>(device_output), context->impl.stream);
         error = cudaGetLastError();
     }
@@ -1153,7 +1286,7 @@ extern "C" int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *contex
         elements > static_cast<size_t>(INT32_MAX) || epsilon <= 0.0f)
         return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);
-    qwen_rms_norm_float<<<1, 256, 256 * sizeof(double), context->impl.stream>>>(
+    qwen_rms_norm_float<<<1, 256, 256 * sizeof(float), context->impl.stream>>>(
         static_cast<const float *>(device_input), static_cast<const float *>(device_weights),
         static_cast<float *>(device_output), static_cast<int>(elements), epsilon);
     const cudaError_t error = cudaGetLastError();
@@ -1175,9 +1308,14 @@ extern "C" int fortai_cuda_q8_matvec_host(fortai_cuda_q8_context *context,
     cudaError_t error = ensure_host_matvec_scratch(&context->impl, activation_size, output_size);
     if (error == cudaSuccess) error = cudaEventRecord(context->impl.start, context->impl.stream);
     if (error == cudaSuccess)
-        error = cudaMemcpyAsync(context->impl.scratch_activation, host_activation,
+        error = cudaMemcpyAsync(context->impl.scratch_raw, host_activation,
             activation_size,
             cudaMemcpyHostToDevice, context->impl.stream);
+    if (error == cudaSuccess) {
+        launch_q8_repack_activation(context->impl.scratch_raw, context->impl.scratch_activation,
+            weights->impl.blocks, context->impl.stream);
+        error = cudaGetLastError();
+    }
     if (error == cudaSuccess) {
         launch_q8(const_cast<fortai_cuda_q8_weights_impl *>(&weights->impl),
             context->impl.scratch_activation, context->impl.scratch_output,
@@ -1283,8 +1421,13 @@ extern "C" int fortai_cuda_q8_ffn_host(fortai_cuda_q8_context *context,
     if (error == cudaSuccess && gate->blocks >= 128)
         error = ensure_aux_scratch(&context->impl, gate_bytes);
     if (error == cudaSuccess) error = cudaEventRecord(context->impl.start, context->impl.stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(context->impl.scratch_activation, host_activation,
+    if (error == cudaSuccess) error = cudaMemcpyAsync(context->impl.scratch_raw, host_activation,
         expected_activation, cudaMemcpyHostToDevice, context->impl.stream);
+    if (error == cudaSuccess) {
+        launch_q8_repack_activation(context->impl.scratch_raw, context->impl.scratch_activation,
+            gate->blocks, context->impl.stream);
+        error = cudaGetLastError();
+    }
     if (error == cudaSuccess) {
         launch_q8_silu_product(gate, up, context->impl.scratch_activation,
             context->impl.scratch_output, context->impl.scratch_aux, context->impl.stream);
@@ -1490,8 +1633,13 @@ extern "C" int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *la
     cudaError_t error = ensure_host_matvec_scratch(context,
         std::max(expected_activation, output_activation), expected_output);
     if (error == cudaSuccess) error = cudaEventRecord(context->start, context->stream);
-    if (error == cudaSuccess) error = cudaMemcpyAsync(context->scratch_activation, host_activation,
+    if (error == cudaSuccess) error = cudaMemcpyAsync(context->scratch_raw, host_activation,
         expected_activation, cudaMemcpyHostToDevice, context->stream);
+    if (error == cudaSuccess) {
+        launch_q8_repack_activation(context->scratch_raw, context->scratch_activation,
+            layer->impl.qkv_weights->blocks, context->stream);
+        error = cudaGetLastError();
+    }
     if (error == cudaSuccess) {
         launch_q8(layer->impl.qkv_weights, context->scratch_activation, layer->impl.qkv_output,
             context->stream);
@@ -1586,16 +1734,14 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_device(
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        q8_gemv_fused4<<<layer->impl.qkv_weights->rows + layer->impl.gate_weights->rows +
-            layer->impl.alpha_weights->rows + layer->impl.beta_weights->rows, 32, 0,
-            context->stream>>>(
+        launch_q8_fused4(
             layer->impl.qkv_weights->device_data, layer->impl.qkv_weights->rows,
             layer->impl.qkv_output, layer->impl.gate_weights->device_data,
             layer->impl.gate_weights->rows, layer->impl.gate_output,
             layer->impl.alpha_weights->device_data, layer->impl.alpha_weights->rows,
             layer->impl.alpha_output, layer->impl.beta_weights->device_data,
             layer->impl.beta_weights->rows, layer->impl.beta_output,
-            context->scratch_activation, input_blocks);
+            context->scratch_activation, input_blocks, context->stream);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
