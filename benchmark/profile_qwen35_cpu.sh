@@ -40,8 +40,9 @@ profile_dir="$root_dir/benchmark/profiles/${base}_${stamp}"
 mkdir -p "$profile_dir"
 
 export OMP_NUM_THREADS="$threads"
-export OMP_PROC_BIND="${OMP_PROC_BIND:-spread}"
+export OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
+export OMP_WAIT_POLICY="${FORTAI_LLAMA_OMP_WAIT_POLICY:-${OMP_WAIT_POLICY:-ACTIVE}}"
 native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto}"
 
 {

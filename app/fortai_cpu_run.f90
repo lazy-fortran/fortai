@@ -15,6 +15,7 @@ program fortai_cpu_run
     integer :: load_start, load_end, forward_start, forward_end
     integer :: rank, top_count, top_index, trace_top_ios, trace_top_length
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
+    real(real32) :: greedy_sum
     real(real32) :: maximum_logit
     character(len=16) :: trace_tokens, trace_top_logits
     logical :: trace_enabled, exclude_prompt
@@ -70,13 +71,22 @@ program fortai_cpu_run
         ! llama-server reports generation timing after the prompt token has
         ! been evaluated.  Match that scope without changing the default
         ! trace runner semantics.
-        call model%forward(token, 0_int64, logits, stat)
-        if (.not. stat%is_ok()) then
-            print '(a)', 'FortAI prompt forward failed: ' // stat%message
-            error stop 1
+        if (model%fast_enabled .and. top_count == 0) then
+            call model%forward_greedy(token, 0_int64, next_token, greedy_sum, stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'FortAI prompt forward failed: ' // stat%message
+                error stop 1
+            end if
+            token = next_token
+        else
+            call model%forward(token, 0_int64, logits, stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'FortAI prompt forward failed: ' // stat%message
+                error stop 1
+            end if
+            max_index = maxloc(logits, dim=1)
+            token = int(max_index - 1, int64)
         end if
-        max_index = maxloc(logits, dim=1)
-        token = int(max_index - 1, int64)
         if (trace_enabled) print '(a,i0,a,i0)', 'token[', 0, ']=', token
         if (top_count > 0) then
             maximum_logit = maxval(logits)
@@ -95,27 +105,36 @@ program fortai_cpu_run
     sample_seconds = 0.0_real32
     call system_clock(forward_start)
     do position = first_position, last_position
-        call model%forward(token, position, logits, stat)
-        if (.not. stat%is_ok()) then
-            print '(a)', 'FortAI forward failed: ' // stat%message
-            error stop 1
+        if (model%fast_enabled .and. top_count == 0) then
+            call model%forward_greedy(token, position, next_token, greedy_sum, stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'FortAI forward failed: ' // stat%message
+                error stop 1
+            end if
+            checksum = checksum + greedy_sum
+        else
+            call model%forward(token, position, logits, stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'FortAI forward failed: ' // stat%message
+                error stop 1
+            end if
+            checksum = checksum + sum(logits)
+            if (top_count > 0) then
+                maximum_logit = maxval(logits)
+                ranked_logits = logits
+                do rank = 1, top_count
+                    top_index = maxloc(ranked_logits, dim=1)
+                    print '(a,i0,a,i0,a,i0,a,es16.8)', 'top_logit[', position, ',', rank, &
+                        ']=', top_index - 1, ',', ranked_logits(top_index) - maximum_logit
+                    ranked_logits(top_index) = -huge(0.0_real32)
+                end do
+            end if
+            call system_clock(sample_start)
+            max_index = maxloc(logits, dim=1)
+            call system_clock(sample_end)
+            sample_seconds = sample_seconds + real(sample_end - sample_start, real32) / real(clock_rate, real32)
+            next_token = int(max_index - 1, int64)
         end if
-        checksum = checksum + sum(logits)
-        if (top_count > 0) then
-            maximum_logit = maxval(logits)
-            ranked_logits = logits
-            do rank = 1, top_count
-                top_index = maxloc(ranked_logits, dim=1)
-                print '(a,i0,a,i0,a,i0,a,es16.8)', 'top_logit[', position, ',', rank, &
-                    ']=', top_index - 1, ',', ranked_logits(top_index) - maximum_logit
-                ranked_logits(top_index) = -huge(0.0_real32)
-            end do
-        end if
-        call system_clock(sample_start)
-        max_index = maxloc(logits, dim=1)
-        call system_clock(sample_end)
-        sample_seconds = sample_seconds + real(sample_end - sample_start, real32) / real(clock_rate, real32)
-        next_token = int(max_index - 1, int64)
         token = next_token
         if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
     end do

@@ -26,6 +26,7 @@ result_file="$result_dir/fortai_${base}_${stamp}.json"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc)}"
 export OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}"
 export OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-${OMP_PLACES:-cores}}"
+export OMP_WAIT_POLICY="${FORTAI_LLAMA_OMP_WAIT_POLICY:-${OMP_WAIT_POLICY:-ACTIVE}}"
 native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto}"
 digest_output=$("$root_dir/tools/worktree_digest.sh")
 patch_digest=$(printf '%s\n' "$digest_output" | sed -n 's/^patch_digest=//p')

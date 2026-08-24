@@ -52,6 +52,10 @@ export OMP_NUM_THREADS="$threads"
 # callers can request an explicit policy for an affinity study.
 export OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}"
 export OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-${OMP_PLACES:-cores}}"
+# Keep the execution team hot for short autoregressive graphs.  fo's build
+# driver still uses PASSIVE internally; this policy is inherited only by the
+# launched benchmark and temporary llama.cpp oracle.
+export OMP_WAIT_POLICY="${FORTAI_LLAMA_OMP_WAIT_POLICY:-${OMP_WAIT_POLICY:-ACTIVE}}"
 export FORTAI_ENABLE_PERSISTENT_OPENMP="$persistent_openmp"
 # The CPU comparison must never touch CUDA even though llama-server links
 # libggml-cuda.so: hide every GPU so backend init finds zero devices.

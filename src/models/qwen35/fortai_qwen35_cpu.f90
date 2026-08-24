@@ -90,6 +90,15 @@ module fortai_qwen35_cpu
             integer(c_size_t), value, intent(in) :: count
         end function fortai_llama_fast_context_decode
 
+        integer(c_int) function fortai_llama_fast_context_decode_greedy(handle, token, position, next_token, logit_sum) &
+                bind(C, name='fortai_llama_fast_context_decode_greedy')
+            import c_float, c_int, c_ptr
+            type(c_ptr), value, intent(in) :: handle
+            integer(c_int), value, intent(in) :: token, position
+            integer(c_int), intent(out) :: next_token
+            real(c_float), intent(out) :: logit_sum
+        end function fortai_llama_fast_context_decode_greedy
+
         integer(c_int) function fortai_llama_fast_context_reset(handle) &
                 bind(C, name='fortai_llama_fast_context_reset')
             import c_int, c_ptr
@@ -207,6 +216,7 @@ module fortai_qwen35_cpu
         procedure :: close => qwen35_cpu_close
         procedure :: enable_cuda => qwen35_cpu_enable_cuda
         procedure :: forward => qwen35_cpu_forward
+        procedure :: forward_greedy => qwen35_cpu_forward_greedy
         procedure :: gdn_state_add => qwen35_cpu_model_gdn_state_add
         procedure :: gdn_state_value => qwen35_cpu_model_gdn_state_value
         procedure :: layers_key_value => qwen35_cpu_model_layers_key_value
@@ -812,6 +822,38 @@ contains
             call qwen35_cpu_forward_body(self, token_id, position, logits, stat)
         end if
     end subroutine qwen35_cpu_forward
+
+    subroutine qwen35_cpu_forward_greedy(self, token_id, position, next_token, logit_sum, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(int64), intent(in) :: token_id, position
+        integer(int64), intent(out) :: next_token
+        real(real32), intent(out) :: logit_sum
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code, next_token_c
+
+        next_token = 0_int64
+        logit_sum = 0.0_real32
+        if (self%fast_enabled) then
+            code = fortai_llama_fast_context_decode_greedy(self%fast_handle, &
+                int(token_id, c_int), int(position, c_int), next_token_c, logit_sum)
+            if (code /= 0_c_int) then
+                call stat%set(FORTAI_UNSUPPORTED, 'llama.cpp fast path greedy decode failed')
+                return
+            end if
+            next_token = int(next_token_c, int64)
+            call stat%clear()
+            return
+        end if
+
+        if (.not. allocated(self%logits)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 logits workspace is not allocated')
+            return
+        end if
+        call qwen35_cpu_forward(self, token_id, position, self%logits, stat)
+        if (.not. stat%is_ok()) return
+        logit_sum = sum(self%logits)
+        next_token = int(maxloc(self%logits, dim=1) - 1, int64)
+    end subroutine qwen35_cpu_forward_greedy
 
     subroutine qwen35_cpu_forward_body(self, token_id, position, logits, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self

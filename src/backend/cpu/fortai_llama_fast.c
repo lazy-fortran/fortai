@@ -7,12 +7,17 @@
  * selected at runtime and its graph/CPU-repack/CUDA backends stay resident.
  */
 #include <dlfcn.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 typedef struct fortai_llama_model fortai_llama_model;
 typedef struct fortai_llama_context fortai_llama_context;
@@ -165,6 +170,74 @@ static fortai_llama_api fortai_api;
 static int fortai_api_attempted;
 static int fortai_backend_initialized;
 
+#if (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__)
+static __attribute__((target("avx2"))) int fortai_argmax_avx2(const float *values, int count,
+    float *sum_out) {
+    const __m256 negative_infinity = _mm256_set1_ps(-INFINITY);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i index_step = _mm256_set1_epi32(8);
+    __m256 maximum = negative_infinity;
+    __m256 sum = _mm256_setzero_ps();
+    __m256i indices = zero;
+    __m256i next_indices = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    int offset = 0;
+    for (; offset + 8 <= count; offset += 8) {
+        const __m256 current = _mm256_loadu_ps(values + offset);
+        sum = _mm256_add_ps(sum, current);
+        const __m256 greater = _mm256_cmp_ps(current, maximum, _CMP_GT_OQ);
+        maximum = _mm256_blendv_ps(maximum, current, greater);
+        indices = _mm256_blendv_epi8(indices, next_indices, _mm256_castps_si256(greater));
+        next_indices = _mm256_add_epi32(next_indices, index_step);
+    }
+    float maxima[8];
+    int best_indices[8];
+    _mm256_storeu_ps(maxima, maximum);
+    _mm256_storeu_si256((__m256i *)best_indices, indices);
+    int best = best_indices[0];
+    float best_value = maxima[0];
+    for (int lane = 1; lane < 8; ++lane) {
+        if (maxima[lane] > best_value ||
+            (maxima[lane] == best_value && best_indices[lane] < best)) {
+            best_value = maxima[lane];
+            best = best_indices[lane];
+        }
+    }
+    float total = 0.0f;
+    float sums[8];
+    _mm256_storeu_ps(sums, sum);
+    for (int lane = 0; lane < 8; ++lane) total += sums[lane];
+    for (; offset < count; ++offset) {
+        total += values[offset];
+        if (values[offset] > best_value) {
+            best_value = values[offset];
+            best = offset;
+        }
+    }
+    *sum_out = total;
+    return best;
+}
+#endif
+
+static int fortai_argmax_f32(const float *values, int count, float *sum_out) {
+#if (defined(__x86_64__) || defined(__i386__)) && defined(__GNUC__)
+    static int use_avx2 = -1;
+    if (use_avx2 < 0) use_avx2 = __builtin_cpu_supports("avx2") != 0;
+    if (use_avx2) return fortai_argmax_avx2(values, count, sum_out);
+#endif
+    int best = 0;
+    float best_value = values[0];
+    float total = values[0];
+    for (int i = 1; i < count; ++i) {
+        total += values[i];
+        if (values[i] > best_value) {
+            best_value = values[i];
+            best = i;
+        }
+    }
+    *sum_out = total;
+    return best;
+}
+
 static void fortai_quiet_log(int level, const char *text, void *user) {
     (void)level;
     (void)text;
@@ -289,12 +362,10 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
      * same minimum/slot normalization internally as llama-server; doing the
      * padding here would bypass that normalization path. */
     context_params.n_ctx = (uint32_t)context_size;
-    /* The server derives both batch limits from the requested -c value for
-     * this small context (128 in the benchmark), even though the KV graph is
-     * padded to 256.  Keep the logical/physical limits at that value so the
-     * graph shape matches the server exactly. */
-    context_params.n_batch = (uint32_t)context_size;
-    context_params.n_ubatch = (uint32_t)context_size;
+    /* Keep llama-server's public defaults (n_batch=2048, n_ubatch=512).
+     * `-c` changes the KV context but does not rewrite either batch limit;
+     * retaining the values returned by llama_context_default_params keeps
+     * the scheduler/graph shape identical at higher thread counts. */
     /* FortAI drives one causal sequence at a time.  The server defaults to
      * four slots for concurrent requests, but reserving those slots here
      * needlessly enlarges the recurrent/KV graph and hurts CPU scaling. */
@@ -407,6 +478,31 @@ int fortai_llama_fast_context_decode(void *opaque, int token, int position,
     float *result = handle->api.logits(handle->context, -1);
     if (result == NULL) return 3;
     memcpy(logits, result, (size_t)handle->vocab * sizeof(float));
+    return 0;
+}
+
+/* Greedy generation does not need a host-side copy of the complete logits
+ * vector.  llama.cpp's sampler reads this same resident buffer directly;
+ * scan it in place and return the first maximum, matching Fortran MAXLOC's
+ * tie rule while avoiding one 1-MiB write and a second full-vector read per
+ * token for the Qwen3.5 vocabulary. */
+int fortai_llama_fast_context_decode_greedy(void *opaque, int token, int position,
+    int *next_token, float *logit_sum) {
+    fortai_llama_handle *handle = (fortai_llama_handle *)opaque;
+    if (handle == NULL || handle->context == NULL || next_token == NULL ||
+        logit_sum == NULL ||
+        token < 0 || position < 0 || position >= handle->max_context)
+        return 1;
+    handle->batch.n_tokens = 1;
+    handle->batch.token[0] = token;
+    handle->batch.pos[0] = position;
+    handle->batch.n_seq_id[0] = 1;
+    handle->batch.seq_id[0][0] = 0;
+    handle->batch.logits[0] = 1;
+    if (handle->api.decode(handle->context, handle->batch) != 0) return 2;
+    float *result = handle->api.logits(handle->context, -1);
+    if (result == NULL || handle->vocab <= 0) return 3;
+    *next_token = fortai_argmax_f32(result, handle->vocab, logit_sum);
     return 0;
 }
 

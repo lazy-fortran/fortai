@@ -15,6 +15,7 @@ program fortai_cuda_run
     integer :: sample_start, sample_end, top_count, trace_top_length, trace_top_ios, rank, top_index
     integer :: load_start, load_end, forward_start, forward_end
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
+    real(real32) :: greedy_sum
     character(len=16) :: trace_tokens, trace_top_tokens
     logical :: trace_enabled, disable_cuda, exclude_prompt
     character(len=8) :: disable_cuda_env
@@ -78,13 +79,22 @@ program fortai_cuda_run
     first_position = 0_int64
     last_position = steps - 1_int64
     if (exclude_prompt) then
-        call model%forward(token, 0_int64, logits, stat)
-        if (.not. stat%is_ok()) then
-            print '(a)', 'FortAI prompt forward failed: ' // stat%message
-            error stop 1
+        if (model%fast_enabled .and. top_count == 0) then
+            call model%forward_greedy(token, 0_int64, next_token, greedy_sum, stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'FortAI prompt forward failed: ' // stat%message
+                error stop 1
+            end if
+            token = next_token
+        else
+            call model%forward(token, 0_int64, logits, stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'FortAI prompt forward failed: ' // stat%message
+                error stop 1
+            end if
+            max_index = maxloc(logits, dim=1)
+            token = int(max_index - 1, int64)
         end if
-        max_index = maxloc(logits, dim=1)
-        token = int(max_index - 1, int64)
         if (trace_enabled) print '(a,i0,a,i0)', 'token[', 0, ']=', token
         if (top_count > 0) then
             ranked_logits = logits
@@ -103,17 +113,26 @@ program fortai_cuda_run
     sample_seconds = 0.0_real32
     call system_clock(forward_start)
     do position = first_position, last_position
-        call model%forward(token, position, logits, stat)
-        if (.not. stat%is_ok()) then
-            print '(a)', 'FortAI CUDA forward failed: ' // stat%message
-            error stop 1
+        if (model%fast_enabled .and. top_count == 0) then
+            call model%forward_greedy(token, position, next_token, greedy_sum, stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'FortAI CUDA forward failed: ' // stat%message
+                error stop 1
+            end if
+            checksum = checksum + greedy_sum
+        else
+            call model%forward(token, position, logits, stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'FortAI CUDA forward failed: ' // stat%message
+                error stop 1
+            end if
+            checksum = checksum + sum(logits)
+            call system_clock(sample_start)
+            max_index = maxloc(logits, dim=1)
+            call system_clock(sample_end)
+            sample_seconds = sample_seconds + real(sample_end - sample_start, real32) / real(clock_rate, real32)
+            next_token = int(max_index - 1, int64)
         end if
-        checksum = checksum + sum(logits)
-        call system_clock(sample_start)
-        max_index = maxloc(logits, dim=1)
-        call system_clock(sample_end)
-        sample_seconds = sample_seconds + real(sample_end - sample_start, real32) / real(clock_rate, real32)
-        next_token = int(max_index - 1, int64)
         token = next_token
         if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
         if (top_count > 0) then
