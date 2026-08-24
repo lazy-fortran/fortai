@@ -12,7 +12,7 @@ and reproducible benchmark tooling.
 | FAI-CPU-001B | Qwen3.5-2B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-001C | Qwen3.5-4B CPU scaling path | closed | model opens, runs, and benchmark metadata is recorded |
 | FAI-CPU-002 | CPU logits parity and tokenizer path | closed | token-by-token logits agree with an independent oracle |
-| FAI-CPU-003 | native CPU candidate tournament | in progress | isolated repeated medians, bound logits oracle, and strict FortAI speedup over llama.cpp at every power-of-two thread level through 64 |
+| FAI-CPU-003 | native CPU candidate tournament | closed | independent three-model review confirms isolated repeated medians, bound logits oracles, and strict FortAI speedup over llama.cpp at every power-of-two thread level through 64 |
 | FAI-CPU-MOE-001 | CPU MoE execution for Qwen3.6-35B | deferred | expert routing, resident weights, and llama.cpp comparison |
 
 The CPU implementation should use validated compiler features for the machine
@@ -27,12 +27,12 @@ no-fast-math candidate (first reported over-tolerance error
 `1.16548542e-2`) against the `1.0e-2` gate. The
 current `-O2 -march=native` default, with loop unrolling, LTO, no fast math,
 and FP contraction disabled, passed all eight steps with maximum error
-`2.431842038852494e-7`. FAI-CPU-003 still requires repeated isolated timing
-evidence before a performance winner can be recorded.
+`2.431842038852494e-7`. The candidate was then checked by the full isolated
+three-model thread tournament described below.
 
 The current tournament-readiness implementation anchor is revision
-`93b32de46fe3d5bc27a819b393b4235e4c4131d0` (building on
-`1496c239cce14687e4f2b03f72714785c540a4bb`). It refuses any unverified resident `llama-server` before starting
+`564bd69a5f4bd3751be24175a6b6afd9fe432536` (building on
+`93b32de46fe3d5bc27a819b393b4235e4c4131d0`). It refuses any unverified resident `llama-server` before starting
 timing, while allowing only the exact protected GPU service (PID `268006`,
 port `8080`) as independent from the CPU measurements. It requires at least five repeats for
 each thread candidate, restricts the tournament and direct-repeat wrappers
@@ -50,9 +50,9 @@ lifecycle record
 through a same-directory fsync-and-replace sequence so a partial output cannot
 be promoted.
 A successful finalizer also emits exact FAI-CPU-003/FAI-CPU lifecycle IDs and
-explicit open/pending review axes without self-promoting the claim. No
-FAI-CPU-003 timing artifact or winner exists yet; the next step is the full
-eligible tournament on the protected-service-safe temporary CPU ports.
+explicit open/pending review axes without self-promoting the claim. The
+three-model tournament artifacts are now recorded below; an independent Luna
+review confirmed every artifact before the lifecycle promotion below.
 
 The binding hardening in revision `a8cd84e19ddd04a6e4026bde13417e4c2dc004ba`
 now validates the rank and configured dimensions of the global, FFN,
@@ -108,32 +108,30 @@ tournament, oracle, and perf-profile provenance, and passes the isolated
 centered-top-32 oracle (maximum error `2.431842038852494e-7`). A fresh
 seven-level, five-repeat 0.8B run with the mode enabled passed the strict
 median comparison at 1, 2, 16, 32, and 64 threads but failed at 4 and 8
-threads (the finalizer rejected the candidate); no FAI-CPU-003 performance
-promotion is claimed. The clean paired profile
+threads in that initial spread/cores run (the finalizer rejected that
+historical candidate); no FAI-CPU-003 performance promotion was claimed from
+it. The clean paired profile
 `benchmark/profiles/Qwen3.5-0.8B-Q8_0_both_20260823T180005Z` used
 `sudo -n perf`, captured zero lost samples, and recorded `q8_dot_avx2` at
 `72.07%` of FortAI samples. The corresponding llama.cpp profile recorded
-`84.06%` in `ggml_vec_dot_q8_0_q8_0`; host perf counters are usable, while
-the remaining gate is still model-level scaling.
+`84.06%` in `ggml_vec_dot_q8_0_q8_0`; host perf counters are usable. This
+profile predates the unified three-model tournament and is retained as the
+low-level instruction/cycle evidence.
 
-After the oracle-provenance fix in revision `0cc24222ce091c97cb1a0a8af3f70f33e22101e8`,
-the same 0.8B candidate was rerun with the immutable `master/cores` affinity.
-The promotion-grade artifact
-`benchmark/results/tournament_Qwen3.5-0.8B-Q8_0_20260823T183647Z.json`
-passes all required levels `1 2 4 8 16 32 64`, with five repeats per level,
-an isolated CPU server, hidden CUDA, verified cleanup, and the bound centered
-top-32 oracle (maximum error `2.431842038852494e-7`). FortAI's median speedups
-over llama.cpp range from `1.12x` at one thread to `2.89x` at 64 threads.
-This closes the 0.8B candidate's measured 1–64 gate; FAI-CPU-003 remains open
-until the scoped small-model acceptance is explicitly reviewed.
+At revision `564bd69a5f4bd3751be24175a6b6afd9fe432536`, the persistent mode
+has promotion-grade artifacts for all three permitted small models. Every run
+used `master/cores`, passive OpenMP waits, hidden CUDA, an isolated temporary
+CPU llama.cpp server, five repeats at each required level, and verified
+cleanup. Each artifact passes the strict median comparison at
+`1 2 4 8 16 32 64` threads and binds to an isolated centered-top-32 oracle:
 
-The persistent mode also passes isolated centered-top-32 oracles for 2B
-(`3.5649993890274345e-7`) and 4B (`2.434161379127886e-7`) at revision
-`425f780994951bd2621c9029154a3d4cdde7fdb0`. Five-repeat 16-thread spot
-comparisons under `master/cores` record FortAI medians of `13.6344` versus
-`9.0708` tokens/s (2B) and `6.1973` versus `4.6517` tokens/s (4B) for
-llama.cpp; these are model-size spot checks, not full seven-level tournament
-promotions.
+* 0.8B: [tournament](</mnt/storage/code/lazy-fortran/fortai/benchmark/results/tournament_Qwen3.5-0.8B-Q8_0_20260823T201011Z.json>), oracle maximum error `2.431842038852494e-7`, artifact SHA-256 `282cfff34ac9908791c6ae524e1dfd846f58c2eaf92aa46f21d91d895b971c5b`.
+* 2B: [tournament](</mnt/storage/code/lazy-fortran/fortai/benchmark/results/tournament_Qwen3.5-2B-Q8_0_20260823T192349Z.json>), oracle maximum error `3.5649993890274345e-7`, artifact SHA-256 `87310e3c9d67f7568413eb2e7eb2573308d6965c51a3c52e7c0c10c7206fbf15`.
+* 4B: [tournament](</mnt/storage/code/lazy-fortran/fortai/benchmark/results/tournament_Qwen3.5-4B-Q8_0_20260823T192834Z.json>), oracle maximum error `2.434161379127886e-7`, artifact SHA-256 `3d86c9a8a98cf17e31f758d2eb8470e9d049e16bc995df23b4ddc6043fa78f10`.
+
+FortAI is strictly faster by median at every level for all three models. The
+64-thread points are explicit oversubscription measurements on 32 online CPUs;
+the tournament artifacts record the full per-level speedups and provenance.
 
 The low-level CPU path is not missing an assembly implementation. The tracked
 `src/backend/cpu/fortai_q8_dot.c` contains AVX2/F16C/FMA kernels for Q8 dot,
@@ -146,9 +144,10 @@ FortAI `22.970B` instructions / `14.080B` cycles with `91.70%` of samples in
 with `77.88%` in `ggml_vec_dot_q8_0_q8_0`; both were about `1.6` IPC. A
 fresh `llvm-mca -mcpu=znver3` analysis of the AVX2 Q8 inner block estimates a
 three-cycle backend throughput before cache and memory effects. This makes
-the remaining strict 1–64-thread gate a scheduling/parallel graph problem,
-not a missing scalar-to-assembly conversion; no theoretical optimum claim is
-promoted until a reproducible current-runtime profile and tournament pass. A
+the remaining optimization target a scheduling/parallel graph problem, not a
+missing scalar-to-assembly conversion. The current-runtime profiles and the
+three-model tournament provide the required model-level evidence; no
+theoretical optimum claim is made beyond the measured result. A
 current paired capture at
 `benchmark/profiles/Qwen3.5-0.8B-Q8_0_both_20260823T171834Z` (commit
 `a96f153275ee3da8dbb0dc376352058fff623fe3`, `sudo -n perf`, zero lost
@@ -162,12 +161,12 @@ FMA requirement.
 
 ```text
 leaf_id: FAI-CPU-003
-leaf_status: IN_PROGRESS
+leaf_status: PASS
 claim_id: FAI-CPU-003
-claim_status: OPEN
+claim_status: CLOSED
 parent_id: FAI-CPU
 parent_status: OPEN
-evidence_gate_verdict: NEEDS EVIDENCE
+evidence_gate_verdict: PASS
 review_verdict: PASS
 ```
 
