@@ -99,6 +99,15 @@ module fortai_qwen35_cpu
             real(c_float), intent(out) :: logit_sum
         end function fortai_llama_fast_context_decode_greedy
 
+        integer(c_int) function fortai_llama_fast_context_decode_speculative(handle, token, position, &
+                tokens, capacity, count, logit_sum) bind(C, name='fortai_llama_fast_context_decode_speculative')
+            import c_float, c_int, c_ptr
+            type(c_ptr), value, intent(in) :: handle
+            integer(c_int), value, intent(in) :: token, position, capacity
+            integer(c_int), intent(out) :: tokens(*), count
+            real(c_float), intent(out) :: logit_sum
+        end function fortai_llama_fast_context_decode_speculative
+
         integer(c_int) function fortai_llama_fast_context_reset(handle) &
                 bind(C, name='fortai_llama_fast_context_reset')
             import c_int, c_ptr
@@ -217,6 +226,7 @@ module fortai_qwen35_cpu
         procedure :: enable_cuda => qwen35_cpu_enable_cuda
         procedure :: forward => qwen35_cpu_forward
         procedure :: forward_greedy => qwen35_cpu_forward_greedy
+        procedure :: forward_greedy_speculative => qwen35_cpu_forward_greedy_speculative
         procedure :: gdn_state_add => qwen35_cpu_model_gdn_state_add
         procedure :: gdn_state_value => qwen35_cpu_model_gdn_state_value
         procedure :: layers_key_value => qwen35_cpu_model_layers_key_value
@@ -854,6 +864,48 @@ contains
         logit_sum = sum(self%logits)
         next_token = int(maxloc(self%logits, dim=1) - 1, int64)
     end subroutine qwen35_cpu_forward_greedy
+
+    subroutine qwen35_cpu_forward_greedy_speculative(self, token_id, position, tokens, count, logit_sum, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(int64), intent(in) :: token_id, position
+        integer(int64), intent(out) :: tokens(:)
+        integer, intent(out) :: count
+        real(real32), intent(out) :: logit_sum
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code, count_c
+        integer(c_int) :: c_tokens(32)
+        integer :: i, capacity
+
+        call stat%clear()
+        count = 0
+        logit_sum = 0.0_real32
+        if (size(tokens) == 0) then
+            call stat%set(FORTAI_INVALID, 'speculative output workspace is empty')
+            return
+        end if
+        capacity = min(size(tokens), size(c_tokens))
+        if (.not. self%fast_enabled) then
+            call self%forward_greedy(token_id, position, tokens(1), logit_sum, stat)
+            if (stat%is_ok()) count = 1
+            return
+        end if
+        code = fortai_llama_fast_context_decode_speculative(self%fast_handle, &
+            int(token_id, c_int), int(position, c_int), c_tokens, int(capacity, c_int), &
+            count_c, logit_sum)
+        if (code /= 0_c_int) then
+            call stat%set(FORTAI_UNSUPPORTED, 'llama.cpp speculative decode failed')
+            return
+        end if
+        count = int(count_c)
+        if (count <= 0 .or. count > capacity) then
+            call stat%set(FORTAI_UNSUPPORTED, 'llama.cpp speculative decode returned invalid count')
+            count = 0
+            return
+        end if
+        do i = 1, count
+            tokens(i) = int(c_tokens(i), int64)
+        end do
+    end subroutine qwen35_cpu_forward_greedy_speculative
 
     subroutine qwen35_cpu_forward_body(self, token_id, position, logits, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self

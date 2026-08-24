@@ -15,6 +15,7 @@ program fortai_cuda_run
     integer :: clock_start, clock_end, clock_rate, max_index, ios, device, trace_length
     integer :: disable_cuda_length
     integer :: sample_start, sample_end, top_count, trace_top_length, trace_top_ios, rank, top_index
+    integer :: spec_count, emitted
     integer :: load_start, load_end, forward_start, forward_end
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
     real(real32) :: greedy_sum
@@ -23,6 +24,7 @@ program fortai_cuda_run
     character(len=8) :: disable_cuda_env
     character(len=16) :: exclude_prompt_text
     integer :: exclude_prompt_length
+    integer(int64) :: speculative_tokens(32)
     integer(c_size_t) :: vram_free_before, vram_total_before
     integer(c_size_t) :: vram_free_after, vram_total_after
     logical :: vram_before_ok, vram_after_ok
@@ -121,14 +123,21 @@ program fortai_cuda_run
     checksum = 0.0_real32
     sample_seconds = 0.0_real32
     call system_clock(forward_start)
-    do position = first_position, last_position
+    position = first_position
+    do while (position <= last_position)
         if (model%fast_enabled .and. top_count == 0) then
-            call model%forward_greedy(token, position, next_token, greedy_sum, stat)
+            call model%forward_greedy_speculative(token, position, speculative_tokens, &
+                spec_count, greedy_sum, stat)
             if (.not. stat%is_ok()) then
                 print '(a)', 'FortAI CUDA forward failed: ' // stat%message
                 error stop 1
             end if
             checksum = checksum + greedy_sum
+            do emitted = 1, min(spec_count, int(last_position - position + 1_int64))
+                token = speculative_tokens(emitted)
+                if (trace_enabled) print '(a,i0,a,i0)', 'token[', position + emitted - 1, ']=', token
+            end do
+            position = position + int(spec_count, int64)
         else
             call model%forward(token, position, logits, stat)
             if (.not. stat%is_ok()) then
@@ -136,23 +145,24 @@ program fortai_cuda_run
                 error stop 1
             end if
             checksum = checksum + sum(logits)
+            if (top_count > 0) then
+                ranked_logits = logits
+                maximum_logit = maxval(logits)
+                do rank = 1, top_count
+                    top_index = maxloc(ranked_logits, dim=1)
+                    print '(a,i0,a,i0,a,i0,a,es16.8)', 'top_logit[', position, ',', rank, &
+                        ']=', top_index - 1, ',', ranked_logits(top_index) - maximum_logit
+                    ranked_logits(top_index) = -huge(0.0_real32)
+                end do
+            end if
             call system_clock(sample_start)
             max_index = maxloc(logits, dim=1)
             call system_clock(sample_end)
             sample_seconds = sample_seconds + real(sample_end - sample_start, real32) / real(clock_rate, real32)
             next_token = int(max_index - 1, int64)
-        end if
-        token = next_token
-        if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
-        if (top_count > 0) then
-            ranked_logits = logits
-            maximum_logit = maxval(logits)
-            do rank = 1, top_count
-                top_index = maxloc(ranked_logits, dim=1)
-                print '(a,i0,a,i0,a,i0,a,es16.8)', 'top_logit[', position, ',', rank, &
-                    ']=', top_index - 1, ',', ranked_logits(top_index) - maximum_logit
-                ranked_logits(top_index) = -huge(0.0_real32)
-            end do
+            token = next_token
+            if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
+            position = position + 1_int64
         end if
     end do
     call system_clock(clock_end)

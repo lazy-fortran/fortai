@@ -14,6 +14,7 @@ program fortai_cpu_run
     integer :: sample_start, sample_end
     integer :: load_start, load_end, forward_start, forward_end
     integer :: rank, top_count, top_index, trace_top_ios, trace_top_length
+    integer :: spec_count, emitted
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
     real(real32) :: greedy_sum
     real(real32) :: maximum_logit
@@ -21,6 +22,7 @@ program fortai_cpu_run
     logical :: trace_enabled, exclude_prompt
     character(len=16) :: exclude_prompt_text
     integer :: exclude_prompt_length
+    integer(int64) :: speculative_tokens(32)
 
     call get_command_argument(1, model_path)
     if (len_trim(model_path) == 0) then
@@ -104,14 +106,21 @@ program fortai_cpu_run
     checksum = 0.0_real32
     sample_seconds = 0.0_real32
     call system_clock(forward_start)
-    do position = first_position, last_position
+    position = first_position
+    do while (position <= last_position)
         if (model%fast_enabled .and. top_count == 0) then
-            call model%forward_greedy(token, position, next_token, greedy_sum, stat)
+            call model%forward_greedy_speculative(token, position, speculative_tokens, &
+                spec_count, greedy_sum, stat)
             if (.not. stat%is_ok()) then
                 print '(a)', 'FortAI forward failed: ' // stat%message
                 error stop 1
             end if
             checksum = checksum + greedy_sum
+            do emitted = 1, min(spec_count, int(last_position - position + 1_int64))
+                token = speculative_tokens(emitted)
+                if (trace_enabled) print '(a,i0,a,i0)', 'token[', position + emitted - 1, ']=', token
+            end do
+            position = position + int(spec_count, int64)
         else
             call model%forward(token, position, logits, stat)
             if (.not. stat%is_ok()) then
@@ -134,9 +143,10 @@ program fortai_cpu_run
             call system_clock(sample_end)
             sample_seconds = sample_seconds + real(sample_end - sample_start, real32) / real(clock_rate, real32)
             next_token = int(max_index - 1, int64)
+            token = next_token
+            if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
+            position = position + 1_int64
         end if
-        token = next_token
-        if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
     end do
     call system_clock(clock_end)
     forward_end = clock_end

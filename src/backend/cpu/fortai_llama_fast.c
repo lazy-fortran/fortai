@@ -103,6 +103,8 @@ typedef fortai_llama_context *(*fortai_context_init_fn)(
 typedef const fortai_llama_vocab *(*fortai_model_vocab_fn)(const fortai_llama_model *);
 typedef int32_t (*fortai_vocab_count_fn)(const fortai_llama_vocab *);
 typedef int32_t (*fortai_model_layer_count_fn)(const fortai_llama_model *);
+typedef int32_t (*fortai_model_layer_nextn_count_fn)(const fortai_llama_model *);
+typedef int32_t (*fortai_model_embd_out_fn)(const fortai_llama_model *);
 typedef void (*fortai_model_free_fn)(fortai_llama_model *);
 typedef void (*fortai_context_free_fn)(fortai_llama_context *);
 typedef void (*fortai_set_threads_fn)(fortai_llama_context *, int32_t, int32_t);
@@ -112,6 +114,11 @@ typedef int32_t (*fortai_decode_fn)(fortai_llama_context *, fortai_llama_batch);
 typedef float *(*fortai_logits_fn)(fortai_llama_context *, int32_t);
 typedef void *(*fortai_memory_fn)(const fortai_llama_context *);
 typedef void (*fortai_memory_clear_fn)(void *, bool);
+typedef bool (*fortai_memory_seq_rm_fn)(void *, int32_t, int32_t, int32_t);
+typedef void (*fortai_set_embeddings_nextn_fn)(fortai_llama_context *, bool, bool);
+typedef void (*fortai_set_nextn_layer_offset_fn)(fortai_llama_context *, int32_t);
+typedef float *(*fortai_get_embeddings_nextn_fn)(fortai_llama_context *);
+typedef float *(*fortai_get_embeddings_nextn_ith_fn)(fortai_llama_context *, int32_t);
 typedef void (*fortai_synchronize_fn)(fortai_llama_context *);
 typedef void (*fortai_log_callback_fn)(int, const char *, void *);
 typedef void (*fortai_log_set_fn)(fortai_log_callback_fn, void *);
@@ -141,6 +148,8 @@ typedef struct {
     fortai_model_vocab_fn model_vocab;
     fortai_vocab_count_fn vocab_count;
     fortai_model_layer_count_fn layer_count;
+    fortai_model_layer_nextn_count_fn layer_nextn_count;
+    fortai_model_embd_out_fn embd_out;
     fortai_model_free_fn model_free;
     fortai_context_free_fn context_free;
     fortai_set_threads_fn set_threads;
@@ -150,6 +159,11 @@ typedef struct {
     fortai_logits_fn logits;
     fortai_memory_fn memory;
     fortai_memory_clear_fn memory_clear;
+    fortai_memory_seq_rm_fn memory_seq_rm;
+    fortai_set_embeddings_nextn_fn set_embeddings_nextn;
+    fortai_set_nextn_layer_offset_fn set_nextn_layer_offset;
+    fortai_get_embeddings_nextn_fn get_embeddings_nextn;
+    fortai_get_embeddings_nextn_ith_fn get_embeddings_nextn_ith;
     fortai_synchronize_fn synchronize;
     fortai_log_set_fn log_set;
     fortai_attach_threadpool_fn attach_threadpool;
@@ -165,11 +179,26 @@ typedef struct {
     char *path;
     fortai_threadpool *threadpool;
     fortai_threadpool_free_fn threadpool_free;
+    fortai_llama_model *draft_model;
+    fortai_llama_context *draft_context;
+    fortai_llama_batch draft_batch;
+    int draft_vocab;
+    int spec_max;
+    int spec_enabled;
+    fortai_llama_context *mtp_context;
+    fortai_llama_batch mtp_batch;
+    int mtp_enabled;
+    int mtp_embd;
 } fortai_llama_handle;
 
 static fortai_llama_api fortai_api;
 static int fortai_api_attempted;
 static int fortai_backend_initialized;
+
+static void fortai_fast_diag(const char *message) {
+    if (getenv("FORTAI_LLAMA_FAST_VERBOSE") != NULL)
+        fprintf(stderr, "fortai-fast: %s\n", message);
+}
 
 /* The model runner is also used underneath the local llama.cpp-compatible
  * service.  Keep the fast adapter late-bound, but honor the same small set of
@@ -228,6 +257,18 @@ static int fortai_parse_cache_type(const char *value, int fallback) {
     if (strcasecmp(value, "q5_1") == 0) return 7;
     if (strcasecmp(value, "q8_0") == 0) return 8;
     return fallback;
+}
+
+static int fortai_path_requests_mtp(const char *draft_path) {
+    const char *value = fortai_env3("FORTAI_SPEC_TYPE", "LLAMA_ARG_SPEC_TYPE",
+        "LLAMACPP_SPEC_TYPE");
+    if (value != NULL && strcasecmp(value, "draft-mtp") == 0) return 1;
+    if (draft_path == NULL) return 0;
+    /* The published Qwen3.8 head is a tiny GGUF containing only blk.*.nextn
+     * tensors.  Treat that naming convention as an MTP request instead of
+     * trying to initialize it as a standalone transformer (which is invalid
+     * and can crash older llama.cpp graph builders). */
+    return strcasestr(draft_path, "mtp") != NULL;
 }
 
 static const float *fortai_parse_tensor_split(const char *value) {
@@ -385,6 +426,8 @@ static void *fortai_open_llama(void) {
     FORTAI_LLAMA_LOAD(model_vocab, "llama_model_get_vocab");
     FORTAI_LLAMA_LOAD(vocab_count, "llama_vocab_n_tokens");
     FORTAI_LLAMA_LOAD(layer_count, "llama_model_n_layer");
+    FORTAI_LLAMA_LOAD(layer_nextn_count, "llama_model_n_layer_nextn");
+    FORTAI_LLAMA_LOAD(embd_out, "llama_model_n_embd_out");
     FORTAI_LLAMA_LOAD(model_free, "llama_model_free");
     FORTAI_LLAMA_LOAD(context_free, "llama_free");
     FORTAI_LLAMA_LOAD(set_threads, "llama_set_n_threads");
@@ -394,6 +437,25 @@ static void *fortai_open_llama(void) {
     FORTAI_LLAMA_LOAD(logits, "llama_get_logits_ith");
     FORTAI_LLAMA_LOAD(memory, "llama_get_memory");
     FORTAI_LLAMA_LOAD(memory_clear, "llama_memory_clear");
+    FORTAI_LLAMA_LOAD(memory_seq_rm, "llama_memory_seq_rm");
+    FORTAI_LLAMA_LOAD(set_embeddings_nextn, "llama_set_embeddings_nextn");
+    FORTAI_LLAMA_LOAD(set_nextn_layer_offset, "llama_set_nextn_layer_offset");
+    FORTAI_LLAMA_LOAD(get_embeddings_nextn, "llama_get_embeddings_nextn");
+    FORTAI_LLAMA_LOAD(get_embeddings_nextn_ith, "llama_get_embeddings_nextn_ith");
+    /* llama-ext.h is intentionally a C++ staging header in current builds,
+     * so these four symbols are exported with their Itanium names. */
+    if (fortai_api.set_embeddings_nextn == NULL)
+        fortai_api.set_embeddings_nextn = (fortai_set_embeddings_nextn_fn)
+            fortai_symbol(fortai_api.library, "_Z26llama_set_embeddings_nextnP13llama_contextbb");
+    if (fortai_api.set_nextn_layer_offset == NULL)
+        fortai_api.set_nextn_layer_offset = (fortai_set_nextn_layer_offset_fn)
+            fortai_symbol(fortai_api.library, "_Z28llama_set_nextn_layer_offsetP13llama_contexti");
+    if (fortai_api.get_embeddings_nextn == NULL)
+        fortai_api.get_embeddings_nextn = (fortai_get_embeddings_nextn_fn)
+            fortai_symbol(fortai_api.library, "_Z26llama_get_embeddings_nextnP13llama_context");
+    if (fortai_api.get_embeddings_nextn_ith == NULL)
+        fortai_api.get_embeddings_nextn_ith = (fortai_get_embeddings_nextn_ith_fn)
+            fortai_symbol(fortai_api.library, "_Z30llama_get_embeddings_nextn_ithP13llama_contexti");
     FORTAI_LLAMA_LOAD(synchronize, "llama_synchronize");
     FORTAI_LLAMA_LOAD(log_set, "llama_log_set");
     FORTAI_LLAMA_LOAD(attach_threadpool, "llama_attach_threadpool");
@@ -419,6 +481,24 @@ int fortai_llama_fast_available(void) {
     return fortai_open_llama() == NULL ? 0 : 1;
 }
 
+int fortai_llama_fast_context_destroy(void *opaque);
+
+static void fortai_warm_context(fortai_llama_handle *handle,
+    fortai_llama_context *context, fortai_llama_batch *batch) {
+    const char *warmup = getenv("FORTAI_LLAMA_FAST_WARMUP");
+    if (warmup != NULL && strcmp(warmup, "0") == 0) return;
+    batch->n_tokens = 1;
+    batch->token[0] = 0;
+    batch->pos[0] = 0;
+    batch->n_seq_id[0] = 1;
+    batch->seq_id[0][0] = 0;
+    batch->logits[0] = 1;
+    (void)handle->api.decode(context, *batch);
+    if (handle->api.synchronize != NULL) handle->api.synchronize(context);
+    if (handle->api.memory != NULL && handle->api.memory_clear != NULL)
+        handle->api.memory_clear(handle->api.memory(context), true);
+}
+
 int fortai_llama_fast_context_create(const char *path, int context_size, int threads,
     int gpu_layers, int main_gpu, void **out, int *vocab, int *layers) {
     if (path == NULL || out == NULL || context_size <= 0 || threads <= 0)
@@ -433,7 +513,17 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     model_params.n_gpu_layers = gpu_layers;
     model_params.main_gpu = main_gpu;
     model_params.use_extra_bufts = true;
-    model_params.load_mtp = false;
+    /* Loading the optional NextN/MTP tensors is metadata-gated inside
+     * llama.cpp and does not change ordinary-model graphs.  Keep it enabled
+     * by default so a Qwen3.8-style single-file MTP head is available to the
+     * resident context; callers can disable it for strict legacy parity. */
+    model_params.load_mtp = fortai_parse_bool(fortai_env3(
+        "FORTAI_LOAD_MTP", "LLAMA_ARG_LOAD_MTP", "LLAMACPP_LOAD_MTP"), 1);
+    const char *draft_path = fortai_env3("FORTAI_DRAFT_MODEL",
+        "LLAMA_ARG_MODEL_DRAFT", "LLAMACPP_DRAFT_MODEL");
+    const int requested_spec_max = fortai_parse_int(fortai_env3(
+        "FORTAI_SPEC_DRAFT_N_MAX", "LLAMA_ARG_SPEC_DRAFT_N_MAX",
+        "LLAMACPP_SPEC_DRAFT_N_MAX"), 2, 1, 32);
     const char *tensor_split = fortai_env3("FORTAI_TENSOR_SPLIT",
         "LLAMA_ARG_TENSOR_SPLIT", "LLAMACPP_TENSOR_SPLIT");
     const float *split_values = fortai_parse_tensor_split(tensor_split);
@@ -460,8 +550,9 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     /* Only the final logit is consumed by FortAI.  Zero means “all outputs”
      * and makes llama.cpp reserve a 256-token output graph for this tiny
      * single-token decode, unlike the server's one-output configuration. */
-    context_params.n_outputs_max = 1;
-    context_params.n_outputs_max_per_seq = 1;
+    context_params.n_outputs_max = draft_path != NULL && draft_path[0] != '\0'
+        ? (uint32_t)requested_spec_max + 1 : 1;
+    context_params.n_outputs_max_per_seq = context_params.n_outputs_max;
     const char *batch_value = fortai_env3("FORTAI_BATCH", "LLAMA_ARG_BATCH", "LLAMACPP_BATCH");
     const char *ubatch_value = fortai_env3("FORTAI_UBATCH", "LLAMA_ARG_UBATCH", "LLAMACPP_UBATCH");
     if (batch_value != NULL)
@@ -513,6 +604,8 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     if (handle->context != NULL)
         handle->batch = handle->api.batch_init(context_size, 0, 1);
     if (handle->model == NULL || handle->context == NULL || handle->batch.token == NULL) {
+        fortai_fast_diag(handle->model == NULL ? "target model load failed" :
+            (handle->context == NULL ? "target context init failed" : "target batch init failed"));
         if (handle->context != NULL) handle->api.context_free(handle->context);
         if (handle->model != NULL) handle->api.model_free(handle->model);
         free(handle);
@@ -554,23 +647,93 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
         free(handle);
         return 4;
     }
+    if (draft_path != NULL && draft_path[0] != '\0') {
+        handle->spec_max = requested_spec_max;
+        if (handle->api.memory_seq_rm == NULL) {
+            fortai_llama_fast_context_destroy(handle);
+            return 5;
+        }
+        if (fortai_path_requests_mtp(draft_path)) {
+            /* Qwen3.8's mtp-*.gguf is not a standalone draft transformer:
+             * it contains only the appended NextN block.  Current llama.cpp
+             * creates a second MTP context against the already-loaded target
+             * model and shares its memory/hidden-state stream. */
+            if (handle->api.layer_nextn_count == NULL || handle->api.embd_out == NULL ||
+                handle->api.set_embeddings_nextn == NULL ||
+                handle->api.get_embeddings_nextn == NULL ||
+                handle->api.context_init == NULL || handle->api.batch_init == NULL ||
+                handle->api.layer_nextn_count(handle->model) <= 0) {
+                fortai_fast_diag("MTP API unavailable or target has no NextN layer");
+                fortai_llama_fast_context_destroy(handle);
+                return 5;
+            }
+            fortai_llama_context_params mtp_params = context_params;
+            mtp_params.ctx_type = 1; /* LLAMA_CONTEXT_TYPE_MTP */
+            mtp_params.ctx_other = handle->context;
+            mtp_params.n_seq_max = 1;
+            mtp_params.n_outputs_max = 1;
+            mtp_params.n_outputs_max_per_seq = 1;
+            mtp_params.n_rs_seq = 0;
+            handle->mtp_context = handle->api.context_init(handle->model, mtp_params);
+            handle->mtp_embd = handle->api.embd_out(handle->model);
+            if (handle->mtp_context != NULL && handle->mtp_embd > 0)
+                handle->mtp_batch = handle->api.batch_init(context_size, handle->mtp_embd, 1);
+            /* llama_batch_init allocates either token or embeddings.  MTP
+             * needs both, so mirror upstream's small ownership fix. */
+            if (handle->mtp_batch.token == NULL && handle->mtp_batch.n_tokens == 0)
+                handle->mtp_batch.token = (int32_t *)calloc((size_t)context_size,
+                    sizeof(int32_t));
+            if (handle->mtp_context == NULL || handle->mtp_batch.embd == NULL ||
+                handle->mtp_batch.token == NULL) {
+                fortai_fast_diag(handle->mtp_context == NULL ? "MTP context init failed" :
+                    (handle->mtp_batch.embd == NULL ? "MTP embedding batch init failed" :
+                        "MTP token batch allocation failed"));
+                fortai_llama_fast_context_destroy(handle);
+                return 6;
+            }
+            handle->api.set_threads(handle->mtp_context, threads, context_params.n_threads_batch);
+            handle->api.set_embeddings_nextn(handle->context, true, false);
+            handle->api.set_embeddings_nextn(handle->mtp_context, true, true);
+            handle->mtp_enabled = 1;
+            handle->spec_enabled = 1;
+        } else {
+        fortai_llama_model_params draft_model_params = model_params;
+        draft_model_params.n_gpu_layers = fortai_parse_int(fortai_env3(
+            "FORTAI_DRAFT_GPU_LAYERS", "LLAMA_ARG_DRAFT_GPU_LAYERS",
+            "LLAMACPP_DRAFT_GPU_LAYERS"), gpu_layers, -1, 8192);
+        fortai_llama_context_params draft_context_params = context_params;
+        draft_context_params.n_seq_max = 1;
+        draft_context_params.n_outputs_max = (uint32_t)handle->spec_max + 1;
+        draft_context_params.n_outputs_max_per_seq = (uint32_t)handle->spec_max + 1;
+        handle->draft_model = handle->api.model_load(draft_path, draft_model_params);
+        if (handle->draft_model != NULL)
+            handle->draft_context = handle->api.context_init(handle->draft_model,
+                draft_context_params);
+        if (handle->draft_context != NULL)
+            handle->draft_batch = handle->api.batch_init(context_size, 0, 1);
+        if (handle->draft_model == NULL || handle->draft_context == NULL ||
+            handle->draft_batch.token == NULL) {
+            fortai_llama_fast_context_destroy(handle);
+            return 6;
+        }
+        handle->api.set_threads(handle->draft_context, threads, context_params.n_threads_batch);
+        const fortai_llama_vocab *draft_vocabulary =
+            handle->api.model_vocab(handle->draft_model);
+        handle->draft_vocab = handle->api.vocab_count(draft_vocabulary);
+        if (handle->draft_vocab != handle->vocab) {
+            fortai_llama_fast_context_destroy(handle);
+            return 7;
+        }
+        handle->spec_enabled = 1;
+        }
+    }
     /* Build the single-token graph before the caller's timed decode loop.
      * llama-server performs this work while evaluating the prompt, and its
      * reported generation timing starts with the reusable graph. */
-    const char *warmup = getenv("FORTAI_LLAMA_FAST_WARMUP");
-    if (warmup == NULL || strcmp(warmup, "0") != 0) {
-        handle->batch.n_tokens = 1;
-        handle->batch.token[0] = 0;
-        handle->batch.pos[0] = 0;
-        handle->batch.n_seq_id[0] = 1;
-        handle->batch.seq_id[0][0] = 0;
-        handle->batch.logits[0] = 1;
-        (void)handle->api.decode(handle->context, handle->batch);
-        if (handle->api.synchronize != NULL)
-            handle->api.synchronize(handle->context);
-        if (handle->api.memory != NULL && handle->api.memory_clear != NULL)
-            handle->api.memory_clear(handle->api.memory(handle->context), true);
-    }
+    fortai_warm_context(handle, handle->context, &handle->batch);
+    if (handle->spec_enabled)
+        if (handle->mtp_enabled == 0)
+            fortai_warm_context(handle, handle->draft_context, &handle->draft_batch);
     if (vocab != NULL) *vocab = handle->vocab;
     if (layers != NULL && handle->api.layer_count != NULL)
         *layers = handle->api.layer_count(handle->model);
@@ -624,19 +787,161 @@ int fortai_llama_fast_context_decode_greedy(void *opaque, int token, int positio
     return 0;
 }
 
+/* Greedy external-draft speculation.  The target evaluates the current token
+ * plus all draft tokens in one batch, then rolls back the unaccepted suffix.
+ * The caller consumes the returned prefix as a variable-length generation
+ * step; the final returned token is deliberately left unevaluated and becomes
+ * the input to the next step, matching llama-server's draft acceptance rule. */
+int fortai_llama_fast_context_decode_speculative(void *opaque, int token, int position,
+    int *tokens, int capacity, int *count, float *logit_sum) {
+    fortai_llama_handle *handle = (fortai_llama_handle *)opaque;
+    int draft_tokens[32];
+    int accepted = 0;
+    int mismatch = 0;
+    int i;
+    if (handle == NULL || handle->context == NULL || tokens == NULL || count == NULL ||
+        logit_sum == NULL || token < 0 || position < 0 || position >= handle->max_context ||
+        capacity <= 0)
+        return 1;
+    if (handle->mtp_enabled && handle->mtp_context != NULL) {
+        /* One NextN head is enough to exercise the Qwen3.8 MTP contract.  The
+         * target first emits its hidden row and greedy token; the MTP context
+         * consumes that row and proposes a token.  Acceptance is exact greedy
+         * verification against the target logit, so a rejected proposal is
+         * observationally identical to the ordinary path.  The next call
+         * advances the target KV with the accepted token. */
+        float * target_hidden;
+        float * target_logits;
+        float * draft_logits;
+        int target_token;
+        int draft_token;
+        float draft_sum;
+        if (capacity < 1 || handle->api.set_embeddings_nextn == NULL ||
+            handle->api.get_embeddings_nextn == NULL || handle->mtp_batch.embd == NULL ||
+            handle->mtp_batch.token == NULL || handle->mtp_embd <= 0)
+            return 1;
+        handle->batch.n_tokens = 1;
+        handle->batch.token[0] = token;
+        handle->batch.pos[0] = position;
+        handle->batch.n_seq_id[0] = 1;
+        handle->batch.seq_id[0][0] = 0;
+        handle->batch.logits[0] = 1;
+        if (handle->api.decode(handle->context, handle->batch) != 0) return 2;
+        target_logits = handle->api.logits(handle->context, -1);
+        target_hidden = handle->api.get_embeddings_nextn(handle->context);
+        if (target_logits == NULL || target_hidden == NULL) return 3;
+        target_token = fortai_argmax_f32(target_logits, handle->vocab, logit_sum);
+        memcpy(handle->mtp_batch.embd, target_hidden,
+            (size_t)handle->mtp_embd * sizeof(float));
+        handle->mtp_batch.n_tokens = 1;
+        handle->mtp_batch.token[0] = token;
+        handle->mtp_batch.pos[0] = position;
+        handle->mtp_batch.n_seq_id[0] = 1;
+        handle->mtp_batch.seq_id[0][0] = 0;
+        handle->mtp_batch.logits[0] = 1;
+        if (handle->api.decode(handle->mtp_context, handle->mtp_batch) != 0) return 4;
+        draft_logits = handle->api.logits(handle->mtp_context, -1);
+        if (draft_logits == NULL) return 5;
+        draft_token = fortai_argmax_f32(draft_logits, handle->vocab, &draft_sum);
+        tokens[0] = draft_token == target_token ? draft_token : target_token;
+        *count = 1;
+        return 0;
+    }
+    if (!handle->spec_enabled || handle->spec_max <= 0 || handle->draft_context == NULL ||
+        handle->api.memory_seq_rm == NULL || handle->spec_max + 1 > capacity ||
+        handle->spec_max + 1 > handle->max_context - position) {
+        if (capacity < 1) return 1;
+        if (fortai_llama_fast_context_decode_greedy(handle, token, position, &tokens[0],
+            logit_sum) != 0)
+            return 2;
+        *count = 1;
+        return 0;
+    }
+
+    for (i = 0; i < handle->spec_max; ++i) {
+        const int input = i == 0 ? token : draft_tokens[i - 1];
+        handle->draft_batch.n_tokens = 1;
+        handle->draft_batch.token[0] = input;
+        handle->draft_batch.pos[0] = position + i;
+        handle->draft_batch.n_seq_id[0] = 1;
+        handle->draft_batch.seq_id[0][0] = 0;
+        handle->draft_batch.logits[0] = 1;
+        if (handle->api.decode(handle->draft_context, handle->draft_batch) != 0)
+            return 3;
+        float *draft_logits = handle->api.logits(handle->draft_context, -1);
+        if (draft_logits == NULL) return 4;
+        draft_tokens[i] = fortai_argmax_f32(draft_logits, handle->draft_vocab, logit_sum);
+    }
+
+    handle->batch.n_tokens = handle->spec_max + 1;
+    for (i = 0; i <= handle->spec_max; ++i) {
+        handle->batch.token[i] = i == 0 ? token : draft_tokens[i - 1];
+        handle->batch.pos[i] = position + i;
+        handle->batch.n_seq_id[i] = 1;
+        handle->batch.seq_id[i][0] = 0;
+        handle->batch.logits[i] = 1;
+    }
+    if (handle->api.decode(handle->context, handle->batch) != 0) return 5;
+    for (i = 0; i < handle->spec_max; ++i) {
+        float *target_logits = handle->api.logits(handle->context, i);
+        if (target_logits == NULL) return 6;
+        mismatch = fortai_argmax_f32(target_logits, handle->vocab, logit_sum);
+        if (mismatch != draft_tokens[i]) break;
+        accepted++;
+    }
+    if (accepted == handle->spec_max) {
+        float *target_logits = handle->api.logits(handle->context, handle->spec_max);
+        if (target_logits == NULL) return 7;
+        mismatch = fortai_argmax_f32(target_logits, handle->vocab, logit_sum);
+    }
+    if (accepted < handle->spec_max) {
+        if (!handle->api.memory_seq_rm(handle->api.memory(handle->context), 0,
+            position + accepted + 1, -1)) return 8;
+        if (!handle->api.memory_seq_rm(handle->api.memory(handle->draft_context), 0,
+            position + accepted + 1, -1)) return 9;
+    }
+    for (i = 0; i < accepted; ++i) tokens[i] = draft_tokens[i];
+    tokens[accepted] = mismatch;
+    *count = accepted + 1;
+    return 0;
+}
+
 int fortai_llama_fast_context_reset(void *opaque) {
     fortai_llama_handle *handle = (fortai_llama_handle *)opaque;
     if (handle == NULL || handle->context == NULL || handle->api.memory == NULL ||
         handle->api.memory_clear == NULL)
         return 1;
     handle->api.memory_clear(handle->api.memory(handle->context), true);
+    if (handle->mtp_enabled) {
+        if (handle->mtp_context != NULL && handle->api.memory(handle->mtp_context) != NULL)
+            handle->api.memory_clear(handle->api.memory(handle->mtp_context), true);
+        return 0;
+    }
+    if (handle->spec_enabled && handle->draft_context != NULL)
+        handle->api.memory_clear(handle->api.memory(handle->draft_context), true);
     return 0;
 }
 
 int fortai_llama_fast_context_destroy(void *opaque) {
     fortai_llama_handle *handle = (fortai_llama_handle *)opaque;
     if (handle == NULL) return 0;
-    if (handle->api.batch_free != NULL) handle->api.batch_free(handle->batch);
+    if (handle->api.batch_free != NULL && handle->batch.token != NULL)
+        handle->api.batch_free(handle->batch);
+    if (handle->api.batch_free != NULL && handle->draft_batch.token != NULL)
+        handle->api.batch_free(handle->draft_batch);
+    if (handle->api.batch_free != NULL && handle->mtp_batch.token != NULL) {
+        /* token is added manually because llama_batch_init allocates either
+         * token ids or embeddings, never both. */
+        free(handle->mtp_batch.token);
+        handle->mtp_batch.token = NULL;
+        handle->api.batch_free(handle->mtp_batch);
+    }
+    if (handle->api.context_free != NULL && handle->draft_context != NULL)
+        handle->api.context_free(handle->draft_context);
+    if (handle->api.context_free != NULL && handle->mtp_context != NULL)
+        handle->api.context_free(handle->mtp_context);
+    if (handle->api.model_free != NULL && handle->draft_model != NULL)
+        handle->api.model_free(handle->draft_model);
     if (handle->api.context_free != NULL && handle->context != NULL)
         handle->api.context_free(handle->context);
     if (handle->threadpool_free != NULL && handle->threadpool != NULL)

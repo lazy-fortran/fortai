@@ -144,10 +144,12 @@ batch/ubatch sizes, parallel sequence count, K/V cache types, KQV and generic
 operation offload, SWA/KV-unified mode, thread-batch count, and multi-GPU
 tensor splitting. The CUDA runner reports `vram_*_bytes` before and after
 loading so the memory delta can be compared with llama.cpp under the same
-profile. External draft-model speculative decoding and multimodal projector
-execution remain outside this direct single-sequence runner; use the upstream
-server compatibility path for those features until their FortAI integration is
-promoted.
+profile. Qwen3.8-style `mtp-*.gguf` heads are handled through llama.cpp's
+resident NextN/MTP context (the target model is loaded once and the MTP head
+shares its hidden-state path); greedy acceptance remains exact. Multimodal
+projector execution and general chat-server orchestration remain outside this
+direct single-sequence runner, so use the upstream server compatibility path
+when those features are required.
 
 Benchmark results, logs, and perf data stay machine-local under
 `benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts
