@@ -148,8 +148,15 @@ profile. Qwen3.8-style `mtp-*.gguf` heads are handled through llama.cpp's
 resident NextN/MTP context (the target model is loaded once and the MTP head
 shares its hidden-state path); greedy acceptance remains exact. Multimodal
 projector execution and general chat-server orchestration remain outside this
-direct single-sequence runner, so use the upstream server compatibility path
-when those features are required.
+direct single-sequence runner. For the production service, use
+`tools/fortai-server`: it resolves the configured upstream `llama-server` and
+executes it with every argument unchanged. That keeps the complete current
+llama.cpp CLI/configuration surface (chat templates, multimodal projector,
+flash attention, MTP/speculation, slots, samplers, KV/cache controls, and
+device placement) and upstream performance/memory behavior. Set
+`FORTAI_LLAMA_SERVER`, `LLAMACPP_SERVER`, or `LLAMA_SERVER` to select a binary;
+the wrapper does not choose or bind a port, so the caller's `--port` remains
+authoritative and cannot collide through an implicit default.
 
 Benchmark results, logs, and perf data stay machine-local under
 `benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts

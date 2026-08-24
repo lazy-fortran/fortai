@@ -550,7 +550,8 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     /* Only the final logit is consumed by FortAI.  Zero means “all outputs”
      * and makes llama.cpp reserve a 256-token output graph for this tiny
      * single-token decode, unlike the server's one-output configuration. */
-    context_params.n_outputs_max = draft_path != NULL && draft_path[0] != '\0'
+    context_params.n_outputs_max = draft_path != NULL && draft_path[0] != '\0' &&
+        !fortai_path_requests_mtp(draft_path)
         ? (uint32_t)requested_spec_max + 1 : 1;
     context_params.n_outputs_max_per_seq = context_params.n_outputs_max;
     const char *batch_value = fortai_env3("FORTAI_BATCH", "LLAMA_ARG_BATCH", "LLAMACPP_BATCH");
@@ -804,15 +805,14 @@ int fortai_llama_fast_context_decode_speculative(void *opaque, int token, int po
         capacity <= 0)
         return 1;
     if (handle->mtp_enabled && handle->mtp_context != NULL) {
-        /* One NextN head is enough to exercise the Qwen3.8 MTP contract.  The
-         * target first emits its hidden row and greedy token; the MTP context
-         * consumes that row and proposes a token.  Acceptance is exact greedy
-         * verification against the target logit, so a rejected proposal is
-         * observationally identical to the ordinary path.  The next call
-         * advances the target KV with the accepted token. */
-        float * target_hidden;
-        float * target_logits;
-        float * draft_logits;
+        /* The Qwen3.8 sidecar is a single NextN head, not a standalone draft
+         * transformer.  Feed the target hidden row through that head once,
+         * and use exact target argmax as the oracle.  The target context is
+         * intentionally advanced by one token per call so rollback and
+         * recurrent-state semantics remain identical to the greedy path. */
+        float *target_hidden;
+        float *target_logits;
+        float *draft_logits;
         int target_token;
         int draft_token;
         float draft_sum;
