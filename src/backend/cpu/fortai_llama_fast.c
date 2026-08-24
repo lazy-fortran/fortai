@@ -380,7 +380,7 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     /* FortAI measures its own wall-clock loop and does not consume llama's
      * per-node accounting.  Avoid that bookkeeping on the CPU fast path;
      * retain the reference setting for CUDA unless explicitly overridden. */
-    context_params.no_perf = gpu_layers == 0;
+    context_params.no_perf = gpu_layers == 0 && threads > 1;
     const char *no_perf = getenv("FORTAI_LLAMA_FAST_NO_PERF");
     if (no_perf != NULL) context_params.no_perf = strcmp(no_perf, "0") != 0;
     /* Match llama-server's defaults: KV/KQV offload remains enabled even for
