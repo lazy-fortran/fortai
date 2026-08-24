@@ -6,15 +6,18 @@ program fortai_cuda_run
 
     type(qwen35_cpu_model_t) :: model
     type(status_t) :: stat
-    real(real32), allocatable :: logits(:)
+    real(real32), allocatable :: logits(:), ranked_logits(:)
     character(len=512) :: model_path, argument
     integer(int64) :: token, steps, context, position, next_token
     integer :: clock_start, clock_end, clock_rate, max_index, ios, device, trace_length
-    integer :: sample_start, sample_end
+    integer :: disable_cuda_length
+    integer :: sample_start, sample_end, top_count, trace_top_length, trace_top_ios, rank, top_index
     integer :: load_start, load_end, forward_start, forward_end
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
-    character(len=16) :: trace_tokens
-    logical :: trace_enabled
+    character(len=16) :: trace_tokens, trace_top_tokens
+    logical :: trace_enabled, disable_cuda
+    character(len=8) :: disable_cuda_env
+    real(real32) :: maximum_logit
 
     call get_command_argument(1, model_path)
     if (len_trim(model_path) == 0) then
@@ -37,6 +40,13 @@ program fortai_cuda_run
     call get_environment_variable('FORTAI_TRACE_TOKENS', trace_tokens, length=trace_length)
     trace_enabled = .false.
     if (trace_length > 0) trace_enabled = trace_tokens(1:trace_length) == '1'
+    top_count = 0
+    call get_environment_variable('FORTAI_TRACE_TOP_LOGITS', trace_top_tokens, &
+        length=trace_top_length)
+    if (trace_top_length > 0) then
+        read (trace_top_tokens(1:trace_top_length), *, iostat=trace_top_ios) top_count
+        if (trace_top_ios /= 0 .or. top_count < 2) error stop 2
+    end if
 
     call system_clock(clock_start, clock_rate)
     load_start = clock_start
@@ -45,13 +55,19 @@ program fortai_cuda_run
         print '(a)', 'FortAI model open failed: ' // stat%message
         error stop 1
     end if
-    call model%enable_cuda(device, stat)
-    if (.not. stat%is_ok()) then
-        print '(a)', 'FortAI CUDA enable failed: ' // stat%message
-        error stop 1
+    disable_cuda = .false.
+    call get_environment_variable('FORTAI_DISABLE_CUDA', disable_cuda_env, length=disable_cuda_length)
+    if (disable_cuda_length > 0) disable_cuda = disable_cuda_env(1:disable_cuda_length) == '1'
+    if (.not. disable_cuda) then
+        call model%enable_cuda(device, stat)
+        if (.not. stat%is_ok()) then
+            print '(a)', 'FortAI CUDA enable failed: ' // stat%message
+            error stop 1
+        end if
     end if
     call system_clock(load_end)
     allocate (logits(model%vocabulary_size))
+    if (top_count > 0) allocate (ranked_logits(model%vocabulary_size))
     checksum = 0.0_real32
     sample_seconds = 0.0_real32
     call system_clock(forward_start)
@@ -69,6 +85,16 @@ program fortai_cuda_run
         next_token = int(max_index - 1, int64)
         token = next_token
         if (trace_enabled) print '(a,i0,a,i0)', 'token[', position, ']=', token
+        if (top_count > 0) then
+            ranked_logits = logits
+            maximum_logit = maxval(logits)
+            do rank = 1, top_count
+                top_index = maxloc(ranked_logits, dim=1)
+                print '(a,i0,a,i0,a,i0,a,es16.8)', 'top_logit[', position, ',', rank, &
+                    ']=', top_index - 1, ',', ranked_logits(top_index) - maximum_logit
+                ranked_logits(top_index) = -huge(0.0_real32)
+            end do
+        end if
     end do
     call system_clock(clock_end)
     forward_end = clock_end

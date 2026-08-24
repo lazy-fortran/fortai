@@ -334,7 +334,73 @@ __global__ void qwen_silu_product(float *gate, const float *up, int count) {
     gate[index] = qwen_silu(gate[index]) * up[index];
 }
 
-__global__ void q8_gemv_silu_product(const int8_t *gate_weights,
+__global__ void q8_gemv_silu_product_four_warp(const int8_t *gate_weights,
+    const int8_t *up_weights, const int8_t *activation, float *output,
+    int rows, int blocks) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (row >= rows) return;
+    const int8_t *gate_row = gate_weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
+    const int8_t *up_row = up_weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
+    constexpr int ints_per_block = q8_block_width / 4;
+    constexpr int lanes_per_block = ints_per_block / 2;
+    constexpr int blocks_per_wave = 128 / lanes_per_block;
+    float gate_accumulator = 0.0f;
+    float up_accumulator = 0.0f;
+    for (int block = tid / lanes_per_block; block < blocks; block += blocks_per_wave) {
+        const int8_t *gate_block = gate_row + block * q8_block_bytes;
+        const int8_t *up_block = up_row + block * q8_block_bytes;
+        const int8_t *activation_block = activation + block * q8_block_bytes;
+        float activation_scale = 0.0f;
+        float gate_scale = 0.0f;
+        float up_scale = 0.0f;
+        if ((tid % lanes_per_block) == 0) {
+            activation_scale = block_scale(activation_block);
+            gate_scale = block_scale(gate_block) * activation_scale;
+            up_scale = block_scale(up_block) * activation_scale;
+        }
+        const int group_leader = lane - (lane % lanes_per_block);
+        activation_scale = __shfl_sync(0xffffffffu, activation_scale, group_leader);
+        gate_scale = __shfl_sync(0xffffffffu, gate_scale, group_leader);
+        up_scale = __shfl_sync(0xffffffffu, up_scale, group_leader);
+        const int first_int = (tid % lanes_per_block) * 2;
+        int gate_dot = 0;
+        int up_dot = 0;
+#pragma unroll 2
+        for (int i = 0; i < 2; ++i) {
+            const int offset = 2 + 4 * (first_int + i);
+            const int activation_values = load_i32(activation_block + offset);
+            gate_dot = __dp4a(load_i32(gate_block + offset), activation_values, gate_dot);
+            up_dot = __dp4a(load_i32(up_block + offset), activation_values, up_dot);
+        }
+        gate_accumulator = fmaf(gate_scale, static_cast<float>(gate_dot), gate_accumulator);
+        up_accumulator = fmaf(up_scale, static_cast<float>(up_dot), up_accumulator);
+    }
+    for (int offset = 16; offset; offset >>= 1) {
+        gate_accumulator += __shfl_down_sync(0xffffffffu, gate_accumulator, offset);
+        up_accumulator += __shfl_down_sync(0xffffffffu, up_accumulator, offset);
+    }
+    __shared__ float gate_partial[4];
+    __shared__ float up_partial[4];
+    if (lane == 0) {
+        gate_partial[warp] = gate_accumulator;
+        up_partial[warp] = up_accumulator;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        gate_accumulator = lane < 4 ? gate_partial[lane] : 0.0f;
+        up_accumulator = lane < 4 ? up_partial[lane] : 0.0f;
+        for (int offset = 2; offset; offset >>= 1) {
+            gate_accumulator += __shfl_down_sync(0xffffffffu, gate_accumulator, offset);
+            up_accumulator += __shfl_down_sync(0xffffffffu, up_accumulator, offset);
+        }
+        if (lane == 0) output[row] = qwen_silu(gate_accumulator) * up_accumulator;
+    }
+}
+
+__global__ void q8_gemv_silu_product_one_warp(const int8_t *gate_weights,
     const int8_t *up_weights, const int8_t *activation, float *output,
     int rows, int blocks) {
     const int row = static_cast<int>(blockIdx.x);
@@ -371,8 +437,11 @@ __global__ void q8_gemv_silu_product(const int8_t *gate_weights,
 static void launch_q8_silu_product(fortai_cuda_q8_weights_impl *gate,
     fortai_cuda_q8_weights_impl *up, const int8_t *activation, float *output,
     float *auxiliary, cudaStream_t stream) {
-    if (gate->blocks < 128) {
-        q8_gemv_silu_product<<<gate->rows, 32, 0, stream>>>(gate->device_data,
+    if (gate->blocks <= 64) {
+        q8_gemv_silu_product_one_warp<<<gate->rows, 32, 0, stream>>>(gate->device_data,
+            up->device_data, activation, output, gate->rows, gate->blocks);
+    } else if (gate->blocks < 128) {
+        q8_gemv_silu_product_four_warp<<<gate->rows, 128, 0, stream>>>(gate->device_data,
             up->device_data, activation, output, gate->rows, gate->blocks);
     } else {
         q8_gemv_fused4<<<gate->rows + up->rows, 32, 0, stream>>>(
@@ -420,64 +489,62 @@ __global__ void qwen_recurrent_l2_normalize(float *values, int slices, int lengt
         values[slice * length + i] *= inverse;
 }
 
-__global__ void qwen_recurrent_gdn_serial(const float *qkv, const float *gate,
+__global__ void qwen_recurrent_gdn_rows(const float *qkv, const float *gate,
     const float *alpha, const float *beta, const float *ssm_a, const float *ssm_dt,
-    const float *ssm_norm, float *state, float *output, int state_size, int key_heads,
-    int value_heads, int head_size, float norm_epsilon) {
-    const int head = static_cast<int>(blockIdx.x);
-    const int tid = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    if (head >= value_heads) return;
-    extern __shared__ float shared[];
-    float *head_output = shared;
-    float *reduction = shared + head_size;
-    const int key_head = head / (value_heads / key_heads);
+    float *state, float *output, int state_size, int key_heads, int value_heads,
+    int head_size) {
+    const int row_index = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    const int head = row_index / head_size;
+    const int row = row_index % head_size;
+    if (head >= value_heads || lane >= 32) return;
+    const int key_head = head % key_heads;
     const int q_offset = key_head * head_size;
     const int k_offset = state_size * key_heads + key_head * head_size;
     const int v_offset = 2 * state_size * key_heads + head * head_size;
     const float decay = expf(ssm_a[head] * qwen_softplus(alpha[head] + ssm_dt[head]));
     const float beta_value = qwen_sigmoid(beta[head]);
     float *head_state = state + head * head_size * head_size;
-    for (int row = warp; row < head_size; row += 4) {
-        float key_dot = 0.0f;
-        for (int column = lane; column < head_size; column += 32) {
-            const int index = row * head_size + column;
-            const float decayed = head_state[index] * decay;
-            head_state[index] = decayed;
-            key_dot += decayed * qkv[k_offset + column];
-        }
-        for (int offset = 16; offset; offset >>= 1)
-            key_dot += __shfl_down_sync(0xffffffffu, key_dot, offset);
-        key_dot = __shfl_sync(0xffffffffu, key_dot, 0);
-        const float delta = (qkv[v_offset + row] - key_dot) * beta_value;
-        float query_dot = 0.0f;
-        for (int column = lane; column < head_size; column += 32) {
-            const int index = row * head_size + column;
-            const float updated = head_state[index] + delta * qkv[k_offset + column];
-            head_state[index] = updated;
-            query_dot += updated * qkv[q_offset + column];
-        }
-        for (int offset = 16; offset; offset >>= 1)
-            query_dot += __shfl_down_sync(0xffffffffu, query_dot, offset);
-        if (lane == 0) head_output[row] = query_dot / sqrtf(static_cast<float>(head_size));
+    float key_dot = 0.0f;
+    for (int column = lane; column < head_size; column += 32) {
+        const int index = row * head_size + column;
+        const float decayed = head_state[index] * decay;
+        head_state[index] = decayed;
+        key_dot += decayed * qkv[k_offset + column];
     }
+    for (int offset = 16; offset; offset >>= 1)
+        key_dot += __shfl_down_sync(0xffffffffu, key_dot, offset);
+    key_dot = __shfl_sync(0xffffffffu, key_dot, 0);
+    __shared__ float row_delta;
+    if (lane == 0) row_delta = (qkv[v_offset + row] - key_dot) * beta_value;
     __syncthreads();
-    float sum = 0.0f;
-    for (int row = tid; row < head_size; row += blockDim.x) {
-        const float value = head_output[row];
-        sum += value * value;
+    float query_dot = 0.0f;
+    for (int column = lane; column < head_size; column += 32) {
+        const int index = row * head_size + column;
+        const float updated = head_state[index] + row_delta * qkv[k_offset + column];
+        head_state[index] = updated;
+        query_dot += updated * qkv[q_offset + column];
     }
-    reduction[tid] = sum;
+    for (int offset = 16; offset; offset >>= 1)
+        query_dot += __shfl_down_sync(0xffffffffu, query_dot, offset);
+    if (lane == 0) output[row_index] = query_dot / sqrtf(static_cast<float>(head_size));
+}
+
+__global__ void qwen_recurrent_gdn_normalize(float *output, const float *gate,
+    const float *ssm_norm, int value_heads, int head_size, float norm_epsilon) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (head >= value_heads || tid >= head_size) return;
+    extern __shared__ float reduction[];
+    const int offset = head * head_size + tid;
+    reduction[tid] = output[offset] * output[offset];
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    for (int stride = head_size / 2; stride > 0; stride >>= 1) {
         if (tid < stride) reduction[tid] += reduction[tid + stride];
         __syncthreads();
     }
     const float inverse = 1.0f / sqrtf(reduction[0] / static_cast<float>(head_size) + norm_epsilon);
-    for (int row = tid; row < head_size; row += blockDim.x)
-        output[head * head_size + row] = head_output[row] * inverse * ssm_norm[row] *
-            qwen_silu(gate[head * head_size + row]);
+    output[offset] = output[offset] * inverse * ssm_norm[tid] * qwen_silu(gate[offset]);
 }
 
 __global__ void qwen_quantize_q8(const float *input, int8_t *output, int blocks) {
@@ -1459,13 +1526,20 @@ extern "C" int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *la
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        const size_t shared_bytes = static_cast<size_t>(layer->impl.head_size + 128) * sizeof(float);
-        qwen_recurrent_gdn_serial<<<layer->impl.value_heads, 128, shared_bytes, context->stream>>>(
+        qwen_recurrent_gdn_rows<<<layer->impl.value_heads * layer->impl.head_size,
+            32, sizeof(float), context->stream>>>(
             layer->impl.qkv_output, layer->impl.gate_output, layer->impl.alpha_output,
             layer->impl.beta_output, layer->impl.ssm_a, layer->impl.ssm_dt,
-            layer->impl.ssm_norm, layer->impl.gdn_state, layer->impl.gdn_output,
+            layer->impl.gdn_state, layer->impl.gdn_output,
             layer->impl.state_size, layer->impl.key_heads, layer->impl.value_heads,
-            layer->impl.head_size, layer->impl.norm_epsilon);
+            layer->impl.head_size);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
+            static_cast<size_t>(layer->impl.head_size) * sizeof(float), context->stream>>>(
+            layer->impl.gdn_output, layer->impl.gate_output, layer->impl.ssm_norm,
+            layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
@@ -1538,13 +1612,20 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_device(
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        const size_t shared_bytes = static_cast<size_t>(layer->impl.head_size + 128) * sizeof(float);
-        qwen_recurrent_gdn_serial<<<layer->impl.value_heads, 128, shared_bytes, context->stream>>>(
+        qwen_recurrent_gdn_rows<<<layer->impl.value_heads * layer->impl.head_size,
+            32, sizeof(float), context->stream>>>(
             layer->impl.qkv_output, layer->impl.gate_output, layer->impl.alpha_output,
             layer->impl.beta_output, layer->impl.ssm_a, layer->impl.ssm_dt,
-            layer->impl.ssm_norm, layer->impl.gdn_state, layer->impl.gdn_output,
+            layer->impl.gdn_state, layer->impl.gdn_output,
             layer->impl.state_size, layer->impl.key_heads, layer->impl.value_heads,
-            layer->impl.head_size, layer->impl.norm_epsilon);
+            layer->impl.head_size);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
+            static_cast<size_t>(layer->impl.head_size) * sizeof(float), context->stream>>>(
+            layer->impl.gdn_output, layer->impl.gate_output, layer->impl.ssm_norm,
+            layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {

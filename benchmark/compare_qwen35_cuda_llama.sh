@@ -66,13 +66,18 @@ for attempt in $(seq 1 120); do
     sleep 1
     if [[ "$attempt" == 120 ]]; then echo "llama-server did not become healthy" >&2; exit 1; fi
 done
-request=$(TOKEN_ID="$token_id" STEPS="$steps" ORACLE_PROBS="${FORTAI_LLAMA_ORACLE_PROBS:-0}" python3 - <<'PY'
+request=$(TOKEN_ID="$token_id" STEPS="$steps" ORACLE_PROBS="${FORTAI_LLAMA_ORACLE_PROBS:-0}" \
+ORACLE_TOP_K="${FORTAI_LLAMA_ORACLE_TOP_K:-0}" python3 - <<'PY'
 import json
 import os
 request = {"prompt": [int(os.environ["TOKEN_ID"])],
            "n_predict": int(os.environ["STEPS"]),
            "temperature": 0.0, "seed": 42}
-if os.environ["ORACLE_PROBS"] == "1":
+top_k = int(os.environ["ORACLE_TOP_K"])
+if top_k > 1:
+    request["n_probs"] = top_k
+    request["post_sampling_probs"] = False
+elif os.environ["ORACLE_PROBS"] == "1":
     request["n_probs"] = 1
     request["post_sampling_probs"] = True
 print(json.dumps(request))
@@ -91,6 +96,7 @@ if pgrep -x llama-server >/dev/null 2>&1; then echo "llama-server cleanup failed
 
 MODEL_PATH="$model_path" MODEL_SHA256="$model_sha256" TOKEN_ID="$token_id" STEPS="$steps" \
 CONTEXT="$context" DEVICE="$device" THREADS="$threads" COMMIT="$(git -C "$root_dir" rev-parse HEAD)" \
+ORACLE_TOP_K="${FORTAI_LLAMA_ORACLE_TOP_K:-0}" \
 FORTAI_LOG="$fortai_log" LLAMA_LOG="$llama_log" LLAMA_RESULT="$llama_result" RESULT_FILE="$result_file" \
 PATCH_DIGEST="$patch_digest" TREE_DIGEST="$tree_digest" WORKTREE_DIGEST="$worktree_digest" \
 LLAMA_SERVER="$llama_server" LLAMA_LIBRARY_DIR="$llama_library_dir" python3 - <<'PY'
@@ -124,6 +130,7 @@ result = {
     "cuda_device": int(os.environ["DEVICE"]),
     "omp_num_threads": int(os.environ["THREADS"]),
     "llama_server_cleanup": "verified",
+    "llama_oracle_top_k": int(os.environ.get("ORACLE_TOP_K", "0")),
     "fortai_log": os.environ["FORTAI_LOG"],
     "llama_log": os.environ["LLAMA_LOG"],
     "llama_server": os.environ["LLAMA_SERVER"],

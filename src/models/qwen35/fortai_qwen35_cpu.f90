@@ -409,17 +409,22 @@ contains
     subroutine setup_cuda_device_pipeline(self, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         type(status_t), intent(out) :: stat
-        integer :: i, graph_length
+        integer :: i, graph_length, pipeline_length
         integer(c_size_t) :: hidden_bytes
         character(len=8) :: graph_env
+        character(len=8) :: pipeline_env
 
         call stat%clear()
         self%cuda_device_pipeline = .false.
         self%cuda_graph_enabled = .false.
         self%cuda_graph_ready = .false.
+        call get_environment_variable('FORTAI_DISABLE_CUDA_DEVICE_PIPELINE', pipeline_env, length=pipeline_length)
+        if (pipeline_length > 0) then
+            if (pipeline_env(1:1) == '1') return
+        end if
         call get_environment_variable('FORTAI_ENABLE_CUDA_GRAPH', graph_env, length=graph_length)
         if (graph_length > 0) then
-            if (graph_env(1:graph_length) == '1') self%cuda_graph_enabled = .true.
+            if (graph_env(1:1) == '1') self%cuda_graph_enabled = .true.
         end if
         call get_environment_variable('FORTAI_DISABLE_CUDA_GRAPH', graph_env, length=graph_length)
         if (graph_length > 0) then
@@ -722,10 +727,6 @@ contains
                 end if
                 if (.not. stat % is_ok()) return
                 self % x = self % hidden_work + self % residual
-                if (self%cuda_device_pipeline .and. .not. self%layers(i)%recurrent) then
-                    call self%cuda%upload_real(self%cuda_x, self%x, stat)
-                    if (.not. stat%is_ok()) return
-                end if
             end do
         end if
 
