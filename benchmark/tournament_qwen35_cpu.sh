@@ -97,8 +97,10 @@ trap 'rm -f "$index_file"' EXIT
 
 for threads in $thread_list; do
     log_file="$log_dir/tournament_${base}_${threads}_${stamp}.log"
-    OMP_NUM_THREADS="$threads" OMP_PROC_BIND="${OMP_PROC_BIND:-spread}" \
-        OMP_PLACES="${OMP_PLACES:-cores}" FORTAI_NATIVE_FLAGS="$native_flags" \
+    OMP_NUM_THREADS="$threads" \
+        OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}" \
+        OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-${OMP_PLACES:-cores}}" \
+        FORTAI_NATIVE_FLAGS="$native_flags" \
         FORTAI_ALLOW_PROTECTED_GPU_SERVER=1 \
         LLAMA_PORT="$port" "$root_dir/benchmark/repeat_compare_qwen35_cpu.sh" \
         "$model_path" "$repeats" "$token_id" "$timing_steps" "$context" >"$log_file" 2>&1
@@ -125,8 +127,10 @@ PY
 
 oracle_log="$log_dir/tournament_oracle_${base}_${stamp}.log"
 oracle_file="$result_dir/tournament_oracle_${base}_${stamp}.json"
-OMP_NUM_THREADS="$best_thread" OMP_PROC_BIND="${OMP_PROC_BIND:-spread}" \
-    OMP_PLACES="${OMP_PLACES:-cores}" FORTAI_NATIVE_FLAGS="$native_flags" \
+OMP_NUM_THREADS="$best_thread" \
+    OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}" \
+    OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-${OMP_PLACES:-cores}}" \
+    FORTAI_NATIVE_FLAGS="$native_flags" \
     FORTAI_CORRECTNESS_FLAGS="$native_flags" LLAMA_PORT="$port" \
     FORTAI_ALLOW_PROTECTED_GPU_SERVER=1 \
     "$root_dir/benchmark/check_qwen35_cpu_logits.sh" "$model_path" "$token_id" \

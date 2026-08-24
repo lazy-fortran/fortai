@@ -80,8 +80,8 @@ if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$|:$((port + 1))$"
 fi
 
 export OMP_NUM_THREADS="$threads"
-export OMP_PROC_BIND="${OMP_PROC_BIND:-spread}"
-export OMP_PLACES="${OMP_PLACES:-cores}"
+export OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}"
+export OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-${OMP_PLACES:-cores}}"
 if [[ "$persistent_openmp" != 0 && "$persistent_openmp" != 1 ]]; then
     echo "FORTAI_ENABLE_PERSISTENT_OPENMP must be 0 or 1: $persistent_openmp" >&2
     exit 2

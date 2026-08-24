@@ -27,8 +27,9 @@ trap 'rm -f "$index_file"' EXIT
 
 for threads in $thread_list; do
     log_file="$log_dir/tune_${base}_${threads}_${stamp}.log"
-    OMP_NUM_THREADS="$threads" OMP_PROC_BIND="${OMP_PROC_BIND:-spread}" \
-        OMP_PLACES="${OMP_PLACES:-cores}" \
+    OMP_NUM_THREADS="$threads" \
+        OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}" \
+        OMP_PLACES="${FORTAI_LLAMA_OMP_PLACES:-${OMP_PLACES:-cores}}" \
         "$root_dir/benchmark/compare_qwen35_cpu_llama.sh" "$model_path" "$token_id" \
         "$steps" "$context" >"$log_file" 2>&1
     result_file=$(sed -n 's/^result=//p' "$log_file" | tail -n 1)
