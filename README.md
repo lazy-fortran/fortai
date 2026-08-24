@@ -64,6 +64,12 @@ benchmark/run_cpu_reference.sh
 # model-level CPU smoke/benchmark
 benchmark/run_qwen35_cpu.sh .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
 
+# llama.cpp ABI fast path (automatic when the resident library is available)
+FORTAI_LLAMA_FASTPATH=cpu benchmark/run_qwen35_cpu.sh MODEL.gguf
+FORTAI_LLAMA_FASTPATH=cuda benchmark/compare_qwen35_cuda_llama.sh MODEL.gguf
+# force the native Fortran/GGML fallback for diagnostics
+FORTAI_LLAMA_FASTPATH=native benchmark/run_qwen35_cpu.sh MODEL.gguf
+
 # fair short-decode comparison; FortAI and llama.cpp run sequentially
 OMP_NUM_THREADS=4 OMP_PROC_BIND=spread \
   benchmark/compare_qwen35_cpu_llama.sh \
@@ -131,20 +137,20 @@ and their provenance logic are tracked.
 ## Status
 
 Version 0.1.0 includes an experimental model-level Qwen3.5 CPU runtime for
-Q8_0 GGUF and a device-resident CUDA Qwen3.5 path. The CPU path is benchmarked
-against llama.cpp on the 0.8B, 2B, and 4B fixtures. The CUDA path has exact
-eight-token trace parity on all three fixtures and repeated model-level paired
-runs at effective llama.cpp throughput parity on the tested RTX 5060 Ti.
-CUDA Graph replay remains opt-in. Native mixed Q4/IQ tensors currently use the
-GGML CPU/CUDA kernels (including Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ3_S, and
-IQ4_XS), with two-device byte balancing for the Qwen3.8-27B base model. For
-an independent exact Q4_K_XL CUDA oracle smoke on the two GPUs, use
+Q8_0 GGUF and a device-resident CUDA Qwen3.5 path. Exact trace and centered
+top-logit parity are checked independently against llama.cpp (8-token traces
+and top-8 logits pass at 1e-2 tolerance on CPU and CUDA). The native mixed-
+quant fallback remains experimental: the earlier 2B Q4_K_M probe measured
+7.33 tok/s CPU versus 22.30 tok/s for llama.cpp at eight threads, and 76.9
+tok/s CUDA versus 213.2 tok/s at two threads. When the resident llama.cpp ABI
+library is available, the model runner automatically uses the same resident
+graph, repack kernels, and CPU threadpool as the comparison harness; set
+`FORTAI_LLAMA_FASTPATH=native` to measure the native fallback. Explicit
+`cpu`/`cuda` selections remain available for deployments that need to pin the
+backend.
+For an independent exact Q4_K_XL CUDA oracle smoke on the two GPUs, use
 `benchmark/run_q4_cuda_compat.sh`; it starts and cleans up its own private
-localhost server and delegates mixed-quant execution to upstream llama.cpp.
-Native FortAI performance is measured separately from that compatibility
-check. The native 27B smoke currently reproduces the eight-token llama.cpp
-CUDA trace (`11,353,2688,264,220,17,15,4514`) on the two RTX 5060 Ti cards.
-See [ROADMAP.md](ROADMAP.md).
+localhost server. See [ROADMAP.md](ROADMAP.md).
 
 FortAI will only promote a production candidate for a named workload after it
 matches or beats the fastest fair competing harness under the same conditions.

@@ -13,8 +13,9 @@ context="${4:-${FORTAI_CONTEXT:-128}}"
 device="${5:-${CUDA_DEVICE:-0}}"
 llama_visible_devices="${FORTAI_LLAMA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-$device}}"
 threads="${OMP_NUM_THREADS:-2}"
+parallel="${FORTAI_LLAMA_PARALLEL:-1}"
 llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"
-llama_library_dir="${LLAMA_LIBRARY_DIR:-/home/ert/.local/llama.cpp-b10430-cuda}"
+llama_library_dir="${LLAMA_LIBRARY_DIR:-/home/ert/.local/llama.cpp-b10566-cuda}"
 port="${LLAMA_PORT:-18092}"
 result_dir="$root_dir/benchmark/results"
 log_dir="$root_dir/benchmark/logs"
@@ -26,6 +27,10 @@ llama_log="$log_dir/compare_cuda_llama_${base}_${stamp}.log"
 result_file="$result_dir/compare_cuda_${base}_d${device}_${stamp}.json"
 
 if [[ ! -x "$llama_server" ]]; then echo "llama-server not found: $llama_server" >&2; exit 2; fi
+if [[ ! "$parallel" =~ ^[1-9][0-9]*$ ]]; then
+    echo "FORTAI_LLAMA_PARALLEL must be a positive integer: $parallel" >&2
+    exit 2
+fi
 if pgrep -x llama-server >/dev/null 2>&1; then
     echo "an existing llama-server is running; stop it before CUDA model benchmarking" >&2
     exit 2
@@ -58,7 +63,7 @@ if [[ -n "$llama_library_dir" ]]; then
     export LD_LIBRARY_PATH="$llama_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 CUDA_VISIBLE_DEVICES="$llama_visible_devices" "$llama_server" -m "$model_path" --host 127.0.0.1 \
-    --port "$port" -c "$context" -ngl 99 -t "$threads" -tb "$threads" --no-webui \
+    --port "$port" -c "$context" --parallel "$parallel" -ngl 99 -t "$threads" -tb "$threads" --no-webui \
     >"$llama_log" 2>&1 &
 server_pid=$!
 for attempt in $(seq 1 120); do
@@ -98,6 +103,7 @@ if pgrep -x llama-server >/dev/null 2>&1; then echo "llama-server cleanup failed
 MODEL_PATH="$model_path" MODEL_SHA256="$model_sha256" TOKEN_ID="$token_id" STEPS="$steps" \
 CONTEXT="$context" DEVICE="$device" THREADS="$threads" COMMIT="$(git -C "$root_dir" rev-parse HEAD)" \
 LLAMA_VISIBLE_DEVICES="$llama_visible_devices" \
+LLAMA_PARALLEL="$parallel" \
 ORACLE_TOP_K="${FORTAI_LLAMA_ORACLE_TOP_K:-0}" \
 FORTAI_LOG="$fortai_log" LLAMA_LOG="$llama_log" LLAMA_RESULT="$llama_result" RESULT_FILE="$result_file" \
 PATCH_DIGEST="$patch_digest" TREE_DIGEST="$tree_digest" WORKTREE_DIGEST="$worktree_digest" \
@@ -118,14 +124,18 @@ if int(values.get("steps", -1)) != int(os.environ["STEPS"]):
 if int(timings.get("predicted_n", -1)) != int(os.environ["STEPS"]):
     raise SystemExit("llama.cpp did not execute the requested step count")
 result = {
-    "scope": ("qwen35_model_host_controlled_cuda_q4_xl_ggml" if
+    "scope": ("qwen35_model_llama_cpp_abi_fastpath_cuda" if
+              values.get("backend") == "fortai-llama-cpp-fastpath" else
+              ("qwen35_model_host_controlled_cuda_q4_xl_ggml" if
               values.get("backend") == "fortai-cuda-host-q4-xl-ggml" else
               ("qwen35_model_device_resident_cuda_q8" if values.get("device_pipeline") == "T" else
-               "qwen35_model_host_controlled_cuda_q8")),
-    "production_gate": ("experimental_native_q4_xl_ggml" if
+               "qwen35_model_host_controlled_cuda_q8"))),
+    "production_gate": ("compatibility_llama_cpp_abi_fastpath" if
+                        values.get("backend") == "fortai-llama-cpp-fastpath" else
+                        ("experimental_native_q4_xl_ggml" if
                         values.get("backend") == "fortai-cuda-host-q4-xl-ggml" else
                         ("not_promoted_cuda_graph_or_full_parity" if values.get("device_pipeline") == "T" else
-                         "not_promoted_host_transfers")),
+                         "not_promoted_host_transfers"))),
     "fortai_commit": os.environ["COMMIT"],
     "fortai_patch_digest": os.environ["PATCH_DIGEST"],
     "fortai_tracked_tree_digest": os.environ["TREE_DIGEST"],
@@ -138,6 +148,7 @@ result = {
     "cuda_device": int(os.environ["DEVICE"]),
     "llama_visible_devices": os.environ["LLAMA_VISIBLE_DEVICES"],
     "omp_num_threads": int(os.environ["THREADS"]),
+    "llama_parallel": int(os.environ["LLAMA_PARALLEL"]),
     "llama_server_cleanup": "verified",
     "llama_oracle_top_k": int(os.environ.get("ORACLE_TOP_K", "0")),
     "fortai_log": os.environ["FORTAI_LOG"],

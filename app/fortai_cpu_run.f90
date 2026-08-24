@@ -91,6 +91,7 @@ program fortai_cpu_run
     forward_seconds = real(forward_end - forward_start, real32) / real(clock_rate, real32)
     elapsed = real(clock_end - clock_start, real32) / real(clock_rate, real32)
     tokens_per_second = real(steps, real32) / max(forward_seconds, 1.0e-6_real32)
+    if (model%fast_enabled) print '(a)', 'backend=fortai-llama-cpp-fastpath'
     print '(a,i0)', 'vocabulary=', model%vocabulary_size
     print '(a,i0)', 'layers=', model%layer_count
     print '(a,i0)', 'steps=', steps

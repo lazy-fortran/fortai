@@ -17,6 +17,7 @@ steps="${3:-${FORTAI_BENCH_STEPS:-8}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 oracle_top_k="${FORTAI_LLAMA_ORACLE_TOP_K:-0}"
 threads="${OMP_NUM_THREADS:-$(nproc)}"
+parallel="${FORTAI_LLAMA_PARALLEL:-1}"
 persistent_openmp="${FORTAI_ENABLE_PERSISTENT_OPENMP:-0}"
 llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"
 llama_library_dir="${LLAMA_LIBRARY_DIR:-}"
@@ -36,6 +37,10 @@ if [[ ! "$oracle_top_k" =~ ^[0-9]+$ ]]; then
 fi
 if [[ "$persistent_openmp" != 0 && "$persistent_openmp" != 1 ]]; then
     echo "FORTAI_ENABLE_PERSISTENT_OPENMP must be 0 or 1: $persistent_openmp" >&2
+    exit 2
+fi
+if [[ ! "$parallel" =~ ^[1-9][0-9]*$ ]]; then
+    echo "FORTAI_LLAMA_PARALLEL must be a positive integer: $parallel" >&2
     exit 2
 fi
 
@@ -158,7 +163,7 @@ if [[ -n "$llama_library_dir" ]]; then
 fi
 "$llama_server" -m "$model_path" --host 127.0.0.1 --port "$port" \
     -c "$context" -ngl 0 --device none --no-op-offload \
-    -t "$threads" -tb "$threads" --no-webui >"$llama_log" 2>&1 &
+    --parallel "$parallel" -t "$threads" -tb "$threads" --no-webui >"$llama_log" 2>&1 &
 server_pid=$!
 
 for attempt in $(seq 1 120); do
@@ -268,6 +273,7 @@ LLAMA_CLEANUP="verified" LLAMA_SERVER_PATH="$llama_server" \
 LLAMA_SERVER_SHA256="$llama_server_sha256" LLAMA_LIBRARY_DIR="$llama_library_dir" \
 LLAMA_LIBRARY_DIGEST="$llama_library_digest" CPU_MODEL="$cpu_model" \
 ONLINE_CPUS="$online_cpus" \
+LLAMA_PARALLEL="$parallel" \
 PROTECTED_GPU_SERVER_INDEPENDENT="$protected_gpu_server_independent" \
 PROTECTED_GPU_SERVER_PID="$protected_gpu_server_pid" \
 LLAMA_RECORD="$llama_record" LLAMA_PROCESS_PROVENANCE="$llama_process_provenance" \
@@ -319,6 +325,7 @@ result = {
     "protected_gpu_server_pid": int(os.environ["PROTECTED_GPU_SERVER_PID"])
     if os.environ["PROTECTED_GPU_SERVER_PID"] else None,
     "omp_num_threads": int(os.environ["OMP_NUM_THREADS"]),
+    "llama_parallel": int(os.environ["LLAMA_PARALLEL"]),
     "persistent_openmp": os.environ["FORTAI_ENABLE_PERSISTENT_OPENMP"] == "1",
     "model": os.environ["MODEL_PATH"],
     "model_sha256": hashlib.sha256(Path(os.environ["MODEL_PATH"]).read_bytes()).hexdigest(),

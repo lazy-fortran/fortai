@@ -22,6 +22,7 @@ typedef struct fortai_ggml_tensor fortai_ggml_tensor;
 typedef struct fortai_ggml_cgraph fortai_ggml_cgraph;
 typedef struct fortai_ggml_backend fortai_ggml_backend;
 typedef struct fortai_ggml_backend_buffer fortai_ggml_backend_buffer;
+typedef struct fortai_ggml_backend_buffer_type fortai_ggml_backend_buffer_type;
 typedef struct {
     size_t mem_size;
     void * mem_buffer;
@@ -36,7 +37,15 @@ typedef void (*fortai_ggml_build_fn)(fortai_ggml_cgraph *, fortai_ggml_tensor *)
 typedef fortai_ggml_backend * (*fortai_ggml_cpu_init_fn)(void);
 typedef void (*fortai_ggml_backend_free_fn)(fortai_ggml_backend *);
 typedef fortai_ggml_backend_buffer * (*fortai_ggml_alloc_ctx_fn)(fortai_ggml_context *, fortai_ggml_backend *);
+typedef fortai_ggml_backend_buffer * (*fortai_ggml_alloc_buft_fn)(
+    fortai_ggml_context *, fortai_ggml_backend_buffer_type *);
+typedef fortai_ggml_backend_buffer_type * (*fortai_ggml_repack_buft_fn)(void);
 typedef void (*fortai_ggml_buffer_free_fn)(fortai_ggml_backend_buffer *);
+typedef void (*fortai_ggml_buffer_usage_fn)(fortai_ggml_backend_buffer *, int);
+typedef int (*fortai_ggml_buffer_init_tensor_fn)(fortai_ggml_backend_buffer *, fortai_ggml_tensor *);
+typedef void (*fortai_ggml_log_callback)(int, const char *, void *);
+typedef void (*fortai_ggml_log_get_fn)(fortai_ggml_log_callback *, void **);
+typedef void (*fortai_ggml_log_set_fn)(fortai_ggml_log_callback, void *);
 typedef void (*fortai_ggml_tensor_set_fn)(fortai_ggml_tensor *, const void *, size_t, size_t);
 typedef void (*fortai_ggml_tensor_get_fn)(const fortai_ggml_tensor *, void *, size_t, size_t);
 typedef int (*fortai_ggml_compute_fn)(fortai_ggml_backend *, fortai_ggml_cgraph *);
@@ -51,6 +60,8 @@ typedef struct {
     fortai_ggml_context * context;
     fortai_ggml_backend * backend;
     fortai_ggml_backend_buffer * buffer;
+    fortai_ggml_backend_buffer * weight_buffer;
+    fortai_ggml_context * weight_context;
     fortai_ggml_tensor * weight;
     fortai_ggml_tensor * input;
     fortai_ggml_tensor * output;
@@ -73,6 +84,10 @@ typedef struct {
     fortai_ggml_context *context;
     fortai_ggml_backend *backend;
     fortai_ggml_backend_buffer *buffer;
+    fortai_ggml_backend_buffer *weight_buffer[FORTAI_GGML_GROUP_MAX];
+    fortai_ggml_backend_buffer *weight_repack_buffer;
+    fortai_ggml_backend_buffer *weight_plain_buffer;
+    fortai_ggml_context *weight_context;
     fortai_ggml_tensor *weight[FORTAI_GGML_GROUP_MAX];
     fortai_ggml_tensor *input;
     fortai_ggml_tensor *output[FORTAI_GGML_GROUP_MAX];
@@ -91,8 +106,30 @@ static int fortai_ggml_attempted;
 static void * fortai_ggml_cpu_handle;
 static int fortai_ggml_cpu_attempted;
 static fortai_ggml_backend *fortai_shared_cpu_backend;
+static fortai_ggml_log_callback fortai_previous_log_callback;
+static void *fortai_previous_log_user;
+static int fortai_log_filter_installed;
 
 static const char * fortai_dequant_name(int type, int64_t *block_width, size_t *block_bytes);
+
+static void fortai_ggml_log_filter(int level, const char *text, void *user) {
+    if (text != NULL && strstr(text, "repack tensor") != NULL) return;
+    if (fortai_previous_log_callback != NULL)
+        fortai_previous_log_callback(level, text, fortai_previous_log_user);
+    (void) user;
+}
+
+static void fortai_install_log_filter(void *base) {
+    if (fortai_log_filter_installed || base == NULL) return;
+    fortai_ggml_log_get_fn log_get =
+        (fortai_ggml_log_get_fn)dlsym(base, "ggml_log_get");
+    fortai_ggml_log_set_fn log_set =
+        (fortai_ggml_log_set_fn)dlsym(base, "ggml_log_set");
+    if (log_get == NULL || log_set == NULL) return;
+    log_get(&fortai_previous_log_callback, &fortai_previous_log_user);
+    log_set(fortai_ggml_log_filter, NULL);
+    fortai_log_filter_installed = 1;
+}
 
 static void * fortai_open_ggml(void) {
     if (fortai_ggml_attempted) return fortai_ggml_handle;
@@ -108,7 +145,10 @@ static void * fortai_open_ggml(void) {
     for (int i = 0; i < 4; ++i) {
         if (candidates[i] == NULL || candidates[i][0] == '\0') continue;
         fortai_ggml_handle = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
-        if (fortai_ggml_handle != NULL) return fortai_ggml_handle;
+        if (fortai_ggml_handle != NULL) {
+            fortai_install_log_filter(fortai_ggml_handle);
+            return fortai_ggml_handle;
+        }
     }
     return NULL;
 }
@@ -150,6 +190,24 @@ static fortai_ggml_backend *fortai_get_shared_cpu_backend(void *cpu) {
     return fortai_shared_cpu_backend;
 }
 
+static fortai_ggml_backend_buffer_type *fortai_get_repack_buft(void *cpu) {
+    if (cpu == NULL) return NULL;
+    /* The CPU extra-buffer entry point is C++ ABI-mangled in current GGML
+     * builds.  Keep this optional: older installations simply use the
+     * ordinary CPU buffer below. */
+    fortai_ggml_repack_buft_fn get_buft =
+        (fortai_ggml_repack_buft_fn)dlsym(cpu, "_Z35ggml_backend_cpu_repack_buffer_typev");
+    return get_buft == NULL ? NULL : get_buft();
+}
+
+static int fortai_repack_supported(int type, int64_t rows) {
+    /* The x86 repack backend currently supplies AVX2 kernels for Q4_K and
+     * IQ4_NL.  Q6_K remains on the regular vector-dot path on this machine;
+     * do not place an unsupported format in CPU_REPACK (its optional trait is
+     * null and the setter assumes it is present). */
+    return rows > 0 && rows % 8 == 0 && (type == 12 || type == 20);
+}
+
 static int fortai_cpu_plan_make(int type, const void * weights, size_t weight_bytes,
     int64_t rows, int64_t width, fortai_ggml_cpu_plan * plan) {
     void * base = fortai_open_ggml();
@@ -165,6 +223,8 @@ static int fortai_cpu_plan_make(int type, const void * weights, size_t weight_by
     fortai_ggml_build_fn build = (fortai_ggml_build_fn)dlsym(base, "ggml_build_forward_expand");
     fortai_ggml_alloc_ctx_fn alloc_ctx =
         (fortai_ggml_alloc_ctx_fn)dlsym(base, "ggml_backend_alloc_ctx_tensors");
+    fortai_ggml_alloc_buft_fn alloc_buft =
+        (fortai_ggml_alloc_buft_fn)dlsym(base, "ggml_backend_alloc_ctx_tensors_from_buft");
     fortai_ggml_tensor_set_fn tensor_set =
         (fortai_ggml_tensor_set_fn)dlsym(base, "ggml_backend_tensor_set");
     if (init == NULL || free_ctx == NULL || new_tensor == NULL || mul_mat == NULL ||
@@ -172,8 +232,9 @@ static int fortai_cpu_plan_make(int type, const void * weights, size_t weight_by
         tensor_set == NULL) return 1;
     fortai_ggml_init_params params = { 2u * 1024u * 1024u, NULL, true };
     plan->context = init(params);
-    if (plan->context == NULL) return 1;
-    plan->weight = new_tensor(plan->context, type, width, rows);
+    plan->weight_context = init(params);
+    if (plan->context == NULL || plan->weight_context == NULL) return 1;
+    plan->weight = new_tensor(plan->weight_context, type, width, rows);
     plan->input = new_tensor(plan->context, 0, width, 1);
     plan->output = plan->weight == NULL || plan->input == NULL ? NULL :
         mul_mat(plan->context, plan->weight, plan->input);
@@ -181,17 +242,31 @@ static int fortai_cpu_plan_make(int type, const void * weights, size_t weight_by
     if (plan->graph != NULL) build(plan->graph, plan->output);
     plan->backend = fortai_get_shared_cpu_backend(cpu);
     plan->buffer = plan->backend == NULL ? NULL : alloc_ctx(plan->context, plan->backend);
+    fortai_ggml_backend_buffer_type *repack_buft = fortai_get_repack_buft(cpu);
+    plan->weight_buffer = repack_buft != NULL && alloc_buft != NULL &&
+        fortai_repack_supported(type, rows)
+        ? alloc_buft(plan->weight_context, repack_buft) :
+        (plan->backend == NULL ? NULL : alloc_ctx(plan->weight_context, plan->backend));
     if (plan->buffer == NULL || plan->weight == NULL || plan->input == NULL ||
-        plan->output == NULL || plan->graph == NULL) {
+        plan->output == NULL || plan->graph == NULL || plan->weight_buffer == NULL) {
+        fortai_ggml_buffer_free_fn buffer_free =
+            (fortai_ggml_buffer_free_fn)dlsym(base, "ggml_backend_buffer_free");
         if (plan->buffer != NULL) {
-            fortai_ggml_buffer_free_fn buffer_free =
-                (fortai_ggml_buffer_free_fn)dlsym(base, "ggml_backend_buffer_free");
             if (buffer_free != NULL) buffer_free(plan->buffer);
         }
+        if (plan->weight_buffer != NULL && buffer_free != NULL) buffer_free(plan->weight_buffer);
         free_ctx(plan->context);
+        free_ctx(plan->weight_context);
         memset(plan, 0, sizeof(*plan));
         return 1;
     }
+    fortai_ggml_buffer_usage_fn set_usage =
+        (fortai_ggml_buffer_usage_fn)dlsym(base, "ggml_backend_buffer_set_usage");
+    fortai_ggml_buffer_init_tensor_fn init_tensor =
+        (fortai_ggml_buffer_init_tensor_fn)dlsym(base, "ggml_backend_buffer_init_tensor");
+    if (set_usage != NULL) set_usage(plan->buffer, 1);
+    if (set_usage != NULL) set_usage(plan->weight_buffer, 1);
+    if (init_tensor != NULL) init_tensor(plan->weight_buffer, plan->weight);
     tensor_set(plan->weight, weights, 0, weight_bytes);
     plan->type = type;
     plan->rows = rows;
@@ -255,6 +330,8 @@ static int fortai_cpu_group_plan_make(int count, const int *types,
         (fortai_ggml_build_fn)dlsym(base, "ggml_build_forward_expand");
     fortai_ggml_alloc_ctx_fn alloc_ctx =
         (fortai_ggml_alloc_ctx_fn)dlsym(base, "ggml_backend_alloc_ctx_tensors");
+    fortai_ggml_alloc_buft_fn alloc_buft =
+        (fortai_ggml_alloc_buft_fn)dlsym(base, "ggml_backend_alloc_ctx_tensors_from_buft");
     fortai_ggml_backend_free_fn backend_free =
         (fortai_ggml_backend_free_fn)dlsym(base, "ggml_backend_free");
     fortai_ggml_buffer_free_fn buffer_free =
@@ -267,10 +344,11 @@ static int fortai_cpu_group_plan_make(int count, const int *types,
 
     fortai_ggml_init_params params = { 2u * 1024u * 1024u, NULL, true };
     plan->context = init(params);
-    if (plan->context == NULL) return 1;
+    plan->weight_context = init(params);
+    if (plan->context == NULL || plan->weight_context == NULL) return 1;
     plan->input = new_tensor(plan->context, 0, width, 1);
     for (int i = 0; i < count; ++i) {
-        plan->weight[i] = new_tensor(plan->context, types[i], width, rows[i]);
+        plan->weight[i] = new_tensor(plan->weight_context, types[i], width, rows[i]);
         plan->output[i] = plan->weight[i] == NULL || plan->input == NULL ? NULL :
             mul_mat(plan->context, plan->weight[i], plan->input);
     }
@@ -281,16 +359,53 @@ static int fortai_cpu_group_plan_make(int count, const int *types,
     }
     plan->backend = fortai_get_shared_cpu_backend(cpu);
     plan->buffer = plan->backend == NULL ? NULL : alloc_ctx(plan->context, plan->backend);
-    if (plan->buffer == NULL || plan->input == NULL || plan->graph == NULL) {
+    fortai_ggml_backend_buffer_type *repack_buft = fortai_get_repack_buft(cpu);
+    if (plan->backend != NULL) {
+        int need_repack = 0;
+        int need_plain = 0;
+        for (int i = 0; i < count; ++i) {
+            if (repack_buft != NULL && alloc_buft != NULL && fortai_repack_supported(types[i], rows[i]))
+                need_repack = 1;
+            else
+                need_plain = 1;
+        }
+        if (need_repack) plan->weight_repack_buffer = alloc_buft(plan->weight_context, repack_buft);
+        if (need_plain) plan->weight_plain_buffer = alloc_ctx(plan->weight_context, plan->backend);
+        for (int i = 0; i < count; ++i)
+            plan->weight_buffer[i] = (repack_buft != NULL && alloc_buft != NULL &&
+                fortai_repack_supported(types[i], rows[i]))
+                ? plan->weight_repack_buffer : plan->weight_plain_buffer;
+    }
+    int buffers_ready = plan->backend != NULL;
+    if (plan->weight_repack_buffer == NULL && plan->weight_plain_buffer == NULL) buffers_ready = 0;
+    for (int i = 0; i < count; ++i) if (plan->weight_buffer[i] == NULL) buffers_ready = 0;
+    if (plan->buffer == NULL || !buffers_ready || plan->input == NULL || plan->graph == NULL) {
         if (plan->buffer != NULL) buffer_free(plan->buffer);
+        if (plan->weight_repack_buffer != NULL) buffer_free(plan->weight_repack_buffer);
+        if (plan->weight_plain_buffer != NULL) buffer_free(plan->weight_plain_buffer);
         free_ctx(plan->context);
+        free_ctx(plan->weight_context);
         memset(plan, 0, sizeof(*plan));
         return 1;
     }
+    fortai_ggml_buffer_usage_fn set_usage =
+        (fortai_ggml_buffer_usage_fn)dlsym(base, "ggml_backend_buffer_set_usage");
+    fortai_ggml_buffer_init_tensor_fn init_tensor =
+        (fortai_ggml_buffer_init_tensor_fn)dlsym(base, "ggml_backend_buffer_init_tensor");
+    if (set_usage != NULL) set_usage(plan->buffer, 1);
+    if (set_usage != NULL && plan->weight_repack_buffer != NULL)
+        set_usage(plan->weight_repack_buffer, 1);
+    if (set_usage != NULL && plan->weight_plain_buffer != NULL)
+        set_usage(plan->weight_plain_buffer, 1);
+    for (int i = 0; i < count; ++i)
+        if (init_tensor != NULL) init_tensor(plan->weight_buffer[i], plan->weight[i]);
     for (int i = 0; i < count; ++i) {
         if (plan->weight[i] == NULL || plan->output[i] == NULL) {
             buffer_free(plan->buffer);
+            if (plan->weight_repack_buffer != NULL) buffer_free(plan->weight_repack_buffer);
+            if (plan->weight_plain_buffer != NULL) buffer_free(plan->weight_plain_buffer);
             free_ctx(plan->context);
+            free_ctx(plan->weight_context);
             memset(plan, 0, sizeof(*plan));
             return 1;
         }
@@ -403,6 +518,8 @@ int fortai_ggml_quant_matvec_triplet(int first_type, const void *first_weights,
 }
 
 void fortai_ggml_quant_cache_clear(void) {
+    if (fortai_cpu_plan_count == 0 && fortai_cpu_group_plan_count == 0 &&
+        fortai_shared_cpu_backend == NULL) return;
     void * base = fortai_open_ggml();
     if (base == NULL) return;
     fortai_ggml_buffer_free_fn buffer_free =
@@ -413,14 +530,26 @@ void fortai_ggml_quant_cache_clear(void) {
     for (size_t i = 0; i < fortai_cpu_plan_count; ++i) {
         if (buffer_free != NULL && fortai_cpu_plans[i].buffer != NULL)
             buffer_free(fortai_cpu_plans[i].buffer);
+        if (buffer_free != NULL && fortai_cpu_plans[i].weight_buffer != NULL)
+            buffer_free(fortai_cpu_plans[i].weight_buffer);
         if (free_ctx != NULL && fortai_cpu_plans[i].context != NULL)
             free_ctx(fortai_cpu_plans[i].context);
+        if (free_ctx != NULL && fortai_cpu_plans[i].weight_context != NULL)
+            free_ctx(fortai_cpu_plans[i].weight_context);
     }
     for (size_t i = 0; i < fortai_cpu_group_plan_count; ++i) {
         if (buffer_free != NULL && fortai_cpu_group_plans[i].buffer != NULL)
             buffer_free(fortai_cpu_group_plans[i].buffer);
+        if (buffer_free != NULL) {
+            if (fortai_cpu_group_plans[i].weight_repack_buffer != NULL)
+                buffer_free(fortai_cpu_group_plans[i].weight_repack_buffer);
+            if (fortai_cpu_group_plans[i].weight_plain_buffer != NULL)
+                buffer_free(fortai_cpu_group_plans[i].weight_plain_buffer);
+        }
         if (free_ctx != NULL && fortai_cpu_group_plans[i].context != NULL)
             free_ctx(fortai_cpu_group_plans[i].context);
+        if (free_ctx != NULL && fortai_cpu_group_plans[i].weight_context != NULL)
+            free_ctx(fortai_cpu_group_plans[i].weight_context);
     }
     if (backend_free != NULL && fortai_shared_cpu_backend != NULL)
         backend_free(fortai_shared_cpu_backend);

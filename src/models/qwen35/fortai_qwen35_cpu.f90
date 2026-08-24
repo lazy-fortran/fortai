@@ -1,6 +1,6 @@
 module fortai_qwen35_cpu
-    use, intrinsic :: iso_c_binding, only: c_associated, c_float, c_int, c_int16_t, c_int64_t, c_int8_t, &
-        c_null_ptr, c_ptr, c_size_t
+    use, intrinsic :: iso_c_binding, only: c_associated, c_char, c_float, c_int, c_int16_t, c_int64_t, c_int8_t, &
+        c_null_char, c_null_ptr, c_ptr, c_size_t
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
     use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, &
         cuda_q8_ffn_host, cuda_q8_ffn_device, cuda_q8_matvec_host_pair, &
@@ -67,6 +67,40 @@ module fortai_qwen35_cpu
             real(c_float), intent(in) :: right(*)
             integer(c_int64_t), value, intent(in) :: count
         end subroutine fortai_silu_product
+
+        integer(c_int) function fortai_llama_fast_available() bind(C, name='fortai_llama_fast_available')
+            import c_int
+        end function fortai_llama_fast_available
+
+        integer(c_int) function fortai_llama_fast_context_create(path, context_size, threads, gpu_layers, &
+                main_gpu, handle, vocab, layers) bind(C, name='fortai_llama_fast_context_create')
+            import c_char, c_int, c_ptr
+            character(kind=c_char), intent(in) :: path(*)
+            integer(c_int), value, intent(in) :: context_size, threads, gpu_layers, main_gpu
+            type(c_ptr), intent(out) :: handle
+            integer(c_int), intent(out) :: vocab, layers
+        end function fortai_llama_fast_context_create
+
+        integer(c_int) function fortai_llama_fast_context_decode(handle, token, position, logits, count) &
+                bind(C, name='fortai_llama_fast_context_decode')
+            import c_float, c_int, c_ptr, c_size_t
+            type(c_ptr), value, intent(in) :: handle
+            integer(c_int), value, intent(in) :: token, position
+            real(c_float), intent(out) :: logits(*)
+            integer(c_size_t), value, intent(in) :: count
+        end function fortai_llama_fast_context_decode
+
+        integer(c_int) function fortai_llama_fast_context_reset(handle) &
+                bind(C, name='fortai_llama_fast_context_reset')
+            import c_int, c_ptr
+            type(c_ptr), value, intent(in) :: handle
+        end function fortai_llama_fast_context_reset
+
+        integer(c_int) function fortai_llama_fast_context_destroy(handle) &
+                bind(C, name='fortai_llama_fast_context_destroy')
+            import c_int, c_ptr
+            type(c_ptr), value, intent(in) :: handle
+        end function fortai_llama_fast_context_destroy
     end interface
 
     type :: qwen35_cpu_layer_t
@@ -159,10 +193,14 @@ module fortai_qwen35_cpu
         type(c_ptr) :: cuda_hidden = c_null_ptr
         type(c_ptr) :: cuda_output_norm = c_null_ptr
         type(c_ptr) :: cuda_logits = c_null_ptr
+        type(c_ptr) :: fast_handle = c_null_ptr
+        character(len=:), allocatable :: model_path
         logical :: cuda_enabled = .false.
         logical :: cuda_device_pipeline = .false.
         logical :: cuda_graph_enabled = .false.
         logical :: cuda_graph_ready = .false.
+        logical :: fast_enabled = .false.
+        logical :: fast_gpu = .false.
         logical :: persistent_openmp = .false.
         logical :: persistent_openmp_active = .false.
     contains
@@ -189,6 +227,19 @@ contains
         integer :: work_size
 
         call self % close()
+        self%model_path = trim(path)
+        self%max_context = 256_int64
+        if (present(max_context)) self%max_context = max_context
+        self%persistent_openmp = .false.
+        if (fast_path_mode() == 1 .or. fast_path_mode() == 3) then
+            call fast_context_create(self, 0, 0, stat)
+            if (stat%is_ok()) then
+                self%fast_gpu = .false.
+                return
+            end if
+            call stat%clear()
+            call fast_context_destroy(self)
+        end if
         call self % file % open(path, stat)
         if (.not. stat % is_ok()) return
 
@@ -334,6 +385,18 @@ contains
         logical :: have_q4
 
         call stat%clear()
+        call fast_context_destroy(self)
+        self%fast_gpu = .false.
+        if (fast_path_mode() == 2 .or. fast_path_mode() == 3) then
+            call fast_context_create(self, -1, device, stat)
+            if (stat%is_ok()) then
+                self%fast_gpu = .true.
+                self%cuda_enabled = .false.
+                return
+            end if
+            call stat%clear()
+            call fast_context_destroy(self)
+        end if
         if (.not. allocated(self%file%tensors)) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA model is not open')
             return
@@ -642,6 +705,8 @@ contains
         integer :: i
         type(status_t) :: cuda_stat
 
+        call fast_context_destroy(self)
+        self%fast_gpu = .false.
         call cuda_device_pipeline_cleanup(self, cuda_stat)
         if (allocated(self%cuda_weights)) then
             if (allocated(self%layers)) then
@@ -700,6 +765,7 @@ contains
         if (allocated(self % quantized_input)) deallocate (self % quantized_input)
         if (allocated(self % quantized_scales)) deallocate (self % quantized_scales)
         call self % file % close()
+        if (allocated(self%model_path)) deallocate(self%model_path)
         self % hidden_size = 0
         self % vocabulary_size = 0
         self % layer_count = 0
@@ -712,6 +778,7 @@ contains
         integer :: i
         type(status_t) :: cuda_stat
 
+        if (self%fast_enabled) call fast_context_reset(self)
         if (allocated(self % x)) self % x = 0.0_real32
         if (allocated(self % layers)) then
             do i = 1, size(self % layers)
@@ -731,7 +798,9 @@ contains
         real(real32), contiguous, intent(out) :: logits(:)
         type(status_t), intent(out) :: stat
 
-        if (self%persistent_openmp .and. .not. self%cuda_device_pipeline) then
+        if (self%fast_enabled) then
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat)
+        else if (self%persistent_openmp .and. .not. self%cuda_device_pipeline) then
             self%persistent_openmp_active = .true.
             !$omp parallel default(none) shared(self, token_id, position, logits, stat)
             !$omp single
@@ -753,7 +822,8 @@ contains
         logical :: capture_graph
 
         call stat % clear()
-        if (.not. allocated(self % x) .or. size(logits) /= self % vocabulary_size) then
+        if ((.not. self%fast_enabled .and. .not. allocated(self % x)) .or. &
+            size(logits) /= self % vocabulary_size) then
             call stat % set(FORTAI_INVALID, 'Qwen3.5 CPU model is not open')
             return
         end if
@@ -763,6 +833,13 @@ contains
         end if
         if (position < 0_int64 .or. position >= self % max_context) then
             call stat % set(FORTAI_INVALID, 'Qwen3.5 position exceeds the CPU context')
+            return
+        end if
+        if (self%fast_enabled) then
+            if (fortai_llama_fast_context_decode(self%fast_handle, int(token_id, c_int), &
+                    int(position, c_int), logits, int(size(logits), c_size_t)) /= 0_c_int) then
+                call stat%set(FORTAI_UNSUPPORTED, 'llama.cpp fast path decode failed')
+            end if
             return
         end if
         if (self%cuda_device_pipeline) then
@@ -861,6 +938,93 @@ contains
         if (.not. stat % is_ok()) return
         call model_matvec(self, self % output, self % normalized, logits, stat)
     end subroutine qwen35_cpu_forward_body
+
+    integer function fast_path_mode()
+        character(len=16) :: value
+        integer :: length
+
+        ! Prefer the resident llama.cpp graph when it is available.  The
+        ! native Fortran/GGML implementation remains an automatic fallback;
+        ! callers can force it with FORTAI_LLAMA_FASTPATH=native|0.
+        fast_path_mode = 3
+        value = ''
+        call get_environment_variable('FORTAI_LLAMA_FASTPATH', value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) length = len(value)
+        select case (trim(value(1:length)))
+        case ('0', 'native', 'off', 'none')
+            fast_path_mode = 0
+        case ('1', 'auto')
+            fast_path_mode = 3
+        case ('cpu')
+            fast_path_mode = 1
+        case ('cuda', 'gpu')
+            fast_path_mode = 2
+        end select
+    end function fast_path_mode
+
+    subroutine fast_context_create(self, gpu_layers, main_gpu, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: gpu_layers, main_gpu
+        type(status_t), intent(out) :: stat
+        character(len=32) :: thread_text
+        character(kind=c_char), allocatable :: cpath(:)
+        integer :: length, i, threads, ios
+        integer(c_int) :: code, vocabulary, layers
+
+        call stat%clear()
+        call fast_context_destroy(self)
+        if (.not. allocated(self%model_path) .or. len_trim(self%model_path) == 0) then
+            call stat%set(FORTAI_UNSUPPORTED, 'llama.cpp fast path has no model path')
+            return
+        end if
+        if (fortai_llama_fast_available() == 0_c_int) then
+            call stat%set(FORTAI_UNSUPPORTED, 'llama.cpp fast path library is unavailable')
+            return
+        end if
+        threads = 1
+        thread_text = ''
+        call get_environment_variable('OMP_NUM_THREADS', thread_text, length=length)
+        if (length > 0) then
+            read (thread_text(1:min(length, len(thread_text))), *, iostat=ios) threads
+            if (ios /= 0 .or. threads <= 0) threads = 1
+        end if
+        length = len_trim(self%model_path)
+        allocate(cpath(length + 1))
+        do i = 1, length
+            cpath(i) = self%model_path(i:i)
+        end do
+        cpath(length + 1) = c_null_char
+        code = fortai_llama_fast_context_create(cpath, int(self%max_context, c_int), int(threads, c_int), &
+            int(gpu_layers, c_int), int(main_gpu, c_int), self%fast_handle, vocabulary, layers)
+        deallocate(cpath)
+        if (code /= 0_c_int) then
+            self%fast_handle = c_null_ptr
+            call stat%set(FORTAI_UNSUPPORTED, 'llama.cpp fast path context creation failed')
+            return
+        end if
+        self%vocabulary_size = int(vocabulary, int32)
+        self%layer_count = int(layers, int32)
+        self%fast_enabled = .true.
+    end subroutine fast_context_create
+
+    subroutine fast_context_destroy(self)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(c_int) :: code
+
+        if (c_associated(self%fast_handle)) then
+            code = fortai_llama_fast_context_destroy(self%fast_handle)
+            self%fast_handle = c_null_ptr
+        end if
+        self%fast_enabled = .false.
+    end subroutine fast_context_destroy
+
+    subroutine fast_context_reset(self)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(c_int) :: code
+
+        if (c_associated(self%fast_handle)) code = fortai_llama_fast_context_reset(self%fast_handle)
+    end subroutine fast_context_reset
 
     subroutine enable_persistent_openmp(self)
         class(qwen35_cpu_model_t), intent(inout) :: self

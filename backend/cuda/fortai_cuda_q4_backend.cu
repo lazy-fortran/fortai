@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <ggml.h>
+#include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
 #include <ggml-cuda.h>
@@ -78,7 +79,7 @@ struct fortai_cuda_q4_weights {
     ggml_tensor * activation = nullptr;
     ggml_tensor * output = nullptr;
     ggml_cgraph * graph = nullptr;
-    ggml_backend_sched_t scheduler = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
     size_t output_bytes = 0;
 };
 
@@ -148,12 +149,12 @@ int fortai_cuda_q4_weights_upload(fortai_cuda_q4_context * context, int value_ty
         return FORTAI_CUDA_INVALID;
     }
     ggml_build_forward_expand(created->graph, created->output);
-    ggml_backend_t backends[] = {context->devices[device], context->cpu};
-    created->scheduler = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
-    if (created->scheduler == nullptr || !ggml_backend_sched_alloc_graph(created->scheduler, created->graph)) {
+    created->buffer = ggml_backend_alloc_ctx_tensors(created->graph_context, created->backend);
+    if (created->buffer == nullptr) {
         fortai_cuda_q4_weights_destroy(created);
         return FORTAI_CUDA_RUNTIME_ERROR;
     }
+    ggml_backend_buffer_set_usage(created->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     /* Queue model uploads on each device and synchronize once after the full
      * tensor set is built.  The previous per-tensor synchronous copy made
      * large UD-Q4_K_XL model open time scale with the tensor count. */
@@ -173,7 +174,7 @@ int fortai_cuda_q4_context_synchronize(fortai_cuda_q4_context *context) {
 
 int fortai_cuda_q4_weights_destroy(fortai_cuda_q4_weights * weights) {
     if (weights == nullptr) return FORTAI_CUDA_OK;
-    if (weights->scheduler != nullptr) ggml_backend_sched_free(weights->scheduler);
+    if (weights->buffer != nullptr) ggml_backend_buffer_free(weights->buffer);
     if (weights->graph_context != nullptr) ggml_free(weights->graph_context);
     delete weights;
     return FORTAI_CUDA_OK;
@@ -210,8 +211,8 @@ static int fortai_cuda_q4_matvec_host_group(fortai_cuda_q4_context *context,
         if (member_count == 1) {
             ggml_backend_tensor_set_async(weight->backend, weight->activation,
                 host_activation, 0, activation_bytes);
-            enum ggml_status status = ggml_backend_sched_graph_compute_async(
-                weight->scheduler, weight->graph);
+            enum ggml_status status = ggml_backend_graph_compute_async(
+                weight->backend, weight->graph);
             if (status != GGML_STATUS_SUCCESS) return fail(context);
             ggml_backend_tensor_get_async(weight->backend, weight->output,
                 host_outputs[i], 0, output_bytes[i]);
