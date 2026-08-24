@@ -95,7 +95,8 @@ int fortai_cuda_q4_context_create(int first_device, int second_device,
     if (created == nullptr) return FORTAI_CUDA_RUNTIME_ERROR;
     fortai_quiet_log_acquire();
     created->devices[0] = ggml_backend_cuda_init(first_device);
-    created->devices[1] = ggml_backend_cuda_init(second_device);
+    created->devices[1] = second_device == first_device ? created->devices[0] :
+        ggml_backend_cuda_init(second_device);
     created->cpu = ggml_backend_cpu_init();
     if (created->devices[0] == nullptr || created->devices[1] == nullptr || created->cpu == nullptr) {
         fortai_cuda_q4_context_destroy(created);
@@ -108,7 +109,8 @@ int fortai_cuda_q4_context_create(int first_device, int second_device,
 int fortai_cuda_q4_context_destroy(fortai_cuda_q4_context * context) {
     if (context == nullptr) return FORTAI_CUDA_OK;
     if (context->devices[0] != nullptr) ggml_backend_free(context->devices[0]);
-    if (context->devices[1] != nullptr) ggml_backend_free(context->devices[1]);
+    if (context->devices[1] != nullptr && context->devices[1] != context->devices[0])
+        ggml_backend_free(context->devices[1]);
     if (context->cpu != nullptr) ggml_backend_free(context->cpu);
     delete context;
     fortai_quiet_log_release();
