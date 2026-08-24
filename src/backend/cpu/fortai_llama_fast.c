@@ -306,11 +306,17 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     context_params.n_outputs_max_per_seq = 1;
     context_params.n_threads = threads;
     context_params.n_threads_batch = threads;
-    /* Match the CPU harness when the model is CPU-only.  GPU contexts keep
-     * llama.cpp's default KQV/elementary-op offload, as does the CUDA server;
-     * disabling it would silently route attention through host memory. */
-    context_params.offload_kqv = gpu_layers == 0 ? false : true;
+    /* Match llama-server's defaults: KV/KQV offload remains enabled even for
+     * CPU-only contexts, while the comparison harness explicitly disables
+     * generic host-op offload below.  The CPU backend keeps these tensors on
+     * host memory, but the flag still selects the same graph construction and
+     * memory path as the reference server. */
+    context_params.offload_kqv = true;
     context_params.op_offload = gpu_layers == 0 ? false : true;
+    /* llama-server leaves the recurrent sliding-window cache compact unless
+     * --swa-full is explicitly requested.  The public context default is the
+     * opposite, so set this explicitly to keep the graph identical. */
+    context_params.swa_full = false;
     context_params.kv_unified = false;
     handle->model = handle->api.model_load(path, model_params);
     if (handle->model != NULL)
