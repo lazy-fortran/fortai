@@ -70,12 +70,11 @@ CPU thread count, and Q8_0 GGUF for both programs. It always terminates the
 temporary server. Results are evidence, not promotion: a slower FortAI result
 is explicitly retained as experimental.
 
-FortAI times every requested model forward. llama.cpp's generation rate omits
-the prompt forward because its first generated token is free, so that raw rate
-is not directly comparable. The result therefore validates an uncached
-one-token prompt and records `matched_forward` over the prompt forward plus
-the remaining generated-token forwards. CPU repeat and tuning summaries use
-only this matched rate.
+llama.cpp's generation rate omits the prompt forward because its first
+generated token is free, so the comparison runner evaluates the uncached
+one-token prompt before the timed loop on both sides. `matched_forward` now
+reports exactly the requested generated-token forwards after that prompt;
+CPU repeat and tuning summaries use this generated-only rate.
 
 The comparison is strictly CPU-only. The installed llama-server links
 libggml-cuda, so `-ngl 0 --device none` alone still lets the CUDA backend

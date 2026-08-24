@@ -9,14 +9,17 @@ program fortai_cuda_run
     real(real32), allocatable :: logits(:), ranked_logits(:)
     character(len=512) :: model_path, argument
     integer(int64) :: token, steps, context, position, next_token
+    integer(int64) :: first_position, last_position
     integer :: clock_start, clock_end, clock_rate, max_index, ios, device, trace_length
     integer :: disable_cuda_length
     integer :: sample_start, sample_end, top_count, trace_top_length, trace_top_ios, rank, top_index
     integer :: load_start, load_end, forward_start, forward_end
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
     character(len=16) :: trace_tokens, trace_top_tokens
-    logical :: trace_enabled, disable_cuda
+    logical :: trace_enabled, disable_cuda, exclude_prompt
     character(len=8) :: disable_cuda_env
+    character(len=16) :: exclude_prompt_text
+    integer :: exclude_prompt_length
     real(real32) :: maximum_logit
 
     call get_command_argument(1, model_path)
@@ -68,16 +71,47 @@ program fortai_cuda_run
     call system_clock(load_end)
     allocate (logits(model%vocabulary_size))
     if (top_count > 0) allocate (ranked_logits(model%vocabulary_size))
+    call get_environment_variable('FORTAI_EXCLUDE_PROMPT', exclude_prompt_text, &
+        length=exclude_prompt_length)
+    exclude_prompt = exclude_prompt_length > 0 .and. &
+        exclude_prompt_text(1:exclude_prompt_length) == '1'
+    first_position = 0_int64
+    last_position = steps - 1_int64
+    if (exclude_prompt) then
+        call model%forward(token, 0_int64, logits, stat)
+        if (.not. stat%is_ok()) then
+            print '(a)', 'FortAI prompt forward failed: ' // stat%message
+            error stop 1
+        end if
+        max_index = maxloc(logits, dim=1)
+        token = int(max_index - 1, int64)
+        if (trace_enabled) print '(a,i0,a,i0)', 'token[', 0, ']=', token
+        if (top_count > 0) then
+            ranked_logits = logits
+            maximum_logit = maxval(logits)
+            do rank = 1, top_count
+                top_index = maxloc(ranked_logits, dim=1)
+                print '(a,i0,a,i0,a,i0,a,es16.8)', 'top_logit[', 0, ',', rank, &
+                    ']=', top_index - 1, ',', ranked_logits(top_index) - maximum_logit
+                ranked_logits(top_index) = -huge(0.0_real32)
+            end do
+        end if
+        first_position = 1_int64
+        last_position = steps
+    end if
     checksum = 0.0_real32
     sample_seconds = 0.0_real32
     call system_clock(forward_start)
-    do position = 0_int64, steps - 1_int64
+    do position = first_position, last_position
         call model%forward(token, position, logits, stat)
         if (.not. stat%is_ok()) then
             print '(a)', 'FortAI CUDA forward failed: ' // stat%message
             error stop 1
         end if
         checksum = checksum + sum(logits)
+        ! Keep the final decode in the generated-token timing scope, but
+        ! match llama.cpp's completion output length.
+        if (exclude_prompt .and. position == steps) cycle
         call system_clock(sample_start)
         max_index = maxloc(logits, dim=1)
         call system_clock(sample_end)
@@ -124,4 +158,5 @@ program fortai_cuda_run
     print '(a,es16.8)', 'sample_seconds=', sample_seconds
     print '(a,es16.8)', 'elapsed_seconds=', elapsed
     print '(a,es16.8)', 'tokens_per_second=', tokens_per_second
+    call model%close()
 end program fortai_cuda_run

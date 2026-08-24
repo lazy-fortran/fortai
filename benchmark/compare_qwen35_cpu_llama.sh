@@ -121,7 +121,8 @@ llama_record="$root_dir/.provenance/records/llama.cpp.txt"
 # Run FortAI before starting llama.cpp so the measurements do not compete.
 (cd "$root_dir" && fo build --flag "$native_flags" && \
     env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" \
-        OMP_PLACES="$OMP_PLACES" fo exec --no-build fortai_cpu_run \
+        OMP_PLACES="$OMP_PLACES" FORTAI_EXCLUDE_PROMPT=1 \
+        fo exec --no-build fortai_cpu_run \
         "$model_path" "$token_id" "$steps" "$context") >"$fortai_log"
 fortai_executable=$(readlink -f "$root_dir/build/fo/app/fortai_cpu_run")
 if [[ ! -x "$fortai_executable" ]]; then

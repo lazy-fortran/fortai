@@ -9,6 +9,7 @@ program fortai_cpu_run
     real(real32), allocatable :: logits(:), ranked_logits(:)
     character(len=512) :: model_path, argument
     integer(int64) :: token, steps, context, position, next_token
+    integer(int64) :: first_position, last_position
     integer :: clock_start, clock_end, clock_rate, max_index, ios, trace_length
     integer :: sample_start, sample_end
     integer :: load_start, load_end, forward_start, forward_end
@@ -16,7 +17,9 @@ program fortai_cpu_run
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
     real(real32) :: maximum_logit
     character(len=16) :: trace_tokens, trace_top_logits
-    logical :: trace_enabled
+    logical :: trace_enabled, exclude_prompt
+    character(len=16) :: exclude_prompt_text
+    integer :: exclude_prompt_length
 
     call get_command_argument(1, model_path)
     if (len_trim(model_path) == 0) then
@@ -57,16 +60,52 @@ program fortai_cpu_run
     allocate (logits(model%vocabulary_size))
     if (top_count > model%vocabulary_size) error stop 2
     if (top_count > 0) allocate (ranked_logits(model%vocabulary_size))
+    call get_environment_variable('FORTAI_EXCLUDE_PROMPT', exclude_prompt_text, &
+        length=exclude_prompt_length)
+    exclude_prompt = exclude_prompt_length > 0 .and. &
+        exclude_prompt_text(1:exclude_prompt_length) == '1'
+    first_position = 0_int64
+    last_position = steps - 1_int64
+    if (exclude_prompt) then
+        ! llama-server reports generation timing after the prompt token has
+        ! been evaluated.  Match that scope without changing the default
+        ! trace runner semantics.
+        call model%forward(token, 0_int64, logits, stat)
+        if (.not. stat%is_ok()) then
+            print '(a)', 'FortAI prompt forward failed: ' // stat%message
+            error stop 1
+        end if
+        max_index = maxloc(logits, dim=1)
+        token = int(max_index - 1, int64)
+        if (trace_enabled) print '(a,i0,a,i0)', 'token[', 0, ']=', token
+        if (top_count > 0) then
+            maximum_logit = maxval(logits)
+            ranked_logits = logits
+            do rank = 1, top_count
+                top_index = maxloc(ranked_logits, dim=1)
+                print '(a,i0,a,i0,a,i0,a,es16.8)', 'top_logit[', 0, ',', rank, &
+                    ']=', top_index - 1, ',', ranked_logits(top_index) - maximum_logit
+                ranked_logits(top_index) = -huge(0.0_real32)
+            end do
+        end if
+        first_position = 1_int64
+        last_position = steps
+    end if
     checksum = 0.0_real32
     sample_seconds = 0.0_real32
     call system_clock(forward_start)
-    do position = 0_int64, steps - 1_int64
+    do position = first_position, last_position
         call model%forward(token, position, logits, stat)
         if (.not. stat%is_ok()) then
             print '(a)', 'FortAI forward failed: ' // stat%message
             error stop 1
         end if
         checksum = checksum + sum(logits)
+        ! The llama.cpp predicted-token timer includes the decode of the
+        ! final sampled token, while its completion trace stops at that
+        ! token.  Keep that final forward in the timed scope but do not emit
+        ! a ninth trace item.
+        if (exclude_prompt .and. position == steps) cycle
         if (top_count > 0) then
             maximum_logit = maxval(logits)
             ranked_logits = logits
@@ -102,4 +141,5 @@ program fortai_cpu_run
     print '(a,es16.8)', 'sample_seconds=', sample_seconds
     print '(a,es16.8)', 'elapsed_seconds=', elapsed
     print '(a,es16.8)', 'tokens_per_second=', tokens_per_second
+    call model%close()
 end program fortai_cpu_run

@@ -49,7 +49,8 @@ model_sha256=$(sha256sum "$model_path" | awk '{print $1}')
 
 (cd "$root_dir" && "$root_dir/tools/build_cuda_qwen35.sh") >"$log_dir/build_cuda_qwen35_${stamp}.log"
 (cd "$root_dir" && env OMP_NUM_THREADS="$threads" OMP_PROC_BIND="${OMP_PROC_BIND:-spread}" \
-    OMP_PLACES="${OMP_PLACES:-cores}" "$root_dir/build/cuda/fortai_cuda_run" \
+    OMP_PLACES="${OMP_PLACES:-cores}" FORTAI_EXCLUDE_PROMPT=1 \
+    "$root_dir/build/cuda/fortai_cuda_run" \
     "$model_path" "$token_id" "$steps" "$context" "$device") >"$fortai_log"
 
 cleanup() {

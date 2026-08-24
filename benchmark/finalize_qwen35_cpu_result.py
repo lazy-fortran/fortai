@@ -37,20 +37,21 @@ def matched_forward_metrics(result):
     if predicted_n != steps:
         raise ValueError("llama.cpp predicted_n does not match the requested count")
 
-    llama_evaluations = prompt_n + max(predicted_n - 1, 0)
-    if llama_evaluations != steps:
-        raise ValueError("llama.cpp model-evaluation count does not match FortAI")
     prompt_ms = positive_number(timings["prompt_ms"], "llama.cpp prompt_ms")
     predicted_ms = float(timings["predicted_ms"])
     if not math.isfinite(predicted_ms) or predicted_ms < 0.0:
         raise ValueError("llama.cpp predicted_ms must be finite and nonnegative")
-    llama_seconds = (prompt_ms + predicted_ms) / 1000.0
+    # FortAI's comparison runner evaluates the one-token prompt before its
+    # timed loop (FORTAI_EXCLUDE_PROMPT=1), matching llama-server's
+    # predicted_ms generation timing.  Keep prompt_ms as a provenance check,
+    # but do not charge it to either side of the generation comparison.
+    llama_seconds = predicted_ms / 1000.0
     if llama_seconds <= 0.0:
         raise ValueError("llama.cpp matched evaluation time must be positive")
 
     return {
         "count": steps,
-        "scope": "prompt_plus_generated_model_forwards",
+        "scope": "generated_model_forwards_after_prompt",
         "fortai_seconds": fortai_seconds,
         "llama_cpp_seconds": llama_seconds,
         "fortai_steps_per_second": steps / fortai_seconds,
@@ -78,9 +79,9 @@ def self_test():
     metrics = matched_forward_metrics(fixture)
     assert metrics["count"] == 8
     assert metrics["fortai_seconds"] == 0.4
-    assert metrics["llama_cpp_seconds"] == 0.4
+    assert metrics["llama_cpp_seconds"] == 0.35
     assert metrics["fortai_steps_per_second"] == 20.0
-    assert metrics["llama_cpp_steps_per_second"] == 20.0
+    assert metrics["llama_cpp_steps_per_second"] == 8 / 0.35
 
     fixture["llama_cpp"]["timings"]["cache_n"] = 1
     try:

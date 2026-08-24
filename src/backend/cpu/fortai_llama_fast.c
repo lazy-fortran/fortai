@@ -106,6 +106,7 @@ typedef int32_t (*fortai_decode_fn)(fortai_llama_context *, fortai_llama_batch);
 typedef float *(*fortai_logits_fn)(fortai_llama_context *, int32_t);
 typedef void *(*fortai_memory_fn)(const fortai_llama_context *);
 typedef void (*fortai_memory_clear_fn)(void *, bool);
+typedef void (*fortai_synchronize_fn)(fortai_llama_context *);
 typedef void (*fortai_log_callback_fn)(int, const char *, void *);
 typedef void (*fortai_log_set_fn)(fortai_log_callback_fn, void *);
 typedef struct {
@@ -143,6 +144,7 @@ typedef struct {
     fortai_logits_fn logits;
     fortai_memory_fn memory;
     fortai_memory_clear_fn memory_clear;
+    fortai_synchronize_fn synchronize;
     fortai_log_set_fn log_set;
     fortai_attach_threadpool_fn attach_threadpool;
 } fortai_llama_api;
@@ -242,6 +244,7 @@ static void *fortai_open_llama(void) {
     FORTAI_LLAMA_LOAD(logits, "llama_get_logits_ith");
     FORTAI_LLAMA_LOAD(memory, "llama_get_memory");
     FORTAI_LLAMA_LOAD(memory_clear, "llama_memory_clear");
+    FORTAI_LLAMA_LOAD(synchronize, "llama_synchronize");
     FORTAI_LLAMA_LOAD(log_set, "llama_log_set");
     FORTAI_LLAMA_LOAD(attach_threadpool, "llama_attach_threadpool");
 #undef FORTAI_LLAMA_LOAD
@@ -282,13 +285,14 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
     model_params.use_extra_bufts = true;
     model_params.load_mtp = false;
     fortai_llama_context_params context_params = handle->api.context_default();
-    /* llama.cpp pads the server's small requested context to a 256-token
-     * graph.  Apply that minimum before it derives the causal batch size. */
-    context_params.n_ctx = (uint32_t)(context_size < 256 ? 256 : context_size);
+    /* Pass the requested context through unchanged.  llama.cpp applies the
+     * same minimum/slot normalization internally as llama-server; doing the
+     * padding here would bypass that normalization path. */
+    context_params.n_ctx = (uint32_t)context_size;
     /* The server derives both batch limits from the requested -c value for
      * this small context (128 in the benchmark), even though the KV graph is
-     * padded to 256.  Keeping the logical/physical limits at that value
-     * avoids reserving the larger prompt graph. */
+     * padded to 256.  Keep the logical/physical limits at that value so the
+     * graph shape matches the server exactly. */
     context_params.n_batch = (uint32_t)context_size;
     context_params.n_ubatch = (uint32_t)context_size;
     /* FortAI drives one causal sequence at a time.  The server defaults to
@@ -367,6 +371,8 @@ int fortai_llama_fast_context_create(const char *path, int context_size, int thr
         handle->batch.seq_id[0][0] = 0;
         handle->batch.logits[0] = 1;
         (void)handle->api.decode(handle->context, handle->batch);
+        if (handle->api.synchronize != NULL)
+            handle->api.synchronize(handle->context);
         if (handle->api.memory != NULL && handle->api.memory_clear != NULL)
             handle->api.memory_clear(handle->api.memory(handle->context), true);
     }
@@ -390,7 +396,8 @@ int fortai_llama_fast_context_decode(void *opaque, int token, int position,
     handle->batch.n_seq_id[0] = 1;
     handle->batch.seq_id[0][0] = 0;
     handle->batch.logits[0] = 1;
-    if (handle->api.decode(handle->context, handle->batch) != 0) return 2;
+    int decode_status = handle->api.decode(handle->context, handle->batch);
+    if (decode_status != 0) return 2;
     float *result = handle->api.logits(handle->context, -1);
     if (result == NULL) return 3;
     memcpy(logits, result, (size_t)handle->vocab * sizeof(float));
