@@ -1,5 +1,5 @@
 module fortai_gguf_runtime
-    use, intrinsic :: iso_c_binding, only: c_float, c_int8_t, c_int64_t
+    use, intrinsic :: iso_c_binding, only: c_float, c_int, c_int8_t, c_int64_t, c_size_t
     use, intrinsic :: iso_fortran_env, only: int8, int16, int32, int64, real32, real64
     use fortai_status, only: FORTAI_INVALID, FORTAI_IO_ERROR, FORTAI_UNSUPPORTED, status_t
     implicit none
@@ -33,11 +33,56 @@ module fortai_gguf_runtime
             integer(c_int64_t), value, intent(in) :: block_count
         end subroutine fortai_q8_dequantize_row
 
+        integer(c_int) function fortai_ggml_quant_available(value_type) &
+                bind(C, name='fortai_ggml_quant_available')
+            import c_int
+            integer(c_int), value, intent(in) :: value_type
+        end function fortai_ggml_quant_available
+
+        integer(c_int) function fortai_ggml_dequantize_row(value_type, bytes, values, width) &
+                bind(C, name='fortai_ggml_dequantize_row')
+            import c_float, c_int, c_int8_t, c_int64_t
+            integer(c_int), value, intent(in) :: value_type
+            integer(c_int8_t), intent(in) :: bytes(*)
+            real(c_float), intent(out) :: values(*)
+            integer(c_int64_t), value, intent(in) :: width
+        end function fortai_ggml_dequantize_row
+
+        real(c_float) function fortai_ggml_quant_dot(value_type, bytes, vector, width) &
+                bind(C, name='fortai_ggml_quant_dot')
+            import c_float, c_int, c_int8_t, c_int64_t
+            integer(c_int), value, intent(in) :: value_type
+            integer(c_int8_t), intent(in) :: bytes(*)
+            real(c_float), intent(in) :: vector(*)
+            integer(c_int64_t), value, intent(in) :: width
+        end function fortai_ggml_quant_dot
+
+        integer(c_int) function fortai_ggml_quant_matvec(value_type, bytes, weight_bytes, rows, width, &
+                activation, output) bind(C, name='fortai_ggml_quant_matvec')
+            import c_float, c_int, c_int8_t, c_int64_t, c_size_t
+            integer(c_int), value, intent(in) :: value_type
+            integer(c_int8_t), intent(in) :: bytes(*)
+            integer(c_size_t), value, intent(in) :: weight_bytes
+            integer(c_int64_t), value, intent(in) :: rows, width
+            real(c_float), intent(in) :: activation(*)
+            real(c_float), intent(out) :: output(*)
+        end function fortai_ggml_quant_matvec
+
+        subroutine fortai_ggml_quant_cache_clear() bind(C, name='fortai_ggml_quant_cache_clear')
+        end subroutine fortai_ggml_quant_cache_clear
+
     end interface
 
     integer(int32), parameter, public :: GGML_TYPE_F32 = 0_int32
     integer(int32), parameter, public :: GGML_TYPE_F16 = 1_int32
     integer(int32), parameter, public :: GGML_TYPE_Q8_0 = 8_int32
+    integer(int32), parameter, public :: GGML_TYPE_Q3_K = 11_int32
+    integer(int32), parameter, public :: GGML_TYPE_Q4_K = 12_int32
+    integer(int32), parameter, public :: GGML_TYPE_Q5_K = 13_int32
+    integer(int32), parameter, public :: GGML_TYPE_Q6_K = 14_int32
+    integer(int32), parameter, public :: GGML_TYPE_IQ4_NL = 20_int32
+    integer(int32), parameter, public :: GGML_TYPE_IQ3_S = 21_int32
+    integer(int32), parameter, public :: GGML_TYPE_IQ4_XS = 23_int32
 
     integer(int32), parameter :: GGUF_UINT8 = 0_int32
     integer(int32), parameter :: GGUF_INT8 = 1_int32
@@ -99,9 +144,13 @@ module fortai_gguf_runtime
         procedure :: open => gguf_file_open
     end type gguf_file_t
 
-    public :: gguf_fp16_to_real
+    public :: gguf_fp16_to_real, gguf_quant_cache_clear
 
 contains
+
+    subroutine gguf_quant_cache_clear()
+        call fortai_ggml_quant_cache_clear()
+    end subroutine gguf_quant_cache_clear
 
     subroutine gguf_file_open(self, path, stat)
         class(gguf_file_t), intent(inout) :: self
@@ -290,8 +339,9 @@ contains
     real(real32) function gguf_tensor_value(self, index)
         class(gguf_tensor_t), intent(in) :: self
         integer(int64), intent(in) :: index
-        integer(int64) :: block, byte_index, within
+        integer(int64) :: block, byte_index, within, width, row, block_width, block_bytes
         integer(int16) :: scale_bits
+        real(real32), allocatable :: decoded(:)
 
         gguf_tensor_value = 0.0_real32
         if (.not. allocated(self%bytes)) return
@@ -316,9 +366,22 @@ contains
                 scale_bits = transfer(self%bytes(byte_index:byte_index + 1_int64), scale_bits)
                 gguf_tensor_value = gguf_fp16_to_real(scale_bits) * real( &
                     int(self%bytes(byte_index + 2_int64 + within), int32), real32)
-            case default
-                gguf_tensor_value = 0.0_real32
-            end select
+        case (GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, &
+                GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS)
+            if (size(self%shape) /= 2) return
+            width = self%shape(1)
+            call quant_layout(self%value_type, block_width, block_bytes)
+            row = (index - 1_int64) / width
+            within = mod(index - 1_int64, width)
+            allocate(decoded(width))
+            byte_index = row * (width / block_width) * block_bytes + 1_int64
+            if (fortai_ggml_dequantize_row(int(self%value_type, c_int), &
+                    self%bytes(byte_index:), decoded, width) == 0_c_int) then
+                gguf_tensor_value = decoded(within + 1_int64)
+            end if
+        case default
+            gguf_tensor_value = 0.0_real32
+        end select
         end function gguf_tensor_value
 
         subroutine gguf_tensor_get_row(self, row, values, stat)
@@ -326,7 +389,8 @@ contains
             integer(int64), intent(in) :: row
             real(real32), contiguous, intent(out) :: values(:)
             type(status_t), intent(out) :: stat
-            integer(int64) :: i, width
+            integer(int64) :: i, width, block_width, block_bytes, byte_index
+            integer(c_int) :: code
 
             call stat%clear()
             if (size(self%shape) /= 2) then
@@ -343,6 +407,15 @@ contains
                     (width / 32_int64) * 34_int64 + 1_int64:), values, width / 32_int64)
                 return
             end if
+            if (is_mixed_quant(self%value_type)) then
+                call quant_layout(self%value_type, block_width, block_bytes)
+                byte_index = (row - 1_int64) * (width / block_width) * block_bytes + 1_int64
+                code = fortai_ggml_dequantize_row(int(self%value_type, c_int), &
+                    self%bytes(byte_index:), values, width)
+                if (code /= 0_c_int) call stat%set(FORTAI_UNSUPPORTED, &
+                    'GGML mixed-quant decoder is unavailable')
+                return
+            end if
             do i = 1, width
                 values(i) = self%value((row - 1_int64) * width + i)
             end do
@@ -352,7 +425,7 @@ contains
             class(gguf_tensor_t), intent(in) :: self
             integer(int64), intent(in) :: row
             real(real32), intent(in) :: vector(:)
-            integer(int64) :: block, block_count, i, offset, width
+            integer(int64) :: block, block_count, i, offset, width, block_width, block_bytes
             real(real32) :: accumulator, scale
             integer(int16) :: scale_bits
             integer(int32) :: quantized
@@ -384,6 +457,12 @@ contains
                     gguf_tensor_dot = gguf_tensor_dot + self%value((row - 1_int64) * width + i) &
                         * vector(i)
                 end do
+            case (GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, &
+                    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS)
+                call quant_layout(self%value_type, block_width, block_bytes)
+                offset = (row - 1_int64) * (width / block_width) * block_bytes + 1_int64
+                gguf_tensor_dot = fortai_ggml_quant_dot(int(self%value_type, c_int), &
+                    self%bytes(offset:), vector, width)
             end select
         end function gguf_tensor_dot
 
@@ -393,6 +472,7 @@ contains
             real(real32), contiguous, intent(out) :: values(:)
             type(status_t), intent(out) :: stat
             integer(int64) :: row
+            integer(c_int) :: code
 
             call stat%clear()
             if (size(self%shape) /= 2) then
@@ -404,8 +484,28 @@ contains
                 return
             end if
             if (self%value_type /= GGML_TYPE_Q8_0 .and. self%value_type /= GGML_TYPE_F32 &
-                .and. self%value_type /= GGML_TYPE_F16) then
+                .and. self%value_type /= GGML_TYPE_F16 .and. .not. is_mixed_quant(self%value_type)) then
                 call stat%set(FORTAI_UNSUPPORTED, 'GGUF matvec type is not supported')
+                return
+            end if
+            if (is_mixed_quant(self%value_type)) then
+                code = fortai_ggml_quant_matvec(int(self%value_type, c_int), self%bytes, &
+                    int(size(self%bytes), c_size_t), self%shape(2), self%shape(1), vector, values)
+                if (code /= 0_c_int) then
+                    ! Keep the exact row decoder as a portable slow path when
+                    ! the optional GGML CPU backend is not installed.
+                    if (self%shape(2) < 128_int64) then
+                        do row = 1, self%shape(2)
+                            values(row) = self%dot(row, vector)
+                        end do
+                    else
+                        !$omp parallel do default(none) shared(self, vector, values) private(row) schedule(static)
+                        do row = 1, self%shape(2)
+                            values(row) = self%dot(row, vector)
+                        end do
+                        !$omp end parallel do
+                    end if
+                end if
                 return
             end if
             if (self%shape(2) < 128_int64) then
@@ -838,6 +938,7 @@ contains
             integer(int64), intent(in) :: shape(:)
             integer(int64), intent(in) :: elements
             type(status_t), intent(out) :: stat
+            integer(int64) :: block_width, block_bytes
 
             call stat%clear()
             select case (value_type)
@@ -852,11 +953,53 @@ contains
                     return
                 end if
                 tensor_bytes = (elements / shape(1)) * (shape(1) / 32_int64) * 34_int64
+            case (GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, &
+                    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS)
+                call quant_layout(value_type, block_width, block_bytes)
+                if (shape(1) <= 0_int64 .or. mod(shape(1), block_width) /= 0_int64) then
+                    call stat%set(FORTAI_INVALID, 'mixed-quant tensor width is not block aligned')
+                    tensor_bytes = 0_int64
+                    return
+                end if
+                tensor_bytes = (elements / shape(1)) * (shape(1) / block_width) * block_bytes
             case default
                 call stat%set(FORTAI_UNSUPPORTED, 'GGUF tensor quantization is not supported')
                 tensor_bytes = 0_int64
             end select
         end function tensor_bytes
+
+        logical function is_mixed_quant(value_type)
+            integer(int32), intent(in) :: value_type
+
+            is_mixed_quant = value_type == GGML_TYPE_Q3_K .or. value_type == GGML_TYPE_Q4_K .or. &
+                value_type == GGML_TYPE_Q5_K .or. value_type == GGML_TYPE_Q6_K .or. &
+                value_type == GGML_TYPE_IQ4_NL .or. value_type == GGML_TYPE_IQ3_S .or. &
+                value_type == GGML_TYPE_IQ4_XS
+        end function is_mixed_quant
+
+        subroutine quant_layout(value_type, block_width, block_bytes)
+            integer(int32), intent(in) :: value_type
+            integer(int64), intent(out) :: block_width, block_bytes
+
+            block_width = 0_int64
+            block_bytes = 0_int64
+            select case (value_type)
+            case (GGML_TYPE_Q3_K)
+                block_width = 256_int64; block_bytes = 110_int64
+            case (GGML_TYPE_Q4_K)
+                block_width = 256_int64; block_bytes = 144_int64
+            case (GGML_TYPE_Q5_K)
+                block_width = 256_int64; block_bytes = 176_int64
+            case (GGML_TYPE_Q6_K)
+                block_width = 256_int64; block_bytes = 210_int64
+            case (GGML_TYPE_IQ4_NL)
+                block_width = 32_int64; block_bytes = 18_int64
+            case (GGML_TYPE_IQ3_S)
+                block_width = 256_int64; block_bytes = 110_int64
+            case (GGML_TYPE_IQ4_XS)
+                block_width = 256_int64; block_bytes = 136_int64
+            end select
+        end subroutine quant_layout
 
         integer(int64) function align_up(value, alignment)
             integer(int64), intent(in) :: value, alignment

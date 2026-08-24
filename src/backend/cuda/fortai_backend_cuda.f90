@@ -32,6 +32,20 @@ module fortai_backend_cuda
         procedure :: destroy => cuda_q8_weights_destroy
     end type cuda_q8_weights_t
 
+    type, public :: cuda_q4_context_t
+        type(c_ptr) :: handle = c_null_ptr
+    contains
+        procedure :: create => cuda_q4_context_create
+        procedure :: destroy => cuda_q4_context_destroy
+    end type cuda_q4_context_t
+
+    type, public :: cuda_q4_weights_t
+        type(c_ptr) :: handle = c_null_ptr
+    contains
+        procedure :: upload => cuda_q4_weights_upload
+        procedure :: destroy => cuda_q4_weights_destroy
+    end type cuda_q4_weights_t
+
     type, public :: cuda_qwen35_recurrent_t
         type(c_ptr) :: handle = c_null_ptr
     contains
@@ -63,6 +77,7 @@ module fortai_backend_cuda
     public :: cuda_q8_matvec_resident
     public :: cuda_q8_matvec_device_f32
     public :: cuda_qwen35_embedding_device
+    public :: cuda_q4_matvec_host
 
     interface
         function c_context_create(device, context) bind(C, name='fortai_cuda_q8_context_create') &
@@ -126,6 +141,50 @@ module fortai_backend_cuda
             type(c_ptr), value :: weights
             integer(c_int) :: code
         end function c_weights_destroy
+
+        function c_q4_context_create(first_device, second_device, context) &
+                bind(C, name='fortai_cuda_q4_context_create') result(code)
+            import c_int, c_ptr
+            integer(c_int), value :: first_device, second_device
+            type(c_ptr) :: context
+            integer(c_int) :: code
+        end function c_q4_context_create
+
+        function c_q4_context_destroy(context) bind(C, name='fortai_cuda_q4_context_destroy') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: context
+            integer(c_int) :: code
+        end function c_q4_context_destroy
+
+        function c_q4_weights_upload(context, value_type, host_weights, weight_bytes, rows, width, &
+                device, weights) bind(C, name='fortai_cuda_q4_weights_upload') result(code)
+            import c_int, c_int8_t, c_ptr, c_size_t
+            type(c_ptr), value :: context
+            integer(c_int), value :: value_type
+            integer(c_int8_t), target, intent(in) :: host_weights(*)
+            integer(c_size_t), value :: weight_bytes
+            integer(c_int), value :: rows, width, device
+            type(c_ptr) :: weights
+            integer(c_int) :: code
+        end function c_q4_weights_upload
+
+        function c_q4_weights_destroy(weights) bind(C, name='fortai_cuda_q4_weights_destroy') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: weights
+            integer(c_int) :: code
+        end function c_q4_weights_destroy
+
+        function c_q4_matvec_host(context, weights, activation, activation_bytes, output, output_bytes, &
+                elapsed_ms) bind(C, name='fortai_cuda_q4_matvec_host') result(code)
+            import c_float, c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights
+            real(c_float), target, intent(in) :: activation(*)
+            integer(c_size_t), value :: activation_bytes
+            real(c_float), target, intent(out) :: output(*)
+            integer(c_size_t), value :: output_bytes
+            real(c_float), intent(out) :: elapsed_ms
+            integer(c_int) :: code
+        end function c_q4_matvec_host
 
         function c_buffer_create(context, bytes, buffer) &
                 bind(C, name='fortai_cuda_q8_device_buffer_create') result(code)
@@ -414,6 +473,92 @@ module fortai_backend_cuda
     end interface
 
 contains
+
+    subroutine cuda_q4_context_create(self, first_device, second_device, stat)
+        class(cuda_q4_context_t), intent(inout) :: self
+        integer, intent(in) :: first_device, second_device
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (c_associated(self%handle)) call self%destroy(stat)
+        code = c_q4_context_create(int(first_device, c_int), int(second_device, c_int), self%handle)
+        if (code /= FORTAI_CUDA_OK) then
+            self%handle = c_null_ptr
+            call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 context creation failed')
+        end if
+    end subroutine cuda_q4_context_create
+
+    subroutine cuda_q4_context_destroy(self, stat)
+        class(cuda_q4_context_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle)) return
+        code = c_q4_context_destroy(self%handle)
+        self%handle = c_null_ptr
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 context destruction failed')
+    end subroutine cuda_q4_context_destroy
+
+    subroutine cuda_q4_weights_upload(self, context, value_type, host_weights, weight_bytes, rows, width, &
+            device, stat)
+        class(cuda_q4_weights_t), intent(inout) :: self
+        class(cuda_q4_context_t), intent(in) :: context
+        integer, intent(in) :: value_type, rows, width, device
+        integer(c_int8_t), contiguous, target, intent(in) :: host_weights(:)
+        integer(c_size_t), intent(in) :: weight_bytes
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. size(host_weights) <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 weight upload arguments')
+            return
+        end if
+        if (c_associated(self%handle)) call self%destroy(stat)
+        code = c_q4_weights_upload(context%handle, int(value_type, c_int), host_weights, weight_bytes, &
+            int(rows, c_int), int(width, c_int), int(device, c_int), self%handle)
+        if (code /= FORTAI_CUDA_OK) then
+            self%handle = c_null_ptr
+            call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 weight upload failed')
+        end if
+    end subroutine cuda_q4_weights_upload
+
+    subroutine cuda_q4_weights_destroy(self, stat)
+        class(cuda_q4_weights_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle)) return
+        code = c_q4_weights_destroy(self%handle)
+        self%handle = c_null_ptr
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 weight destruction failed')
+    end subroutine cuda_q4_weights_destroy
+
+    subroutine cuda_q4_matvec_host(context, weights, activation, output, elapsed_ms, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: weights
+        real(c_float), contiguous, target, intent(in) :: activation(:)
+        real(c_float), contiguous, target, intent(out) :: output(:)
+        real(c_float), intent(out) :: elapsed_ms
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        elapsed_ms = 0.0_c_float
+        if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 matvec arguments')
+            return
+        end if
+        code = c_q4_matvec_host(context%handle, weights%handle, activation, &
+            int(size(activation) * storage_size(activation(1)) / 8, c_size_t), output, &
+            int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 matvec failed')
+    end subroutine cuda_q4_matvec_host
 
     subroutine cuda_q8_context_create(self, device, stat)
         class(cuda_q8_context_t), intent(inout) :: self

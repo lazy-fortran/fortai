@@ -35,6 +35,35 @@ server down. It refuses to use a port that is already occupied. Set
 runner and fair comparison wrapper are `run_qwen35_cpu.sh` and
 `compare_qwen35_cpu_llama.sh`.
 
+For the mixed-quant Qwen3.8-27B `UD-Q4_K_XL` format, the native FortAI CUDA
+runner uses the exact GGML CUDA kernels for every tensor encoding and balances
+active tensors across two visible GPUs. The native CPU path uses the GGML CPU
+quantized matvec backend, with a bounded persistent plan cache. Build it with:
+
+```bash
+FORTAI_GGML_PREFIX=/home/ert/.local/llama.cpp-upstream-main-650913862 \
+  tools/build_cuda_qwen35.sh
+```
+
+For an independent upstream oracle, use the isolated CUDA compatibility smoke:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 benchmark/run_q4_cuda_compat.sh \
+  /mnt/storage/slopcode/models/unsloth_Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  9419 8 128
+```
+
+`UD-Q4_K_XL` is a mixed GGUF tensor format, not a single Q4 block type. The
+compatibility runner delegates to the installed upstream llama.cpp CUDA
+implementation as an independent correctness oracle, on private port `18380`
+by default, and verifies cleanup before returning. It does not claim native
+FortAI performance or enter the FortAI performance gate. Set
+`FORTAI_GGML_CPU_CACHE=0` when host memory is too constrained for the bounded
+CPU plan cache; correctness is unchanged.
+The dynamic ABI adapter honors `FORTAI_GGML_LIBRARY` and
+`FORTAI_GGML_CPU_LIBRARY` when the GGML installation is not in the machine
+local default locations.
+
 The comparison wrapper uses the same initial token ID, context, decode budget,
 CPU thread count, and Q8_0 GGUF for both programs. It always terminates the
 temporary server. Results are evidence, not promotion: a slower FortAI result
@@ -209,6 +238,20 @@ top-k token set, and reports the maximum centered-logit error together with
 both model and llama.cpp executable digests. Set `steps` to 1 when isolating
 the initial forward pass. The named eight-step 0.8B Q8_0 gate passes with a
 maximum centered-logit error of `2.431842038852494e-7`.
+
+The same centered-logit checker accepts native mixed Q4/IQ tensors. For the
+2B Q4_K_M fixture, use a two-GPU visibility list and a private oracle port:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 FORTAI_CUDA_Q4_SECOND_DEVICE=1 LLAMA_PORT=18395 \
+  benchmark/check_qwen35_cuda_logits.sh \
+  /mnt/storage/lazy-fortran-models/qwen3.5-2b-q4/qwen3.5-2b-q4_k_m.gguf \
+  9419 8 128 4 0.5 0
+```
+
+This records the native `fortai-cuda-host-q4-xl-ggml` backend and compares it
+with llama.cpp's two-GPU CUDA result; the tested run passed with maximum
+centered-logit error `0.1808955686`.
 
 For instruction-level CPU work, `profile_qwen35_cpu_both.sh` records the
 matched FortAI/llama.cpp `perf stat` counters (including cycles and retired

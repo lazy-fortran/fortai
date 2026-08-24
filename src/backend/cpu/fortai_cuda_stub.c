@@ -1,4 +1,5 @@
 #include "../../../backend/cuda/fortai_cuda_backend.h"
+#include "../../../backend/cuda/fortai_cuda_q4_backend.h"
 
 #if defined(__GNUC__)
 #define FORTAI_WEAK __attribute__((weak))
@@ -8,6 +9,51 @@
 
 static int unavailable(void) {
     return FORTAI_CUDA_RUNTIME_ERROR;
+}
+
+int FORTAI_WEAK fortai_cuda_q4_context_create(int first_device, int second_device,
+    fortai_cuda_q4_context **context) {
+    (void)first_device;
+    (void)second_device;
+    if (context) *context = NULL;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q4_context_destroy(fortai_cuda_q4_context *context) {
+    (void)context;
+    return FORTAI_CUDA_OK;
+}
+
+int FORTAI_WEAK fortai_cuda_q4_weights_upload(fortai_cuda_q4_context *context, int value_type,
+    const void *host_weights, size_t weight_bytes, int rows, int width, int device,
+    fortai_cuda_q4_weights **weights) {
+    (void)context;
+    (void)value_type;
+    (void)host_weights;
+    (void)weight_bytes;
+    (void)rows;
+    (void)width;
+    (void)device;
+    if (weights) *weights = NULL;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q4_weights_destroy(fortai_cuda_q4_weights *weights) {
+    (void)weights;
+    return FORTAI_CUDA_OK;
+}
+
+int FORTAI_WEAK fortai_cuda_q4_matvec_host(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *weights, const void *host_activation,
+    size_t activation_bytes, float *host_output, size_t output_bytes, float *elapsed_ms) {
+    (void)context;
+    (void)weights;
+    (void)host_activation;
+    (void)activation_bytes;
+    (void)host_output;
+    (void)output_bytes;
+    if (elapsed_ms) *elapsed_ms = 0.0f;
+    return unavailable();
 }
 
 int FORTAI_WEAK fortai_cuda_q8_context_create(int device,

@@ -11,6 +11,7 @@ token_id="${2:-${FORTAI_TOKEN_ID:-9419}}"
 steps="${3:-${FORTAI_BENCH_STEPS:-64}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 device="${5:-${CUDA_DEVICE:-0}}"
+llama_visible_devices="${FORTAI_LLAMA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-$device}}"
 threads="${OMP_NUM_THREADS:-2}"
 llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"
 llama_library_dir="${LLAMA_LIBRARY_DIR:-/home/ert/.local/llama.cpp-b10430-cuda}"
@@ -56,7 +57,7 @@ trap cleanup EXIT INT TERM
 if [[ -n "$llama_library_dir" ]]; then
     export LD_LIBRARY_PATH="$llama_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-CUDA_VISIBLE_DEVICES="$device" "$llama_server" -m "$model_path" --host 127.0.0.1 \
+CUDA_VISIBLE_DEVICES="$llama_visible_devices" "$llama_server" -m "$model_path" --host 127.0.0.1 \
     --port "$port" -c "$context" -ngl 99 -t "$threads" -tb "$threads" --no-webui \
     >"$llama_log" 2>&1 &
 server_pid=$!
@@ -96,6 +97,7 @@ if pgrep -x llama-server >/dev/null 2>&1; then echo "llama-server cleanup failed
 
 MODEL_PATH="$model_path" MODEL_SHA256="$model_sha256" TOKEN_ID="$token_id" STEPS="$steps" \
 CONTEXT="$context" DEVICE="$device" THREADS="$threads" COMMIT="$(git -C "$root_dir" rev-parse HEAD)" \
+LLAMA_VISIBLE_DEVICES="$llama_visible_devices" \
 ORACLE_TOP_K="${FORTAI_LLAMA_ORACLE_TOP_K:-0}" \
 FORTAI_LOG="$fortai_log" LLAMA_LOG="$llama_log" LLAMA_RESULT="$llama_result" RESULT_FILE="$result_file" \
 PATCH_DIGEST="$patch_digest" TREE_DIGEST="$tree_digest" WORKTREE_DIGEST="$worktree_digest" \
@@ -116,8 +118,14 @@ if int(values.get("steps", -1)) != int(os.environ["STEPS"]):
 if int(timings.get("predicted_n", -1)) != int(os.environ["STEPS"]):
     raise SystemExit("llama.cpp did not execute the requested step count")
 result = {
-    "scope": "qwen35_model_device_resident_cuda_q8" if values.get("device_pipeline") == "T" else "qwen35_model_host_controlled_cuda_q8",
-    "production_gate": "not_promoted_cuda_graph_or_full_parity" if values.get("device_pipeline") == "T" else "not_promoted_host_transfers",
+    "scope": ("qwen35_model_host_controlled_cuda_q4_xl_ggml" if
+              values.get("backend") == "fortai-cuda-host-q4-xl-ggml" else
+              ("qwen35_model_device_resident_cuda_q8" if values.get("device_pipeline") == "T" else
+               "qwen35_model_host_controlled_cuda_q8")),
+    "production_gate": ("experimental_native_q4_xl_ggml" if
+                        values.get("backend") == "fortai-cuda-host-q4-xl-ggml" else
+                        ("not_promoted_cuda_graph_or_full_parity" if values.get("device_pipeline") == "T" else
+                         "not_promoted_host_transfers")),
     "fortai_commit": os.environ["COMMIT"],
     "fortai_patch_digest": os.environ["PATCH_DIGEST"],
     "fortai_tracked_tree_digest": os.environ["TREE_DIGEST"],
@@ -128,6 +136,7 @@ result = {
     "steps": int(os.environ["STEPS"]),
     "context": int(os.environ["CONTEXT"]),
     "cuda_device": int(os.environ["DEVICE"]),
+    "llama_visible_devices": os.environ["LLAMA_VISIBLE_DEVICES"],
     "omp_num_threads": int(os.environ["THREADS"]),
     "llama_server_cleanup": "verified",
     "llama_oracle_top_k": int(os.environ.get("ORACLE_TOP_K", "0")),

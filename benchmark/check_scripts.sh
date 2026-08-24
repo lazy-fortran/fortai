@@ -5,6 +5,7 @@ root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bash -n "$root_dir/tools/build_native.sh"
 bash -n "$root_dir/benchmark/run_cpu_reference.sh"
 bash -n "$root_dir/benchmark/run_llama_cpp.sh"
+bash -n "$root_dir/benchmark/run_q4_cuda_compat.sh"
 bash -n "$root_dir/benchmark/run_qwen35_cpu.sh"
 bash -n "$root_dir/benchmark/compare_qwen35_cpu_llama.sh"
 bash -n "$root_dir/benchmark/repeat_compare_qwen35_cpu.sh"

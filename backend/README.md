@@ -11,5 +11,10 @@ exercise that ABI. An experimental Qwen3.5 model runner can route Q8 matvecs
 through the ABI, including grouped paired/triplet projections that reuse one
 activation upload, but its host-controlled activation/output transfers are
 measured and explicitly not promoted as the production CUDA backend.
+It also contains the native mixed `UD-Q4_K_XL` bridge: the CPU lane uses
+GGML's exact quantized matvec backend and the CUDA lane keeps each Q3/Q4/Q5/Q6
+or IQ weight tensor resident on a balanced two-GPU scheduler. This lane is
+experimental until the model-level promotion gate closes; the compatibility
+runner in `benchmark/run_q4_cuda_compat.sh` remains an independent oracle.
 The other directories identify planned lanes; an empty directory does not mean
 that the corresponding backend is available.

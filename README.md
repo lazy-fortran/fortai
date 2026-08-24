@@ -11,7 +11,11 @@ and persistent benchmark/provenance tooling. The CUDA path keeps recurrent
 state, attention KV caches, activations, and FFN execution on the RTX 5060 Ti.
 CUDA Graph replay is available as an explicit opt-in, but is disabled by
 default on the tested RTX 5060 Ti until it passes the end-to-end gate; Q4
-repacking and multi-GPU 27B execution remain staged behind explicit gates.
+mixed-quant `UD-Q4_K_XL` tensors are now handled natively through the exact
+GGML CPU decoder and a persistent two-GPU GGML CUDA bridge. The native path is
+experimental until its model-level promotion gate is closed. A separate
+compatibility smoke remains available as an independent upstream llama.cpp
+oracle.
 
 ## Design
 
@@ -131,8 +135,16 @@ Q8_0 GGUF and a device-resident CUDA Qwen3.5 path. The CPU path is benchmarked
 against llama.cpp on the 0.8B, 2B, and 4B fixtures. The CUDA path has exact
 eight-token trace parity on all three fixtures and repeated model-level paired
 runs at effective llama.cpp throughput parity on the tested RTX 5060 Ti.
-CUDA Graph replay remains opt-in; Q4 repacking and full CUDA Qwen3.8-27B with
-its required multi-GPU split remain on the roadmap. See [ROADMAP.md](ROADMAP.md).
+CUDA Graph replay remains opt-in. Native mixed Q4/IQ tensors currently use the
+GGML CPU/CUDA kernels (including Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ3_S, and
+IQ4_XS), with two-device byte balancing for the Qwen3.8-27B base model. For
+an independent exact Q4_K_XL CUDA oracle smoke on the two GPUs, use
+`benchmark/run_q4_cuda_compat.sh`; it starts and cleans up its own private
+localhost server and delegates mixed-quant execution to upstream llama.cpp.
+Native FortAI performance is measured separately from that compatibility
+check. The native 27B smoke currently reproduces the eight-token llama.cpp
+CUDA trace (`11,353,2688,264,220,17,15,4514`) on the two RTX 5060 Ti cards.
+See [ROADMAP.md](ROADMAP.md).
 
 FortAI will only promote a production candidate for a named workload after it
 matches or beats the fastest fair competing harness under the same conditions.

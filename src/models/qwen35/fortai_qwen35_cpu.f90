@@ -7,8 +7,11 @@ module fortai_qwen35_cpu
         cuda_q8_matvec_host_triplet, cuda_q8_matvec_host_triplet_contiguous, cuda_q8_weights_t, &
         cuda_q8_matvec_device_f32, cuda_qwen35_add_device, cuda_qwen35_copy_device, &
         cuda_qwen35_embedding_device, cuda_qwen35_rms_norm_device
+    use fortai_backend_cuda, only: cuda_q4_context_t, cuda_q4_weights_t, cuda_q4_matvec_host
     use fortai_backend_cuda, only: cuda_qwen35_attention_t, cuda_qwen35_recurrent_t
-    use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_file_t, gguf_fp16_to_real, gguf_tensor_t
+    use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, &
+        GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, gguf_file_t, &
+        gguf_fp16_to_real, gguf_quant_cache_clear, gguf_tensor_t
     use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
     implicit none
     private
@@ -144,6 +147,8 @@ module fortai_qwen35_cpu
         real(real32), allocatable :: quantized_scales(:)
         type(cuda_q8_context_t) :: cuda
         type(cuda_q8_weights_t), allocatable :: cuda_weights(:)
+        type(cuda_q4_context_t) :: cuda_q4
+        type(cuda_q4_weights_t), allocatable :: cuda_q4_weights(:)
         type(c_ptr), allocatable :: cuda_attn_norm(:)
         type(c_ptr), allocatable :: cuda_post_norm(:)
         type(c_ptr) :: cuda_x = c_null_ptr
@@ -188,6 +193,11 @@ contains
         self%hidden_size = int(self%file%meta_int('qwen35.embedding_length', 0_int64), int32)
         self%vocabulary_size = int(self%file%meta_int('qwen35.vocab_size', 0_int64), int32)
         self % layer_count = int(self % file % meta_int('qwen35.block_count', 0_int64), int32)
+        ! Qwen3.8-27B Q4_K_XL carries one MTP/nextn block after the base
+        ! transformer.  llama.cpp intentionally leaves blk.64.* unused;
+        ! keep the base model's 64 layers in the native runner as well.
+        if (self % layer_count > 64 .and. self % file % find_tensor( &
+                'blk.64.nextn.eh_proj.weight') > 0) self % layer_count = 64
         self % feed_forward_size = int(self % file % meta_int( &
             'qwen35.feed_forward_length', 0_int64), int32)
         self % attention_heads = int(self % file % meta_int( &
@@ -267,7 +277,12 @@ contains
 
         allocate (self % layers(self % layer_count))
         do i = 1, self % layer_count
-            self % layers(i) % recurrent = mod(i, interval) /= 0
+            ! The published Qwen3.8-27B GGUF has one terminal full-attention
+            ! block (blk.64) in addition to the regular interval.  Derive
+            ! the layer kind from the tensor schema so that this extra block
+            ! is bound as attention instead of being rejected as incomplete
+            ! recurrent state.
+            self % layers(i) % recurrent = find_layer_tensor(self % file, i - 1, 'attn_q.weight') == 0
             call bind_layer(self, i, stat)
             if (.not. stat % is_ok()) return
             if (self % layers(i) % recurrent) then
@@ -312,7 +327,9 @@ contains
         integer, intent(in) :: device
         type(status_t), intent(out) :: stat
         type(status_t) :: cleanup_stat
-        integer :: i, j, rows, width
+        integer :: i, j, rows, width, q4_device, q4_second_device
+        integer(int64) :: q4_bytes(2)
+        logical :: have_q4
 
         call stat%clear()
         if (.not. allocated(self%file%tensors)) then
@@ -332,6 +349,13 @@ contains
             end do
             deallocate(self%cuda_weights)
         end if
+        if (allocated(self%cuda_q4_weights)) then
+            do i = 1, size(self%cuda_q4_weights)
+                call self%cuda_q4_weights(i)%destroy(cleanup_stat)
+            end do
+            deallocate(self%cuda_q4_weights)
+        end if
+        call self%cuda_q4%destroy(cleanup_stat)
         self%cuda_enabled = .false.
         call self%cuda%destroy(cleanup_stat)
         call self%cuda%create(device, stat)
@@ -354,8 +378,66 @@ contains
                 return
             end if
         end do
+        have_q4 = .false.
+        do i = 1, size(self%file%tensors)
+            if (is_q4_xl_type(self%file%tensors(i)%value_type) .and. &
+                    size(self%file%tensors(i)%shape) == 2) then
+                have_q4 = .true.
+                exit
+            end if
+        end do
+        if (have_q4) then
+            q4_second_device = device + 1
+            ! The default pair is device/device+1; an explicit override is
+            ! parsed below without making the Q8 single-device path depend on it.
+            block
+                character(len=32) :: second_text
+                integer :: second_length, second_status
+                call get_environment_variable('FORTAI_CUDA_Q4_SECOND_DEVICE', second_text, length=second_length)
+                if (second_length > 0) read(second_text(1:second_length), *, iostat=second_status) q4_second_device
+            end block
+            call self%cuda_q4%create(device, q4_second_device, stat)
+            if (.not. stat%is_ok()) then
+                do j = 1, size(self%cuda_weights)
+                    call self%cuda_weights(j)%destroy(cleanup_stat)
+                end do
+                deallocate(self%cuda_weights)
+                call self%cuda%destroy(cleanup_stat)
+                return
+            end if
+            allocate(self%cuda_q4_weights(size(self%file%tensors)))
+            q4_bytes = 0_int64
+            do i = 1, size(self%file%tensors)
+                if (.not. is_q4_xl_type(self%file%tensors(i)%value_type)) cycle
+                if (size(self%file%tensors(i)%shape) /= 2) cycle
+                if (is_unused_q4_tensor(self, i)) cycle
+                q4_device = 1
+                if (q4_bytes(1) <= q4_bytes(2)) q4_device = 0
+                rows = int(self%file%tensors(i)%shape(2))
+                width = int(self%file%tensors(i)%shape(1))
+                call self%cuda_q4_weights(i)%upload(self%cuda_q4, self%file%tensors(i)%value_type, &
+                    self%file%tensors(i)%bytes, int(size(self%file%tensors(i)%bytes), c_size_t), &
+                    rows, width, q4_device, stat)
+                if (.not. stat%is_ok()) then
+                    do j = 1, size(self%cuda_q4_weights)
+                        call self%cuda_q4_weights(j)%destroy(cleanup_stat)
+                    end do
+                    deallocate(self%cuda_q4_weights)
+                    call self%cuda_q4%destroy(cleanup_stat)
+                    do j = 1, size(self%cuda_weights)
+                        call self%cuda_weights(j)%destroy(cleanup_stat)
+                    end do
+                    deallocate(self%cuda_weights)
+                    call self%cuda%destroy(cleanup_stat)
+                    return
+                end if
+                q4_bytes(q4_device + 1) = q4_bytes(q4_device + 1) + &
+                    int(size(self%file%tensors(i)%bytes), int64)
+            end do
+        end if
         do i = 1, size(self%layers)
             if (.not. self%layers(i)%recurrent) cycle
+            if (.not. all_q8_recurrent_weights(self, i)) cycle
             call self%layers(i)%cuda_recurrent%create(self%cuda, &
                 self%cuda_weights(self%layers(i)%attn_qkv), self%cuda_weights(self%layers(i)%attn_gate), &
                 self%cuda_weights(self%layers(i)%ssm_alpha), self%cuda_weights(self%layers(i)%ssm_beta), &
@@ -385,6 +467,7 @@ contains
         end do
         do i = 1, size(self%layers)
             if (self%layers(i)%recurrent) cycle
+            if (.not. all_q8_attention_weights(self, i)) cycle
             if (size(self%file%tensors(self%layers(i)%q_norm)%bytes) /= &
                 self%attention_head_size * storage_size(self%x(1)) / 8) cycle
             if (size(self%file%tensors(self%layers(i)%k_norm)%bytes) /= &
@@ -556,8 +639,16 @@ contains
             end do
             deallocate(self%cuda_weights)
         end if
+        if (allocated(self%cuda_q4_weights)) then
+            do i = 1, size(self%cuda_q4_weights)
+                call self%cuda_q4_weights(i)%destroy(cuda_stat)
+            end do
+            deallocate(self%cuda_q4_weights)
+        end if
+        call self%cuda_q4%destroy(cuda_stat)
         call self%cuda%destroy(cuda_stat)
         self%cuda_enabled = .false.
+        call gguf_quant_cache_clear()
 
         if (allocated(self % layers)) then
             do i = 1, size(self % layers)
@@ -894,18 +985,11 @@ contains
                 self%alpha_work, self%beta_work, stat)
             if (.not. stat%is_ok()) return
         else
-            ! Fuse recurrent projection pairs into one quantization and one
-            ! OpenMP region; the two output widths need not be equal.
-            call self%file%tensors(layer%attn_qkv)%matvec_pair_q8( &
-                self%file%tensors(layer%attn_gate), input, &
-                self%qkv_work(1:self%recurrent_conv_size), &
-                self%gate_work(1:self%recurrent_inner_size), &
-                self%quantized_input, self%quantized_scales, stat, self%persistent_openmp_active)
+            call model_matvec_pair(self, layer%attn_qkv, layer%attn_gate, input, &
+                self%qkv_work(1:self%recurrent_conv_size), self%gate_work(1:self%recurrent_inner_size), stat)
             if (.not. stat % is_ok()) return
-            call self%file%tensors(layer%ssm_alpha)%matvec_pair_q8( &
-                self%file%tensors(layer%ssm_beta), input, self%alpha_work, &
-                self%beta_work, self%quantized_input, self%quantized_scales, stat, &
-                self%persistent_openmp_active)
+            call model_matvec_pair(self, layer%ssm_alpha, layer%ssm_beta, input, &
+                self%alpha_work, self%beta_work, stat)
             if (.not. stat % is_ok()) return
         end if
         call fortai_silu(self % gate_work, int(self % recurrent_inner_size, c_int64_t))
@@ -974,6 +1058,58 @@ contains
         end do
         call model_matvec(self, layer%ssm_out, self%attention_work, self%hidden_work, stat)
     end subroutine forward_recurrent
+
+    logical function is_q4_xl_type(value_type)
+        integer(int32), intent(in) :: value_type
+
+        is_q4_xl_type = value_type == GGML_TYPE_Q3_K .or. value_type == GGML_TYPE_Q4_K .or. &
+            value_type == GGML_TYPE_Q5_K .or. value_type == GGML_TYPE_Q6_K .or. &
+            value_type == GGML_TYPE_IQ4_NL .or. value_type == GGML_TYPE_IQ3_S .or. &
+            value_type == GGML_TYPE_IQ4_XS
+    end function is_q4_xl_type
+
+    logical function is_unused_q4_tensor(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+        character(len=:), allocatable :: tensor_name
+
+        is_unused_q4_tensor = .false.
+        if (self%layer_count > 64_int32) return
+        tensor_name = trim(self%file%tensors(tensor_index)%name)
+        ! Some UD-Q4_K_XL files carry a spare block after the active model
+        ! layers.  llama.cpp does not schedule it; avoid allocating it on
+        ! either GPU while retaining all active tensors for <=64-layer models.
+        if (len(tensor_name) >= 7) is_unused_q4_tensor = tensor_name(1:7) == 'blk.64.'
+    end function is_unused_q4_tensor
+
+    logical function all_q8_recurrent_weights(self, layer_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: layer_index
+        integer :: indices(5), i
+
+        all_q8_recurrent_weights = .false.
+        indices = [self%layers(layer_index)%attn_qkv, self%layers(layer_index)%attn_gate, &
+            self%layers(layer_index)%ssm_alpha, self%layers(layer_index)%ssm_beta, &
+            self%layers(layer_index)%ssm_out]
+        do i = 1, size(indices)
+            if (indices(i) <= 0 .or. self%file%tensors(indices(i))%value_type /= GGML_TYPE_Q8_0) return
+        end do
+        all_q8_recurrent_weights = .true.
+    end function all_q8_recurrent_weights
+
+    logical function all_q8_attention_weights(self, layer_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: layer_index
+        integer :: indices(4), i
+
+        all_q8_attention_weights = .false.
+        indices = [self%layers(layer_index)%attn_q, self%layers(layer_index)%attn_k, &
+            self%layers(layer_index)%attn_v, self%layers(layer_index)%attn_out]
+        do i = 1, size(indices)
+            if (indices(i) <= 0 .or. self%file%tensors(indices(i))%value_type /= GGML_TYPE_Q8_0) return
+        end do
+        all_q8_attention_weights = .true.
+    end function all_q8_attention_weights
 
     logical function cuda_recurrent_projection_ready(self, layer)
         class(qwen35_cpu_model_t), intent(in) :: self
@@ -1234,6 +1370,7 @@ contains
         real(real32), contiguous, intent(in) :: input(:)
         real(real32), contiguous, intent(out) :: output(:)
         type(status_t), intent(out) :: stat
+        real(c_float) :: elapsed_ms
 
         call stat % clear()
         if (tensor_index == 0 .or. size(input) > size(self % quantized_input)) then
@@ -1253,6 +1390,12 @@ contains
             end if
             call self % file % tensors(tensor_index) % matvec_q8(input, output, &
                 self % quantized_input, self % quantized_scales, stat, self%persistent_openmp_active)
+        else if (is_q4_xl_type(self % file % tensors(tensor_index) % value_type) .and. &
+                self%cuda_enabled .and. allocated(self%cuda_q4_weights) .and. &
+                tensor_index <= size(self%cuda_q4_weights) .and. &
+                c_associated(self%cuda_q4_weights(tensor_index)%handle)) then
+            call cuda_q4_matvec_host(self%cuda_q4, self%cuda_q4_weights(tensor_index), input, output, &
+                elapsed_ms, stat)
         else
             call self % file % tensors(tensor_index) % matvec(input, output, stat)
         end if

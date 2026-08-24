@@ -309,8 +309,8 @@ review_verdict: PASS
 | FAI-CUDA-001A | host-controlled Qwen3.5 CUDA integration slice | experimental, measured slower | weights resident, model correctness smoke, persistent transfer/launch profile; cannot be promoted |
 | FAI-CUDA-001B | device-resident Qwen3.5 recurrent, attention, KV, and FFN path | experimental, measured at llama.cpp parity | 0.8B/2B/4B smoke, CUDA trace parity, and fewer host activation round trips |
 | FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | experimental, opt-in, variance-sensitive on RTX 5060 Ti | matched Nsight profile and end-to-end speed at least equal to the direct resident plan and llama.cpp |
-| FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | deferred | two-device placement, transfer accounting, and stable generation |
-| FAI-CUDA-002 | Q4 repack and fused GDN kernels | deferred | validated kernel tournament on named GPUs |
+| FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | experimental, native two-device placement implemented | two-device placement, transfer accounting, and stable generation oracle |
+| FAI-CUDA-002 | native mixed-quant Q4/IQ kernels and fused GDN kernels | experimental, GGML CPU/CUDA bridge implemented | Q3/Q4/Q5/Q6/IQ tensor coverage, independent llama.cpp oracle, and validated kernel tournament on named GPUs; `benchmark/run_q4_cuda_compat.sh` remains oracle-only |
 | FAI-CUDA-003 | CUDA MTP and speculative decoding | deferred | acceptance rate and end-to-end throughput |
 
 The 27B path must include multi-GPU placement from its first production CUDA
