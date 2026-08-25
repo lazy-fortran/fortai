@@ -222,7 +222,7 @@ contains
             'GDN first output', failures)
         call require(abs(output(2) - 10.0_real64) < 1.0e-12_real64, &
             'GDN second output', failures)
-        call require(.not. qwen35_mtp_available(), 'MTP is explicit pending work', failures)
+        call require(qwen35_mtp_available(), 'native MTP implementation is compiled', failures)
         call require(.not. qwen35_dflash2_available(), &
             'DFlash2 is explicit pending work', failures)
         call require(.not. qwen35_vision_available(), &

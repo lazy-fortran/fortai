@@ -7,7 +7,11 @@ module fortai_qwen35_mtp
 contains
 
     logical function qwen35_mtp_available()
-        qwen35_mtp_available = .false.
+        ! The native Qwen3.8 NextN/MTP graph is implemented in
+        ! fortai_qwen35_cpu.  Model-level availability is still reported by
+        ! qwen35_cpu_model_t%mtp_available because ordinary GGUF files do not
+        ! carry the optional block.
+        qwen35_mtp_available = .true.
     end function qwen35_mtp_available
 
 end module fortai_qwen35_mtp

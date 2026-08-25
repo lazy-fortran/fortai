@@ -31,6 +31,8 @@ module fortai_native_service
     public :: fortai_native_service_default_thinking
     public :: fortai_native_service_supports_reasoning_effort
     public :: fortai_native_service_supports_preserve_thinking
+    public :: fortai_native_service_mtp_available
+    public :: fortai_native_service_mtp_active
 
 contains
 
@@ -121,6 +123,14 @@ contains
     logical function fortai_native_service_supports_preserve_thinking()
         fortai_native_service_supports_preserve_thinking = service_tokenizer%supports_preserve_thinking
     end function fortai_native_service_supports_preserve_thinking
+
+    logical function fortai_native_service_mtp_available()
+        fortai_native_service_mtp_available = service_ready .and. service_model%mtp_available
+    end function fortai_native_service_mtp_available
+
+    logical function fortai_native_service_mtp_active()
+        fortai_native_service_mtp_active = service_ready .and. service_model%mtp_active
+    end function fortai_native_service_mtp_active
 
     integer function fortai_native_service_complete_text(prompt_text, max_tokens, output_text, token_count)
         character(len=*), intent(in) :: prompt_text

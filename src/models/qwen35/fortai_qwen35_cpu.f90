@@ -156,6 +156,7 @@ module fortai_qwen35_cpu
     type, public :: qwen35_cpu_model_t
         type(gguf_file_t) :: file
         type(qwen35_cpu_layer_t), allocatable :: layers(:)
+        type(qwen35_cpu_layer_t) :: mtp_layer
         integer(int32) :: hidden_size = 0_int32
         integer(int32) :: vocabulary_size = 0_int32
         integer(int32) :: layer_count = 0_int32
@@ -179,6 +180,13 @@ module fortai_qwen35_cpu
         integer(int32) :: output_norm = 0_int32
         integer(int32) :: output = 0_int32
         integer(int32) :: token_embedding = 0_int32
+        integer(int32) :: mtp_eh_proj = 0_int32
+        integer(int32) :: mtp_enorm = 0_int32
+        integer(int32) :: mtp_hnorm = 0_int32
+        integer(int32) :: mtp_embed_tokens = 0_int32
+        integer(int32) :: mtp_shared_head_norm = 0_int32
+        integer(int32) :: mtp_shared_head_head = 0_int32
+        integer(int32) :: mtp_output = 0_int32
         real(real32) :: norm_epsilon = 1.0e-6_real32
         real(real32) :: rope_base = 10000000.0_real32
         real(real32), allocatable :: x(:)
@@ -199,6 +207,11 @@ module fortai_qwen35_cpu
         real(real32), allocatable :: beta_work(:)
         real(real32), allocatable :: alpha_work(:)
         real(real32), allocatable :: logits(:)
+        real(real32), allocatable :: mtp_target_hidden(:)
+        real(real32), allocatable :: mtp_pending_hidden(:)
+        real(real32), allocatable :: mtp_embedding(:)
+        real(real32), allocatable :: mtp_concat(:)
+        real(real32), allocatable :: mtp_logits(:)
         integer(int8), allocatable :: quantized_input(:)
         real(real32), allocatable :: quantized_scales(:)
         type(cuda_q8_context_t) :: cuda
@@ -234,6 +247,13 @@ module fortai_qwen35_cpu
         logical :: cuda_q4_group_enabled = .true.
         logical :: fast_enabled = .false.
         logical :: fast_gpu = .false.
+        logical :: mtp_available = .false.
+        logical :: mtp_active = .false.
+        integer(int64) :: mtp_last_pair_position = -1_int64
+        integer(int64) :: mtp_last_target_position = -1_int64
+        integer(int64) :: mtp_last_pair_token = -1_int64
+        integer(int64) :: mtp_last_draft_token = -1_int64
+        logical :: mtp_last_draft_match = .false.
         logical :: persistent_openmp = .false.
         logical :: persistent_openmp_active = .false.
     contains
@@ -242,6 +262,7 @@ module fortai_qwen35_cpu
         procedure :: forward => qwen35_cpu_forward
         procedure :: forward_greedy => qwen35_cpu_forward_greedy
         procedure :: forward_greedy_speculative => qwen35_cpu_forward_greedy_speculative
+        procedure :: mtp_draft_greedy => qwen35_cpu_mtp_draft_greedy
         procedure :: gdn_state_add => qwen35_cpu_model_gdn_state_add
         procedure :: gdn_state_value => qwen35_cpu_model_gdn_state_value
         procedure :: layers_key_value => qwen35_cpu_model_layers_key_value
@@ -258,15 +279,17 @@ contains
         character(len=*), intent(in) :: path
         integer(int64), intent(in), optional :: max_context
         type(status_t), intent(out) :: stat
-        integer(int32) :: i, interval
+        integer(int32) :: i, interval, raw_layer_count, mtp_block
         integer :: work_size
+        logical :: mtp_schema
 
         call self % close()
         self%model_path = trim(path)
         self%max_context = 256_int64
         if (present(max_context)) self%max_context = max_context
         self%persistent_openmp = .false.
-        if (fast_path_mode() == 1 .or. fast_path_mode() == 3) then
+        if ((fast_path_mode() == 1 .or. fast_path_mode() == 3) .and. &
+            .not. native_mtp_requested()) then
             call fast_context_create(self, 0, 0, stat)
             if (stat%is_ok()) then
                 self%fast_gpu = .false.
@@ -280,12 +303,29 @@ contains
 
         self%hidden_size = int(self%file%meta_int('qwen35.embedding_length', 0_int64), int32)
         self%vocabulary_size = int(self%file%meta_int('qwen35.vocab_size', 0_int64), int32)
-        self % layer_count = int(self % file % meta_int('qwen35.block_count', 0_int64), int32)
+        raw_layer_count = int(self % file % meta_int('qwen35.block_count', 0_int64), int32)
+        self % layer_count = raw_layer_count
+        self%mtp_available = .false.
+        self%mtp_active = .false.
+        self%mtp_last_pair_position = -1_int64
+        self%mtp_last_target_position = -1_int64
+        self%mtp_last_pair_token = -1_int64
+        self%mtp_last_draft_token = -1_int64
+        self%mtp_last_draft_match = .false.
         ! Qwen3.8-27B Q4_K_XL carries one MTP/nextn block after the base
-        ! transformer.  llama.cpp intentionally leaves blk.64.* unused;
-        ! keep the base model's 64 layers in the native runner as well.
-        if (self % layer_count > 64 .and. self % file % find_tensor( &
-            'blk.64.nextn.eh_proj.weight') > 0) self % layer_count = 64
+        ! transformer.  Keep the base block count separate and bind the
+        ! optional NextN block below when the caller explicitly requests it.
+        mtp_schema = .false.
+        mtp_block = raw_layer_count - 1
+        if (raw_layer_count > 1 .and. find_layer_tensor(self%file, mtp_block, &
+            'nextn.eh_proj.weight') > 0) then
+            mtp_schema = .true.
+            self % layer_count = mtp_block
+        end if
+        if (native_mtp_requested() .and. .not. mtp_schema) then
+            call stat%set(FORTAI_UNSUPPORTED, 'native MTP was requested but the GGUF has no NextN block')
+            return
+        end if
         self % feed_forward_size = int(self % file % meta_int( &
             'qwen35.feed_forward_length', 0_int64), int32)
         self % attention_heads = int(self % file % meta_int( &
@@ -386,6 +426,24 @@ contains
             end if
         end do
 
+        if (mtp_schema) then
+            call bind_mtp_layer(self, mtp_block, stat)
+            if (.not. stat%is_ok()) then
+                if (native_mtp_requested()) then
+                    return
+                end if
+                call stat%clear()
+                self%mtp_eh_proj = 0
+            else
+                self%mtp_available = .true.
+                self%mtp_active = native_mtp_requested()
+                allocate(self%mtp_layer%key_cache(self%attention_head_size * &
+                    self%attention_heads_kv * self%max_context))
+                allocate(self%mtp_layer%value_cache(self%value_length * &
+                    self%attention_heads_kv * self%max_context))
+            end if
+        end if
+
         work_size = max(self % feed_forward_size, self % recurrent_conv_size)
         work_size = max(work_size, 2 * self % attention_heads * self % attention_head_size)
         work_size = max(work_size, self % hidden_size)
@@ -405,6 +463,13 @@ contains
         allocate (self % beta_work(self % recurrent_value_heads))
         allocate (self % alpha_work(self % recurrent_value_heads))
         allocate (self % logits(self % vocabulary_size))
+        if (self%mtp_available) then
+            allocate(self%mtp_target_hidden(self%hidden_size))
+            allocate(self%mtp_pending_hidden(self%hidden_size))
+            allocate(self%mtp_embedding(self%hidden_size))
+            allocate(self%mtp_concat(2 * self%hidden_size))
+            allocate(self%mtp_logits(self%vocabulary_size))
+        end if
         allocate (self % quantized_input(work_size + 2 * ((work_size + 31) / 32)))
         allocate (self % quantized_scales((work_size + 31) / 32))
         call self % reset()
@@ -430,7 +495,8 @@ contains
         if (group_length > 0 .and. group_env(1:1) == '0') self%cuda_q4_group_enabled = .false.
         call fast_context_destroy(self)
         self%fast_gpu = .false.
-        if (fast_path_mode() == 2 .or. fast_path_mode() == 3) then
+        if ((fast_path_mode() == 2 .or. fast_path_mode() == 3) .and. &
+            .not. native_mtp_requested()) then
             call fast_context_create(self, -1, device, stat)
             if (stat%is_ok()) then
                 self%fast_gpu = .true.
@@ -684,6 +750,11 @@ contains
         self%cuda_device_pipeline = .false.
         self%cuda_graph_enabled = .false.
         self%cuda_graph_ready = .false.
+        ! Native MTP consumes the target pre-output hidden state on the host
+        ! and shares the host KV implementation for its attention block.
+        ! Keep the device-resident graph disabled until hidden-state export is
+        ! implemented for that explicit mode.
+        if (self%mtp_active) return
         call get_environment_variable('FORTAI_DISABLE_CUDA_DEVICE_PIPELINE', pipeline_env, length=pipeline_length)
         if (pipeline_length > 0) then
             if (pipeline_env(1:1) == '1') return
@@ -876,6 +947,8 @@ contains
                     call self%layers(i)%cuda_attention%destroy(cuda_stat)
                 end do
             end if
+            call self%mtp_layer%cuda_recurrent%destroy(cuda_stat)
+            call self%mtp_layer%cuda_attention%destroy(cuda_stat)
             do i = 1, size(self%cuda_weights)
                 call self%cuda_weights(i)%destroy(cuda_stat)
             end do
@@ -907,6 +980,10 @@ contains
             end do
             deallocate (self % layers)
         end if
+        if (allocated(self%mtp_layer%conv_state)) deallocate(self%mtp_layer%conv_state)
+        if (allocated(self%mtp_layer%gdn_state)) deallocate(self%mtp_layer%gdn_state)
+        if (allocated(self%mtp_layer%key_cache)) deallocate(self%mtp_layer%key_cache)
+        if (allocated(self%mtp_layer%value_cache)) deallocate(self%mtp_layer%value_cache)
         if (allocated(self % x)) deallocate (self % x)
         if (allocated(self % residual)) deallocate (self % residual)
         if (allocated(self % normalized)) deallocate (self % normalized)
@@ -925,6 +1002,11 @@ contains
         if (allocated(self % beta_work)) deallocate (self % beta_work)
         if (allocated(self % alpha_work)) deallocate (self % alpha_work)
         if (allocated(self % logits)) deallocate (self % logits)
+        if (allocated(self%mtp_target_hidden)) deallocate(self%mtp_target_hidden)
+        if (allocated(self%mtp_pending_hidden)) deallocate(self%mtp_pending_hidden)
+        if (allocated(self%mtp_embedding)) deallocate(self%mtp_embedding)
+        if (allocated(self%mtp_concat)) deallocate(self%mtp_concat)
+        if (allocated(self%mtp_logits)) deallocate(self%mtp_logits)
         if (allocated(self % quantized_input)) deallocate (self % quantized_input)
         if (allocated(self % quantized_scales)) deallocate (self % quantized_scales)
         call self % file % close()
@@ -932,6 +1014,20 @@ contains
         self % hidden_size = 0
         self % vocabulary_size = 0
         self % layer_count = 0
+        self%mtp_available = .false.
+        self%mtp_active = .false.
+        self%mtp_last_pair_position = -1_int64
+        self%mtp_last_target_position = -1_int64
+        self%mtp_last_pair_token = -1_int64
+        self%mtp_last_draft_token = -1_int64
+        self%mtp_last_draft_match = .false.
+        self%mtp_eh_proj = 0
+        self%mtp_enorm = 0
+        self%mtp_hnorm = 0
+        self%mtp_embed_tokens = 0
+        self%mtp_shared_head_norm = 0
+        self%mtp_shared_head_head = 0
+        self%mtp_output = 0
         self%persistent_openmp = .false.
         self%persistent_openmp_active = .false.
     end subroutine qwen35_cpu_close
@@ -953,6 +1049,14 @@ contains
                 if (self%cuda_enabled) call self%layers(i)%cuda_attention%reset(cuda_stat)
             end do
         end if
+        if (allocated(self%mtp_layer%key_cache)) self%mtp_layer%key_cache = 0.0_real32
+        if (allocated(self%mtp_layer%value_cache)) self%mtp_layer%value_cache = 0.0_real32
+        if (allocated(self%mtp_pending_hidden)) self%mtp_pending_hidden = 0.0_real32
+        self%mtp_last_pair_position = -1_int64
+        self%mtp_last_target_position = -1_int64
+        self%mtp_last_pair_token = -1_int64
+        self%mtp_last_draft_token = -1_int64
+        self%mtp_last_draft_match = .false.
     end subroutine qwen35_cpu_reset
 
     subroutine qwen35_cpu_forward(self, token_id, position, logits, stat)
@@ -975,6 +1079,54 @@ contains
             call qwen35_cpu_forward_body(self, token_id, position, logits, stat)
         end if
     end subroutine qwen35_cpu_forward
+
+    logical function native_mtp_requested()
+        character(len=64) :: value
+        integer :: length
+
+        native_mtp_requested = .false.
+        value = ''
+        call get_environment_variable('FORTAI_NATIVE_MTP', value, length=length)
+        if (length > 0) then
+            select case (trim(value(1:length)))
+            case ('1', 'true', 'on', 'yes')
+                native_mtp_requested = .true.
+                return
+            case ('0', 'false', 'off', 'no')
+                return
+            end select
+        end if
+        value = ''
+        call get_environment_variable('FORTAI_SPEC_TYPE', value, length=length)
+        if (length > 0) then
+            if (trim(value(1:length)) == 'draft-mtp') then
+                native_mtp_requested = .true.
+                return
+            end if
+        end if
+        value = ''
+        call get_environment_variable('LLAMA_ARG_SPEC_TYPE', value, length=length)
+        if (length > 0) then
+            if (trim(value(1:length)) == 'draft-mtp') then
+                native_mtp_requested = .true.
+                return
+            end if
+        end if
+        value = ''
+        call get_environment_variable('LLAMACPP_SPEC_TYPE', value, length=length)
+        if (length > 0) then
+            native_mtp_requested = trim(value(1:length)) == 'draft-mtp'
+            if (native_mtp_requested) return
+        end if
+        value = ''
+        call get_environment_variable('FORTAI_DRAFT_MODEL', value, length=length)
+        if (length > 0) then
+            ! The published Qwen3.8 sidecar is a tensor carrier, not a
+            ! standalone transformer.  Its filename is the only portable
+            ! signal available to the native CLI when --model-draft is used.
+            native_mtp_requested = index(value(1:length), 'mtp') > 0
+        end if
+    end function native_mtp_requested
 
     subroutine qwen35_cpu_forward_greedy(self, token_id, position, next_token, logit_sum, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
@@ -1029,6 +1181,8 @@ contains
         integer(c_int) :: code, count_c
         integer(c_int) :: c_tokens(32)
         integer :: i, capacity
+        integer(int64) :: draft_token, verified_token
+        real(real32) :: draft_sum, verified_sum
 
         call stat%clear()
         count = 0
@@ -1038,6 +1192,20 @@ contains
             return
         end if
         capacity = min(size(tokens), size(c_tokens))
+        if (.not. self%fast_enabled .and. self%mtp_active .and. capacity >= 2 .and. &
+            position + 1_int64 < self%max_context) then
+            call self%forward_greedy(token_id, position, tokens(1), logit_sum, stat)
+            if (.not. stat%is_ok()) return
+            call self%mtp_draft_greedy(tokens(1), position + 1_int64, draft_token, draft_sum, stat)
+            if (.not. stat%is_ok()) return
+            call self%forward_greedy(tokens(1), position + 1_int64, verified_token, verified_sum, stat)
+            if (.not. stat%is_ok()) return
+            tokens(2) = verified_token
+            self%mtp_last_draft_token = draft_token
+            self%mtp_last_draft_match = draft_token == verified_token
+            count = 2
+            return
+        end if
         if (.not. self%fast_enabled) then
             call self%forward_greedy(token_id, position, tokens(1), logit_sum, stat)
             if (stat%is_ok()) count = 1
@@ -1083,6 +1251,18 @@ contains
         if (position < 0_int64 .or. position >= self % max_context) then
             call stat % set(FORTAI_INVALID, 'Qwen3.5 position exceeds the CPU context')
             return
+        end if
+        if (self%mtp_active) then
+            if (.not. allocated(self%mtp_pending_hidden)) then
+                call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP workspace is not allocated')
+                return
+            end if
+            if (position /= self%mtp_last_target_position + 1_int64) then
+                call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP requires sequential positions')
+                return
+            end if
+            call qwen35_cpu_mtp_pair(self, token_id, position, self%mtp_pending_hidden, stat)
+            if (.not. stat%is_ok()) return
         end if
         if (self%fast_enabled) then
             if (fortai_llama_fast_context_decode(self%fast_handle, int(token_id, c_int), &
@@ -1187,7 +1367,107 @@ contains
             self % normalized, stat)
         if (.not. stat % is_ok()) return
         call model_matvec(self, self % output, self % normalized, logits, stat)
+        if (stat%is_ok() .and. self%mtp_active) then
+            self%mtp_pending_hidden = self%x
+            self%mtp_last_target_position = position
+        end if
     end subroutine qwen35_cpu_forward_body
+
+    subroutine qwen35_cpu_mtp_pair(self, token_id, position, hidden, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(int64), intent(in) :: token_id, position
+        real(real32), contiguous, intent(in) :: hidden(:)
+        type(status_t), intent(out) :: stat
+
+        call stat%clear()
+        if (.not. self%mtp_available .or. .not. self%mtp_active) then
+            call stat%set(FORTAI_UNSUPPORTED, 'Qwen3.5 native MTP is not active')
+            return
+        end if
+        if (self%mtp_last_pair_position == position .and. self%mtp_last_pair_token == token_id) return
+        if (size(hidden) /= self%hidden_size .or. token_id < 0_int64 .or. &
+            token_id >= self%vocabulary_size .or. position < 0_int64 .or. &
+            position >= self%max_context) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP pair dimensions are invalid')
+            return
+        end if
+        if (.not. allocated(self%mtp_layer%key_cache) .or. .not. allocated(self%mtp_layer%value_cache)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP KV cache is not allocated')
+            return
+        end if
+
+        self%mtp_target_hidden = hidden
+        if (self%mtp_embed_tokens > 0) then
+            call self%file%tensors(self%mtp_embed_tokens)%get_row(token_id + 1_int64, &
+                self%mtp_embedding, stat)
+        else
+            call self%file%tensors(self%token_embedding)%get_row(token_id + 1_int64, &
+                self%mtp_embedding, stat)
+        end if
+        if (.not. stat%is_ok()) return
+        call rms_norm(self%mtp_embedding, self%file%tensors(self%mtp_enorm), self%norm_epsilon, &
+            self%normalized, stat)
+        if (.not. stat%is_ok()) return
+        call rms_norm(self%mtp_target_hidden, self%file%tensors(self%mtp_hnorm), self%norm_epsilon, &
+            self%hidden_work, stat)
+        if (.not. stat%is_ok()) return
+        self%mtp_concat(1:self%hidden_size) = self%normalized
+        self%mtp_concat(self%hidden_size + 1:2 * self%hidden_size) = self%hidden_work
+        call model_matvec(self, self%mtp_eh_proj, self%mtp_concat, self%x, stat)
+        if (.not. stat%is_ok()) return
+
+        self%residual = self%x
+        call rms_norm(self%x, self%file%tensors(self%mtp_layer%attn_norm), self%norm_epsilon, &
+            self%normalized, stat)
+        if (.not. stat%is_ok()) return
+        call forward_attention(self, self%mtp_layer, position, stat)
+        if (.not. stat%is_ok()) return
+        self%x = self%hidden_work + self%residual
+        self%residual = self%x
+        call rms_norm(self%x, self%file%tensors(self%mtp_layer%post_norm), self%norm_epsilon, &
+            self%normalized, stat)
+        if (.not. stat%is_ok()) return
+        call model_matvec_pair(self, self%mtp_layer%ffn_gate, self%mtp_layer%ffn_up, &
+            self%normalized, self%ffn_gate_work, self%ffn_up_work, stat)
+        if (.not. stat%is_ok()) return
+        call silu_product(self%ffn_gate_work, self%ffn_up_work)
+        call model_matvec(self, self%mtp_layer%ffn_down, self%ffn_gate_work, self%hidden_work, stat)
+        if (.not. stat%is_ok()) return
+        self%x = self%hidden_work + self%residual
+        call rms_norm(self%x, self%file%tensors(self%mtp_shared_head_norm), self%norm_epsilon, &
+            self%normalized, stat)
+        if (.not. stat%is_ok()) return
+        call model_matvec(self, self%mtp_output, self%normalized, self%mtp_logits, stat)
+        if (.not. stat%is_ok()) return
+
+        self%x = self%mtp_target_hidden
+        self%mtp_last_pair_position = position
+        self%mtp_last_pair_token = token_id
+    end subroutine qwen35_cpu_mtp_pair
+
+    subroutine qwen35_cpu_mtp_draft_greedy(self, token_id, position, next_token, logit_sum, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(int64), intent(in) :: token_id, position
+        integer(int64), intent(out) :: next_token
+        real(real32), intent(out) :: logit_sum
+        type(status_t), intent(out) :: stat
+
+        next_token = 0_int64
+        logit_sum = 0.0_real32
+        call stat%clear()
+        if (.not. self%mtp_active) then
+            call stat%set(FORTAI_UNSUPPORTED, 'Qwen3.5 native MTP is not active')
+            return
+        end if
+        if (.not. allocated(self%mtp_logits)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP logits workspace is not allocated')
+            return
+        end if
+        call qwen35_cpu_mtp_pair(self, token_id, position, self%x, stat)
+        if (.not. stat%is_ok()) return
+        next_token = int(maxloc(self%mtp_logits, dim=1) - 1, int64)
+        logit_sum = sum(self%mtp_logits)
+    end subroutine qwen35_cpu_mtp_draft_greedy
 
     integer function fast_path_mode()
         character(len=16) :: value
@@ -1671,7 +1951,7 @@ contains
         character(len=:), allocatable :: tensor_name
 
         is_unused_q4_tensor = .false.
-        if (self%layer_count > 64_int32) return
+        if (self%layer_count > 64_int32 .or. self%mtp_active) return
         tensor_name = trim(self%file%tensors(tensor_index)%name)
         ! Some UD-Q4_K_XL files carry a spare block after the active model
         ! layers.  llama.cpp does not schedule it; avoid allocating it on
@@ -1973,6 +2253,92 @@ contains
             end if
         end associate
     end subroutine bind_layer
+
+    subroutine bind_mtp_layer(self, block_number, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: block_number
+        type(status_t), intent(out) :: stat
+        type(qwen35_cpu_layer_t) :: layer
+
+        call stat%clear()
+        layer%recurrent = .false.
+        layer%attn_norm = find_layer_tensor(self%file, block_number, 'attn_norm.weight')
+        layer%post_norm = find_layer_tensor(self%file, block_number, 'post_attention_norm.weight')
+        layer%ffn_gate = find_layer_tensor(self%file, block_number, 'ffn_gate.weight')
+        layer%ffn_up = find_layer_tensor(self%file, block_number, 'ffn_up.weight')
+        layer%ffn_down = find_layer_tensor(self%file, block_number, 'ffn_down.weight')
+        layer%attn_q = find_layer_tensor(self%file, block_number, 'attn_q.weight')
+        layer%attn_k = find_layer_tensor(self%file, block_number, 'attn_k.weight')
+        layer%attn_v = find_layer_tensor(self%file, block_number, 'attn_v.weight')
+        layer%attn_out = find_layer_tensor(self%file, block_number, 'attn_output.weight')
+        layer%q_norm = find_layer_tensor(self%file, block_number, 'attn_q_norm.weight')
+        layer%k_norm = find_layer_tensor(self%file, block_number, 'attn_k_norm.weight')
+        self%mtp_eh_proj = find_layer_tensor(self%file, block_number, 'nextn.eh_proj.weight')
+        self%mtp_enorm = find_layer_tensor(self%file, block_number, 'nextn.enorm.weight')
+        self%mtp_hnorm = find_layer_tensor(self%file, block_number, 'nextn.hnorm.weight')
+        self%mtp_embed_tokens = find_layer_tensor(self%file, block_number, 'nextn.embed_tokens.weight')
+        self%mtp_shared_head_norm = find_layer_tensor(self%file, block_number, &
+            'nextn.shared_head_norm.weight')
+        self%mtp_shared_head_head = find_layer_tensor(self%file, block_number, &
+            'nextn.shared_head_head.weight')
+        self%mtp_output = self%output
+        if (self%mtp_shared_head_head > 0) self%mtp_output = self%mtp_shared_head_head
+
+        if (layer%attn_norm == 0 .or. layer%post_norm == 0 .or. layer%ffn_gate == 0 .or. &
+            layer%ffn_up == 0 .or. layer%ffn_down == 0 .or. layer%attn_q == 0 .or. &
+            layer%attn_k == 0 .or. layer%attn_v == 0 .or. layer%attn_out == 0 .or. &
+            layer%q_norm == 0 .or. layer%k_norm == 0 .or. self%mtp_eh_proj == 0 .or. &
+            self%mtp_enorm == 0 .or. self%mtp_hnorm == 0) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 MTP block is incomplete')
+            return
+        end if
+        if (self%mtp_shared_head_norm == 0) self%mtp_shared_head_norm = self%output_norm
+        call check_tensor_shape(self, layer%attn_norm, 1, self%hidden_size, 0, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%post_norm, 1, self%hidden_size, 0, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%ffn_gate, 2, self%hidden_size, self%feed_forward_size, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%ffn_up, 2, self%hidden_size, self%feed_forward_size, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%ffn_down, 2, self%feed_forward_size, self%hidden_size, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%attn_q, 2, self%hidden_size, &
+            2 * self%attention_heads * self%attention_head_size, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%attn_k, 2, self%hidden_size, &
+            self%attention_heads_kv * self%attention_head_size, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%attn_v, 2, self%hidden_size, &
+            self%attention_heads_kv * self%value_length, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%attn_out, 2, self%attention_heads * self%value_length, &
+            self%hidden_size, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%q_norm, 1, self%attention_head_size, 0, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, layer%k_norm, 1, self%attention_head_size, 0, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, self%mtp_eh_proj, 2, 2 * self%hidden_size, self%hidden_size, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, self%mtp_enorm, 1, self%hidden_size, 0, stat)
+        if (.not. stat%is_ok()) return
+        call check_tensor_shape(self, self%mtp_hnorm, 1, self%hidden_size, 0, stat)
+        if (.not. stat%is_ok()) return
+        if (self%mtp_embed_tokens > 0) then
+            call check_tensor_shape(self, self%mtp_embed_tokens, 2, self%hidden_size, &
+                self%vocabulary_size, stat)
+            if (.not. stat%is_ok()) return
+        end if
+        call check_tensor_shape(self, self%mtp_shared_head_norm, 1, self%hidden_size, 0, stat)
+        if (.not. stat%is_ok()) return
+        if (self%mtp_shared_head_head > 0) then
+            call check_tensor_shape(self, self%mtp_shared_head_head, 2, self%hidden_size, &
+                self%vocabulary_size, stat)
+            if (.not. stat%is_ok()) return
+        end if
+        self%mtp_layer = layer
+    end subroutine bind_mtp_layer
 
     subroutine check_tensor_shape(self, tensor_index, rank, first, second, stat)
         class(qwen35_cpu_model_t), intent(in) :: self

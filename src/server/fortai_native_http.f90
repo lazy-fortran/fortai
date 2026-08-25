@@ -8,7 +8,8 @@ module fortai_native_http
     use, intrinsic :: iso_fortran_env, only: int32, int64, real32
     use fortai_native_service, only: fortai_native_service_complete_text_sampling, &
         fortai_native_service_default_thinking, fortai_native_service_supports_preserve_thinking, &
-        fortai_native_service_supports_reasoning_effort
+        fortai_native_service_supports_reasoning_effort, fortai_native_service_mtp_available, &
+        fortai_native_service_mtp_active
     use fortai_string, only: string_t
     implicit none
     private
@@ -2218,6 +2219,10 @@ contains
         if (path_value == '/health' .or. path_value == '/v1/health') then
             call result%append('{"status":"ok","backend":"fortai","engine":"fortai-native-qwen35","cuda":')
             call result%append_logical(cuda /= 0_c_int)
+            call result%append(',"mtp_available":')
+            call result%append_logical(fortai_native_service_mtp_available())
+            call result%append(',"mtp_active":')
+            call result%append_logical(fortai_native_service_mtp_active())
             call result%append(',"service":"fortai-server"}'); call result%append(char(10)); status = 200_c_int
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return

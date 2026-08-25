@@ -90,7 +90,7 @@ program fortai_cuda_run
     first_position = 0_int64
     last_position = steps - 1_int64
     if (exclude_prompt) then
-        if (model%fast_enabled .and. top_count == 0) then
+        if ((model%fast_enabled .or. model%mtp_active) .and. top_count == 0) then
             call model%forward_greedy(token, 0_int64, next_token, greedy_sum, stat)
             if (.not. stat%is_ok()) then
                 print '(a)', 'FortAI prompt forward failed: ' // stat%message
@@ -125,7 +125,7 @@ program fortai_cuda_run
     call system_clock(forward_start)
     position = first_position
     do while (position <= last_position)
-        if (model%fast_enabled .and. top_count == 0) then
+        if ((model%fast_enabled .or. model%mtp_active) .and. top_count == 0) then
             call model%forward_greedy_speculative(token, position, speculative_tokens, &
                 spec_count, greedy_sum, stat)
             if (.not. stat%is_ok()) then
@@ -185,6 +185,10 @@ program fortai_cuda_run
     print '(a,i0)', 'device=', device
     print '(a,i0)', 'vocabulary=', model%vocabulary_size
     print '(a,i0)', 'layers=', model%layer_count
+    print '(a,l1)', 'mtp_available=', model%mtp_available
+    print '(a,l1)', 'mtp_active=', model%mtp_active
+    print '(a,i0)', 'mtp_last_draft_token=', model%mtp_last_draft_token
+    print '(a,l1)', 'mtp_last_draft_match=', model%mtp_last_draft_match
     print '(a,i0)', 'steps=', steps
     print '(a,i0)', 'last_token=', token
     print '(a,es16.8)', 'logit_checksum=', checksum

@@ -311,7 +311,8 @@ review_verdict: PASS
 | FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | experimental, opt-in, variance-sensitive on RTX 5060 Ti | matched Nsight profile and end-to-end speed at least equal to the direct resident plan and llama.cpp |
 | FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | experimental, native two-device placement implemented | two-device placement, transfer accounting, and stable generation oracle |
 | FAI-CUDA-002 | native mixed-quant Q4/IQ kernels and fused GDN kernels | experimental, GGML CPU/CUDA bridge implemented | Q3/Q4/Q5/Q6/IQ tensor coverage, independent llama.cpp oracle, and validated kernel tournament on named GPUs; `benchmark/run_q4_cuda_compat.sh` remains oracle-only |
-| FAI-CUDA-003 | CUDA MTP and speculative decoding | experimental, Qwen3.8 NextN/MTP context integrated | exact greedy trace, safe fallback, and end-to-end throughput |
+| FAI-CUDA-003A | Native Fortran Qwen3.8 NextN/MTP graph | stable opt-in host-controlled KV path with exact greedy target verification, explicit capability reporting, and safe missing-head rejection | rebuilt CUDA 27B trace, ordinary-target trace parity, and native smoke/oracle checks |
+| FAI-CUDA-003B | Batched target verification/speculative throughput | open performance gate; native single-token target verification is intentionally not promoted as a speedup until the batched recurrent/attention path is implemented | end-to-end throughput at least tied with the fair llama.cpp MTP reference |
 
 The 27B path must include multi-GPU placement from its first production CUDA
 implementation. A single-device prototype may be used for kernel debugging,

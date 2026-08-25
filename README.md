@@ -144,11 +144,14 @@ batch/ubatch sizes, parallel sequence count, K/V cache types, KQV and generic
 operation offload, SWA/KV-unified mode, thread-batch count, and multi-GPU
 tensor splitting. The CUDA runner reports `vram_*_bytes` before and after
 loading so the memory delta can be compared with llama.cpp under the same
-profile. Qwen3.8-style `mtp-*.gguf` heads are handled through llama.cpp's
-resident NextN/MTP context (the target model is loaded once and the MTP head
-shares its hidden-state path); greedy acceptance remains exact. Multimodal
-projector execution and general chat-server orchestration remain outside this
-direct single-sequence runner. The production service is FortAI-owned: build
+profile. Qwen3.8-style embedded NextN/MTP heads are also bound by the native
+Fortran Qwen3.5 runtime. Set `FORTAI_NATIVE_MTP=1` (or
+`FORTAI_SPEC_TYPE=draft-mtp`) to enable the host-controlled MTP KV path; it
+keeps greedy target output exact and disables the device-resident graph until
+hidden-state export is available. The resident llama.cpp adapter remains the
+reference path for true batched speculative throughput, while multimodal
+projector execution and external MTP sidecar loading remain outside this
+direct single-sequence native path. The production service is FortAI-owned: build
 it with `tools/build_cuda_server.sh` and launch
 `tools/fortai-server --model MODEL.gguf --port 8080`. It loads the model
 through the native Fortran Qwen3.5 runtime, initializes the FortAI CUDA
@@ -178,9 +181,8 @@ SSE events. Split two-GPU Q4_K_XL models
 use the deterministic host-boundary CUDA route by default; the resident
 all-device bridge remains an explicit `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1`
 diagnostic opt-in until its model-level determinism gate is closed.  Multimodal
-projector and MTP
-sidecars remain outside this direct single-sequence server rather than being
-silently delegated to another server.
+projector execution and external MTP sidecars remain outside this direct
+single-sequence server rather than being silently delegated to another server.
 
 Benchmark results, logs, and perf data stay machine-local under
 `benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts
