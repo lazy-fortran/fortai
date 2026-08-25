@@ -1236,9 +1236,11 @@ contains
         type(status_t), intent(out) :: stat
         logical, intent(in), optional :: download_logits
         integer :: i
-        logical :: capture_graph
+        logical :: capture_graph, should_download
 
         call stat % clear()
+        should_download = .true.
+        if (present(download_logits)) should_download = download_logits
         if ((.not. self%fast_enabled .and. .not. allocated(self % x)) .or. &
             size(logits) /= self % vocabulary_size) then
             call stat % set(FORTAI_INVALID, 'Qwen3.5 CPU model is not open')
@@ -1364,7 +1366,7 @@ contains
         end if
 
         if (self%cuda_device_pipeline) then
-            if (.not. present(download_logits) .or. download_logits) then
+            if (should_download) then
                 call self%cuda%download_real(self%cuda_logits, logits, stat)
                 if (.not. stat%is_ok()) return
             end if

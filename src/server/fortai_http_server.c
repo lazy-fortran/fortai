@@ -43,6 +43,19 @@ static void fortai_signal_handler(int signal_number) {
     fortai_stop = 1;
 }
 
+static int fortai_install_signal_handlers(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = fortai_signal_handler;
+    if (sigemptyset(&action.sa_mask) != 0) return -1;
+    /* Do not restart accept(): the flag must wake the transport so it can
+     * close the listener and let the Fortran owner release the model. */
+    action.sa_flags = 0;
+    if (sigaction(SIGINT, &action, NULL) != 0) return -1;
+    if (sigaction(SIGTERM, &action, NULL) != 0) return -1;
+    return 0;
+}
+
 static void *fortai_realloc(void *pointer, size_t size) {
     void *result = realloc(pointer, size);
     if (result == NULL && size != 0)
@@ -206,8 +219,8 @@ int fortai_server_online_cpus(void) {
 int fortai_http_transport_run(const char *host, int port, const char *model, int cuda) {
     fortai_transport server = {model, cuda};
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, fortai_signal_handler);
-    signal(SIGTERM, fortai_signal_handler);
+    fortai_stop = 0;
+    if (fortai_install_signal_handlers() != 0) return -1;
     const int listener = fortai_open_listener(host, port);
     if (listener < 0) return -1;
     while (!fortai_stop) {
