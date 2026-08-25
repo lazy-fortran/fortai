@@ -156,13 +156,17 @@ tensor splitting. The CUDA runner reports `vram_*_bytes` before and after
 loading so the memory delta can be compared with llama.cpp under the same
 profile. Qwen3.8-style embedded NextN/MTP heads are also bound by the native
 Fortran Qwen3.5 runtime. Set `FORTAI_NATIVE_MTP=1` (or
-`FORTAI_SPEC_TYPE=draft-mtp`) to enable the native MTP path; it keeps greedy
-target output exact and uses the CUDA-resident target pipeline whenever the
-KV allocation fits, with a host-controlled NextN verification handoff. The
+`FORTAI_SPEC_TYPE=draft-mtp`) to enable the native MTP path; a configured
+head-only draft whose name contains `mtp` enables the same path automatically.
+It keeps greedy target output exact and uses the CUDA-resident target pipeline
+whenever the KV allocation fits, with a host-controlled NextN verification
+handoff. The
 resident llama.cpp adapter remains the reference path for true batched
 speculative throughput. FortAI accepts and validates the configured external
-draft path, while native speculative execution consumes the model's embedded
-NextN head when a matching MTP sidecar is supplied. The production
+draft path, while a matching MTP sidecar is loaded into the target's `blk.64`
+head tensors (without duplicating the target embedding/output weights) and
+native speculative execution consumes that head. `/health` reports
+`mtp_sidecar_active` when this merge is active. The production
 service is FortAI-owned: build
 it with `tools/build_cuda_server.sh` and launch
 `tools/fortai-server --model MODEL.gguf --port 8080`. It loads the model
@@ -201,9 +205,9 @@ Multimodal
 projector paths are accepted and surfaced in `/health`; image-token execution
 is not yet part of the native Qwen runtime. A standalone `--model-draft` is
 loaded and advanced by the native Fortran service for greedy requests, with
-target logits remaining authoritative; `draft-mtp` sidecars use the embedded
-NextN implementation. The server never delegates either feature to another
-process.
+target logits remaining authoritative; `draft-mtp` sidecars use the merged
+`blk.64` NextN implementation. The server never delegates either feature to
+another process.
 For native split-Q4 placement, `FORTAI_TENSOR_SPLIT=a,b` (or
 `--tensor-split a,b`/`-ts a,b`) supplies normalized non-negative fractions for
 the two visible GPUs; omitted values retain equal-byte balancing, and malformed

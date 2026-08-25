@@ -10,7 +10,7 @@ module fortai_native_http
         fortai_native_service_default_thinking, fortai_native_service_supports_preserve_thinking, &
         fortai_native_service_supports_reasoning_effort, fortai_native_service_mtp_available, &
         fortai_native_service_mtp_active, fortai_native_service_external_draft_active, &
-        fortai_native_service_device_pipeline
+        fortai_native_service_mtp_sidecar_active, fortai_native_service_device_pipeline
     use fortai_string, only: string_t
     implicit none
     private
@@ -2328,6 +2328,8 @@ contains
             call result%append_logical(fortai_native_service_mtp_active())
             call result%append(',"external_draft_active":')
             call result%append_logical(fortai_native_service_external_draft_active())
+            call result%append(',"mtp_sidecar_active":')
+            call result%append_logical(fortai_native_service_mtp_sidecar_active())
             call result%append(',"service":"fortai-server","settings":')
             call server_settings_json(result)
             call result%append('}'); call result%append(char(10)); status = 200_c_int

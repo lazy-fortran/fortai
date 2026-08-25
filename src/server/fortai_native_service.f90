@@ -1,10 +1,11 @@
 module fortai_native_service
     use, intrinsic :: iso_c_binding, only: c_char, c_int, c_null_char
     use, intrinsic :: iso_fortran_env, only: error_unit, int32, int64, real32
+    use fortai_gguf_runtime, only: gguf_file_t
     use fortai_native_tokenizer, only: fortai_native_tokenizer_t
     use fortai_qwen35_cpu, only: qwen35_cpu_model_t
     use fortai_string, only: string_t
-    use fortai_status, only: FORTAI_UNSUPPORTED, status_t
+    use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
     implicit none
     private
 
@@ -14,6 +15,7 @@ module fortai_native_service
     type(fortai_native_tokenizer_t), save :: service_draft_tokenizer
     logical, save :: service_ready = .false.
     logical, save :: service_external_draft_active = .false.
+    logical, save :: service_mtp_sidecar_active = .false.
 
     type :: sampling_options_t
         integer :: top_k = 20
@@ -37,6 +39,7 @@ module fortai_native_service
     public :: fortai_native_service_mtp_available
     public :: fortai_native_service_mtp_active
     public :: fortai_native_service_external_draft_active
+    public :: fortai_native_service_mtp_sidecar_active
     public :: fortai_native_service_device_pipeline
 
 contains
@@ -85,6 +88,15 @@ contains
             write(error_unit, '(a)') 'fortai-native: model open failed: ' // trim(stat%message)
             return
         end if
+        draft_path = configured_draft_path()
+        if (service_model%mtp_active .and. is_mtp_sidecar_path(draft_path)) then
+            call apply_mtp_sidecar(draft_path, stat)
+            if (.not. stat%is_ok()) then
+                write(error_unit, '(a)') 'fortai-native: MTP sidecar initialization failed: ' // trim(stat%message)
+                call service_model%close()
+                return
+            end if
+        end if
         call service_tokenizer%open(service_model%file, tokenizer_ok)
         if (.not. tokenizer_ok) then
             write(error_unit, '(a)') 'fortai-native: GGUF tokenizer metadata is unavailable'
@@ -131,6 +143,7 @@ contains
         call service_model%close()
         service_ready = .false.
         service_external_draft_active = .false.
+        service_mtp_sidecar_active = .false.
     end subroutine fortai_native_service_close
 
     logical function fortai_native_service_default_thinking()
@@ -156,6 +169,10 @@ contains
     logical function fortai_native_service_external_draft_active()
         fortai_native_service_external_draft_active = service_ready .and. service_external_draft_active
     end function fortai_native_service_external_draft_active
+
+    logical function fortai_native_service_mtp_sidecar_active()
+        fortai_native_service_mtp_sidecar_active = service_ready .and. service_mtp_sidecar_active
+    end function fortai_native_service_mtp_sidecar_active
 
     logical function fortai_native_service_device_pipeline()
         fortai_native_service_device_pipeline = service_ready .and. service_model%cuda_device_pipeline
@@ -195,6 +212,21 @@ contains
 
     function configured_external_draft_path() result(path)
         character(len=:), allocatable :: path
+        character(len=:), allocatable :: configured
+
+        configured = configured_draft_path()
+        if (len_trim(configured) == 0) then
+            allocate(character(len=0) :: path)
+        else if (native_mtp_mode_requested() .or. is_mtp_sidecar_path(configured)) then
+            allocate(character(len=0) :: path)
+        else
+            allocate(character(len=len_trim(configured)) :: path)
+            path = trim(configured)
+        end if
+    end function configured_external_draft_path
+
+    function configured_draft_path() result(path)
+        character(len=:), allocatable :: path
         character(len=4096) :: value
         integer :: length
 
@@ -204,20 +236,91 @@ contains
         if (length <= 0) call get_environment_variable('LLAMACPP_DRAFT_MODEL', value, length=length)
         if (length <= 0) then
             allocate(character(len=0) :: path)
-        else if (native_mtp_mode_requested()) then
-            allocate(character(len=0) :: path)
-        else
-            length = min(length, len(value))
-            if (index(value(:length), 'mtp') > 0) then
-                allocate(character(len=0) :: path)
-            else if (index(value(:length), 'MTP') > 0) then
-                allocate(character(len=0) :: path)
-            else
-                allocate(character(len=length) :: path)
-                path = trim(value(:length))
-            end if
+            return
         end if
-    end function configured_external_draft_path
+        length = min(length, len(value))
+        allocate(character(len=len_trim(value(:length))) :: path)
+        if (len(path) > 0) path = trim(value(:length))
+    end function configured_draft_path
+
+    logical function is_mtp_sidecar_path(path)
+        character(len=*), intent(in) :: path
+
+        is_mtp_sidecar_path = .false.
+        if (len_trim(path) == 0) return
+        is_mtp_sidecar_path = index(path, 'mtp') > 0 .or. index(path, 'MTP') > 0
+    end function is_mtp_sidecar_path
+
+    subroutine apply_mtp_sidecar(path, stat)
+        character(len=*), intent(in) :: path
+        type(status_t), intent(out) :: stat
+        type(gguf_file_t) :: sidecar
+        integer :: i, target_index, copied
+        character(len=:), allocatable :: tensor_name
+
+        call stat%clear()
+        service_mtp_sidecar_active = .false.
+        if (len_trim(path) == 0) return
+        call sidecar%open(trim(path), stat)
+        if (.not. stat%is_ok()) return
+        if (.not. allocated(sidecar%tensors)) then
+            call stat%set(FORTAI_INVALID, 'MTP sidecar has no tensors')
+            call sidecar%close()
+            return
+        end if
+        copied = 0
+        do i = 1, size(sidecar%tensors)
+            tensor_name = sidecar%tensors(i)%name
+            if (index(tensor_name, 'blk.64.') /= 1) cycle
+            target_index = service_model%file%find_tensor(tensor_name)
+            if (target_index == 0) then
+                call stat%set(FORTAI_UNSUPPORTED, 'MTP sidecar tensor is absent from target: ' // trim(tensor_name))
+                exit
+            end if
+            if (.not. allocated(sidecar%tensors(i)%shape)) then
+                call stat%set(FORTAI_INVALID, 'MTP sidecar tensor has no shape: ' // trim(tensor_name))
+                exit
+            end if
+            if (.not. allocated(service_model%file%tensors(target_index)%shape)) then
+                call stat%set(FORTAI_INVALID, 'target MTP tensor has no shape: ' // trim(tensor_name))
+                exit
+            end if
+            if (size(sidecar%tensors(i)%shape) /= size(service_model%file%tensors(target_index)%shape)) then
+                call stat%set(FORTAI_INVALID, 'MTP sidecar tensor rank differs from target: ' // trim(tensor_name))
+                exit
+            end if
+            if (any(sidecar%tensors(i)%shape /= service_model%file%tensors(target_index)%shape)) then
+                call stat%set(FORTAI_INVALID, 'MTP sidecar tensor shape differs from target: ' // trim(tensor_name))
+                exit
+            end if
+            if (.not. allocated(sidecar%tensors(i)%bytes)) then
+                call stat%set(FORTAI_INVALID, 'MTP sidecar tensor has no data: ' // trim(tensor_name))
+                exit
+            end if
+            if (sidecar%tensors(i)%byte_count /= int(size(sidecar%tensors(i)%bytes), int64)) then
+                call stat%set(FORTAI_INVALID, 'MTP sidecar tensor byte count is inconsistent: ' // trim(tensor_name))
+                exit
+            end if
+            call move_alloc(sidecar%tensors(i)%bytes, service_model%file%tensors(target_index)%bytes)
+            service_model%file%tensors(target_index)%value_type = sidecar%tensors(i)%value_type
+            service_model%file%tensors(target_index)%byte_count = sidecar%tensors(i)%byte_count
+            if (allocated(service_model%file%tensors(target_index)%decoded_values)) &
+                deallocate(service_model%file%tensors(target_index)%decoded_values)
+            if (allocated(sidecar%tensors(i)%decoded_values)) then
+                call move_alloc(sidecar%tensors(i)%decoded_values, &
+                    service_model%file%tensors(target_index)%decoded_values)
+            end if
+            copied = copied + 1
+        end do
+        if (stat%is_ok() .and. copied < 14) then
+            call stat%set(FORTAI_UNSUPPORTED, 'MTP sidecar does not contain the complete blk.64 head')
+        end if
+        if (stat%is_ok()) then
+            service_mtp_sidecar_active = .true.
+            write(error_unit, '(a,i0,a)') 'fortai-native: loaded ', copied, ' MTP head tensors from sidecar'
+        end if
+        call sidecar%close()
+    end subroutine apply_mtp_sidecar
 
     subroutine open_external_draft(path, context_size, stat)
         character(len=*), intent(in) :: path

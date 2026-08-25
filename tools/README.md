@@ -22,12 +22,13 @@ budget, mmproj path/offload, and `--no-webui`) and mirrors their
 CUDA keeps q8_0 K/V resident with mixed f16/q8_0 combinations whenever the
 requested context fits, while the host-boundary fallback uses the same
 quantization layout on the host. The native MTP path uses the embedded NextN
-head and its two-token greedy speculative step; its target decode remains
-CUDA-resident when possible and the target model remains the correctness
-oracle. A standalone
-external draft model is loaded and advanced by the native Fortran service for
-greedy requests when it is a real transformer draft (MTP sidecars are bound to
-the target's NextN path).
+head and its two-token greedy speculative step; a configured head-only
+`mtp*.gguf` sidecar is merged into the target `blk.64` tensors and is reported
+as `mtp_sidecar_active` by `/health`. Its target decode remains CUDA-resident
+when possible and the target model remains the correctness oracle. A
+standalone external draft model is loaded and advanced by the native Fortran
+service for greedy requests when it is a real transformer draft; MTP sidecars
+use the target's NextN path.
 The ISO-C socket transport uses a bounded worker queue for `--threads-http`
 and `--parallel`, so multiple connections can be accepted without corrupting
 the mutable recurrent/KV state.

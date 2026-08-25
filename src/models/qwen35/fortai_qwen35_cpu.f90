@@ -1489,11 +1489,15 @@ contains
         end if
         value = ''
         call get_environment_variable('FORTAI_DRAFT_MODEL', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_MODEL_DRAFT', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_DRAFT_MODEL', value, length=length)
         if (length > 0) then
             ! The published Qwen3.8 sidecar is a tensor carrier, not a
             ! standalone transformer.  Its filename is the only portable
             ! signal available to the native CLI when --model-draft is used.
-            native_mtp_requested = index(value(1:length), 'mtp') > 0
+            length = min(length, len(value))
+            native_mtp_requested = index(value(1:length), 'mtp') > 0 .or. &
+                index(value(1:length), 'MTP') > 0
         end if
     end function native_mtp_requested
 
