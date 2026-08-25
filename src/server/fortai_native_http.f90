@@ -6,7 +6,7 @@ module fortai_native_http
     !! share the same growable string_t implementation as the runtime.
     use, intrinsic :: iso_c_binding, only: c_char, c_int, c_null_char
     use, intrinsic :: iso_fortran_env, only: int32, int64, real32
-    use fortai_native_service, only: fortai_native_service_complete_text_options
+    use fortai_native_service, only: fortai_native_service_complete_text_sampling
     use fortai_string, only: string_t
     implicit none
     private
@@ -372,6 +372,50 @@ contains
         if (last == position) return
         json_integer = max(0, sign * value)
     end function json_integer
+
+    integer function json_integer_checked(text, key, fallback, valid)
+        character(len=*), intent(in) :: text, key
+        integer, intent(in) :: fallback
+        logical, intent(out), optional :: valid
+        integer :: position, last, value
+
+        json_integer_checked = fallback
+        if (present(valid)) valid = .true.
+        position = json_key(text, key, 1)
+        if (position == 0) return
+        if (position > len(text)) then
+            if (present(valid)) valid = .false.
+            return
+        end if
+        if (text(position:position) == '-') then
+            if (present(valid)) valid = .false.
+            return
+        end if
+        if (text(position:position) == '+') position = position + 1
+        last = position
+        value = 0
+        do while (last <= len(text))
+            if (text(last:last) < '0' .or. text(last:last) > '9') exit
+            if (value > 100000000) then
+                if (present(valid)) valid = .false.
+                return
+            end if
+            value = 10 * value + iachar(text(last:last)) - iachar('0')
+            last = last + 1
+        end do
+        if (last == position) then
+            if (present(valid)) valid = .false.
+            return
+        end if
+        last = skip_space(text, last)
+        if (last <= len(text)) then
+            if (text(last:last) /= ',' .and. text(last:last) /= '}' .and. text(last:last) /= ']') then
+                if (present(valid)) valid = .false.
+                return
+            end if
+        end if
+        json_integer_checked = value
+    end function json_integer_checked
 
     integer(int64) function json_int64(text, key, fallback)
         character(len=*), intent(in) :: text, key
@@ -1878,9 +1922,12 @@ contains
         type(message_t), allocatable :: messages(:)
         type(tool_call_t), allocatable :: tool_calls(:)
         integer :: count, max_tokens, tokens, result_code, required, tool_count
+        integer :: top_k, repeat_last_n
         integer(int64) :: seed
-        real(real32) :: temperature
+        real(real32) :: temperature, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty
         logical :: okay, chat, responses, stream, enable_thinking, temperature_valid
+        logical :: top_p_valid, min_p_valid, repeat_penalty_valid, presence_penalty_valid
+        logical :: frequency_penalty_valid, top_k_valid, repeat_last_n_valid, sampling_valid
         character(len=:), allocatable :: path_value
         character(len=:), allocatable :: reasoning_format, reasoning_effort
 
@@ -1938,6 +1985,22 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         seed = json_int64(body%as_character(), 'seed', 0_int64)
+        top_k = json_integer_checked(body%as_character(), 'top_k', 20, top_k_valid)
+        repeat_last_n = json_integer_checked(body%as_character(), 'repeat_last_n', 64, repeat_last_n_valid)
+        top_p = json_real(body%as_character(), 'top_p', 0.95_real32, top_p_valid)
+        min_p = json_real(body%as_character(), 'min_p', 0.0_real32, min_p_valid)
+        repeat_penalty = json_real(body%as_character(), 'repeat_penalty', 1.0_real32, repeat_penalty_valid)
+        presence_penalty = json_real(body%as_character(), 'presence_penalty', 0.0_real32, presence_penalty_valid)
+        frequency_penalty = json_real(body%as_character(), 'frequency_penalty', 0.0_real32, frequency_penalty_valid)
+        sampling_valid = top_p_valid .and. min_p_valid .and. repeat_penalty_valid .and. &
+            presence_penalty_valid .and. frequency_penalty_valid .and. top_k_valid .and. repeat_last_n_valid
+        if (.not. sampling_valid .or. top_k < 0 .or. repeat_last_n < 0 .or. top_p <= 0.0_real32 .or. &
+            top_p > 1.0_real32 .or. min_p < 0.0_real32 .or. min_p > 1.0_real32 .or. &
+            repeat_penalty <= 0.0_real32) then
+            call error_body(400, 'invalid sampling parameters', result); status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
         stream = json_boolean(body%as_character(), 'stream', .false.)
         enable_thinking = json_boolean(body%as_character(), 'enable_thinking', .true.)
         ! OpenAI-compatible clients commonly pass this through
@@ -1980,8 +2043,9 @@ contains
             end if
             end block
         end if
-        result_code = fortai_native_service_complete_text_options(prompt%as_character(), max_tokens, &
-            temperature, seed, generated, tokens)
+        result_code = fortai_native_service_complete_text_sampling(prompt%as_character(), max_tokens, temperature, &
+            seed, top_k, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty, repeat_last_n, &
+            generated, tokens)
         if (result_code < 0) then
             call error_body(500, 'FortAI generation failed', result); status = 500_c_int
             call copy_result(result, 'application/json', response, response_capacity, response_length, &

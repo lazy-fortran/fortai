@@ -15,7 +15,9 @@ The chat and Responses endpoints share the Qwen3.5 template: `enable_thinking`,
 `chat_template_kwargs.enable_thinking`, and `reasoning.effort` select the hard
 thinking/no-thinking prompt form. OpenAI `tools` are formatted natively and
 Qwen3.5 XML tool calls are returned as structured function-call objects and
-streaming argument events.
+streaming argument events. Sampling parameters (`top_k`, `top_p`, `min_p`,
+repeat/presence/frequency penalties, and `seed`) are applied by the native
+Fortran decoder rather than being silently ignored.
 
 Split two-GPU Q4_K_XL serving uses the deterministic host-boundary CUDA path by
 default. `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1` enables the resident
