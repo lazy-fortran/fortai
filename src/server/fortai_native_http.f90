@@ -2261,7 +2261,7 @@ contains
         integer(c_int), value, intent(in) :: request_length, cuda, response_capacity, content_type_capacity
         character(kind=c_char), intent(out) :: response(*), content_type(*)
         integer(c_int), intent(out) :: response_length, status
-        type(string_t) :: request_text, model_text, method, path, body, result, prompt, generated
+        type(string_t) :: request_text, model_text, model_path_text, method, path, body, result, prompt, generated
         type(string_t) :: content, reasoning, tools_json, clean_content, reasoning_instruction
         type(string_t), allocatable :: prompt_batch(:), batch_generated(:)
         type(message_t), allocatable :: messages(:)
@@ -2294,7 +2294,8 @@ contains
         prompt_array = .false.
         request_count = request_count + 1_int64
         call request_text%from_c(request, int(request_length))
-        call model_text%from_c(model)
+        call model_path_text%from_c(model)
+        model_text = model_path_text
         call server_model_id(model_text)
         call parse_http_request(request_text, method, path, body, okay)
         if (.not. okay) then
@@ -2334,6 +2335,12 @@ contains
             call result%append(',"service":"fortai-server","settings":')
             call server_settings_json(result)
             call result%append('}'); call result%append(char(10)); status = 200_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        if (path_value == '/props' .and. method%as_character() == 'GET') then
+            call server_props_json(model_text, model_path_text, result)
+            call result%append(char(10)); status = 200_c_int
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
@@ -2847,6 +2854,31 @@ contains
         call append_setting(result, 'no_webui', 'FORTAI_NO_WEBUI', 'false', .false.)
         call result%append('}')
     end subroutine server_settings_json
+
+    subroutine server_props_json(model, model_path, result)
+        type(string_t), intent(in) :: model, model_path
+        type(string_t), intent(out) :: result
+        character(len=64) :: number
+
+        call result%set('{"default_generation_settings":{"params":')
+        call server_settings_json(result)
+        call result%append(',"n_ctx":')
+        write(number, '(i0)') fortai_native_service_context_size()
+        call result%append(trim(number))
+        call result%append('},"total_slots":')
+        write(number, '(i0)') server_integer_default('FORTAI_PARALLEL', 1)
+        call result%append(trim(number))
+        call result%append(',"model_alias":')
+        result = append_json(result, model)
+        call result%append(',"model_path":')
+        result = append_json(result, model_path)
+        call result%append(',"modalities":{"vision":false,"video":false,"audio":false}')
+        call result%append(',"endpoint_slots":false,"endpoint_props":false,"endpoint_metrics":')
+        call result%append_logical(server_boolean_default('FORTAI_METRICS', .false.))
+        call result%append(',"ui":')
+        call result%append_logical(server_web_ui_enabled())
+        call result%append(',"build_info":"fortai-native","is_sleeping":false}')
+    end subroutine server_props_json
 
     subroutine append_setting(result, key, environment, fallback, quoted)
         type(string_t), intent(inout) :: result
