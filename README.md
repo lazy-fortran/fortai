@@ -195,9 +195,12 @@ target logits remaining authoritative; `draft-mtp` sidecars use the embedded
 NextN implementation. The server never delegates either feature to another
 process.
 For native split-Q4 placement, `FORTAI_TENSOR_SPLIT=a,b` (or
-`--tensor-split a,b`) supplies normalized non-negative fractions for the two
-visible GPUs; omitted values retain equal-byte balancing, and malformed values
-fail model initialization instead of being ignored.
+`--tensor-split a,b`/`-ts a,b`) supplies normalized non-negative fractions for
+the two visible GPUs; omitted values retain equal-byte balancing, and malformed
+values fail model initialization instead of being ignored. The native server
+also accepts llama.cpp's `-np`, `-fa`, and `-fit` short forms, so the same
+production command line can be used on a separate FortAI port while llama.cpp
+remains resident.
 Main native K/V caches support `f32`, `f16`, and `q8_0`; q8_0 storage is
 quantized with llama-compatible FP16 scales and is validated against the
 independent CUDA/CPU trace oracle. With native CUDA selected, q8_0 K/V stays

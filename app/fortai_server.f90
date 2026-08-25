@@ -160,23 +160,34 @@ contains
                 call argument_text_at(i, value_text)
                 call config%host%set(value_text)
             case ('--port')
-                i = i + 1; if (i > count .or. .not. parse_integer(argument_at(i), 1, 65535, value)) then; okay = .false.; return; end if
+                i = i + 1
+                if (i > count) then; okay = .false.; return; end if
+                if (.not. parse_integer(argument_at(i), 1, 65535, value)) then; okay = .false.; return; end if
                 config%port = value
             case ('-c', '--ctx-size')
-                i = i + 1; if (i > count .or. .not. parse_integer(argument_at(i), 128, 2**20, value)) then; okay = .false.; return; end if
+                i = i + 1
+                if (i > count) then; okay = .false.; return; end if
+                if (.not. parse_integer(argument_at(i), 128, 2**20, value)) then; okay = .false.; return; end if
                 config%context_size = value
             case ('-t', '--threads')
-                i = i + 1; if (i > count .or. .not. parse_integer(argument_at(i), 1, 4096, value)) then; okay = .false.; return; end if
+                i = i + 1
+                if (i > count) then; okay = .false.; return; end if
+                if (.not. parse_integer(argument_at(i), 1, 4096, value)) then; okay = .false.; return; end if
                 config%threads = value
             case ('-ngl', '--n-gpu-layers', '--gpu-layers')
-                i = i + 1; if (i > count .or. .not. parse_integer(argument_at(i), 0, 8192, value)) then; okay = .false.; return; end if
+                i = i + 1
+                if (i > count) then; okay = .false.; return; end if
+                if (.not. parse_integer(argument_at(i), 0, 8192, value)) then; okay = .false.; return; end if
                 config%gpu_layers = value
             case ('--main-gpu')
-                i = i + 1; if (i > count .or. .not. parse_integer(argument_at(i), 0, 255, value)) then; okay = .false.; return; end if
+                i = i + 1
+                if (i > count) then; okay = .false.; return; end if
+                if (.not. parse_integer(argument_at(i), 0, 255, value)) then; okay = .false.; return; end if
                 config%main_gpu = value
-            case ('--parallel', '--tensor-split', '--split-mode', '--model-draft', '--spec-type', '--spec-draft-n-max', &
-                    '--flash-attn', '--cache-type-k', '--cache-type-v', '--cache-type-k-draft', '--cache-type-v-draft', &
-                    '--batch-size', '-b', '--ubatch-size', '-ub', '--fit', '--cache-ram', '--cache-reuse', &
+            case ('--parallel', '-np', '--tensor-split', '-ts', '--split-mode', '--model-draft', '--spec-type', &
+                    '--spec-draft-n-max', '--flash-attn', '-fa', '--cache-type-k', '--cache-type-v', &
+                    '--cache-type-k-draft', '--cache-type-v-draft', '--batch-size', '-b', '--ubatch-size', '-ub', &
+                    '--fit', '-fit', '--cache-ram', '--cache-reuse', &
                     '--n-cpu-moe', '--reasoning-budget', '--mmproj', '--rpc', '--threads-http', '--chat-template-kwargs', &
                     '--temp', '--temperature', '--top-k', '--top-p', '--min-p', '--repeat-penalty', &
                     '--presence-penalty', '--frequency-penalty', '--repeat-last-n', '--seed', '--reasoning-format', &
@@ -224,13 +235,13 @@ contains
         character(len=*), intent(in) :: option, value
         character(len=32) :: name
         select case (option)
-        case ('--parallel'); name = 'FORTAI_PARALLEL'
-        case ('--tensor-split'); name = 'FORTAI_TENSOR_SPLIT'
+        case ('--parallel', '-np'); name = 'FORTAI_PARALLEL'
+        case ('--tensor-split', '-ts'); name = 'FORTAI_TENSOR_SPLIT'
         case ('--split-mode'); name = 'FORTAI_SPLIT_MODE'
         case ('--model-draft'); name = 'FORTAI_DRAFT_MODEL'
         case ('--spec-type'); name = 'FORTAI_SPEC_TYPE'
         case ('--spec-draft-n-max'); name = 'FORTAI_SPEC_DRAFT_N_MAX'
-        case ('--flash-attn'); name = 'FORTAI_FLASH_ATTN'
+        case ('--flash-attn', '-fa'); name = 'FORTAI_FLASH_ATTN'
         case ('--cache-type-k'); name = 'FORTAI_CACHE_TYPE_K'
         case ('--cache-type-v'); name = 'FORTAI_CACHE_TYPE_V'
         case ('--cache-type-k-draft'); name = 'FORTAI_CACHE_TYPE_K_DRAFT'
@@ -244,7 +255,7 @@ contains
         case ('--mmproj'); name = 'FORTAI_MMPROJ'
         case ('--rpc'); name = 'FORTAI_RPC'
         case ('--threads-http'); name = 'FORTAI_THREADS_HTTP'
-        case ('--fit'); name = 'FORTAI_FIT'
+        case ('--fit', '-fit'); name = 'FORTAI_FIT'
         case ('--chat-template-kwargs'); name = 'FORTAI_CHAT_TEMPLATE_KWARGS'
         case ('--temp', '--temperature'); name = 'FORTAI_TEMPERATURE'
         case ('--top-k'); name = 'FORTAI_TOP_K'
@@ -428,17 +439,18 @@ contains
         write(output_unit, '(a)') '  -ngl, --n-gpu-layers N       GPU layers (0=CPU)'
         write(output_unit, '(a)') '  --main-gpu N                 primary GPU'
         write(output_unit, '(a)') '  --alias NAME                 served model id (default qwen)'
-        write(output_unit, '(a)') '  --parallel N                 resident sequence slots'
+        write(output_unit, '(a)') '  --parallel N / -np N         resident sequence slots'
         write(output_unit, '(a)') '  -b, --batch-size N           logical prompt batch limit'
         write(output_unit, '(a)') '  -ub, --ubatch-size N         physical prompt microbatch limit'
-        write(output_unit, '(a)') '  --flash-attn on|off|auto     attention mode'
-        write(output_unit, '(a)') '  --tensor-split A,B           two-GPU tensor fractions'
+        write(output_unit, '(a)') '  --flash-attn MODE / -fa      attention mode'
+        write(output_unit, '(a)') '  --tensor-split A,B / -ts     two-GPU tensor fractions'
         write(output_unit, '(a)') '  --model-draft PATH           speculative draft/MTP model'
         write(output_unit, '(a)') '  --spec-type TYPE             speculative mode (draft-mtp)'
         write(output_unit, '(a)') '  --spec-draft-n-max N         maximum speculative draft tokens'
         write(output_unit, '(a)') '  --cache-type-k TYPE          K cache type'
         write(output_unit, '(a)') '  --cache-type-v TYPE          V cache type'
         write(output_unit, '(a)') '  --cache-ram MB               host KV cache budget'
+        write(output_unit, '(a)') '  --fit MODE / -fit MODE       VRAM fit policy'
         write(output_unit, '(a)') '  --cache-reuse N              KV cache reuse threshold'
         write(output_unit, '(a)') '  --mmproj PATH                multimodal projector'
         write(output_unit, '(a)') '  --reasoning-budget N         thinking token budget'

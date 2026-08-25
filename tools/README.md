@@ -12,7 +12,8 @@ compatible `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
 selecting an already-built FortAI binary explicitly.
 
 The native CLI accepts the production llama.cpp profile controls (`--alias`,
-`--parallel`, `--tensor-split`, `--model-draft`, `--spec-type`, `--flash-attn`,
+`--parallel`/`-np`, `--tensor-split`/`-ts`, `--model-draft`, `--spec-type`,
+`--flash-attn`/`-fa`, `--fit`/`-fit`,
 K/V cache types, batch/ubatch, cache budget/reuse, sampler defaults, reasoning
 budget, mmproj path/offload, and `--no-webui`) and mirrors their
 `LLAMACPP_*` environment variables into `FORTAI_*`. `/health` reports the
@@ -49,5 +50,5 @@ all-device bridge for diagnostics. The bridge attaches the native Q8 consumer
 stream and uses rotating CUDA events for cross-stream hand-off; it is not yet
 the production default because its end-to-end performance/determinism gate is
 still open. `FORTAI_TENSOR_SPLIT=a,b` (also accepted as
-`--tensor-split a,b`) controls native Q4 byte placement across the two GPUs;
+`--tensor-split a,b`/`-ts a,b`) controls native Q4 byte placement across the two GPUs;
 fractions are normalized and invalid values fail initialization.
