@@ -164,9 +164,16 @@ contains
         value = ''
         call get_environment_variable('FORTAI_NATIVE_MTP', value, length=length)
         if (length > 0) then
-            if (trim(value(:min(length, len(value)))) == '1' .or. &
-                trim(value(:min(length, len(value)))) == 'true' .or. &
-                trim(value(:min(length, len(value)))) == 'on') then
+            length = min(length, len(value))
+            if (trim(value(:length)) == '1') then
+                native_mtp_mode_requested = .true.
+                return
+            end if
+            if (trim(value(:length)) == 'true') then
+                native_mtp_mode_requested = .true.
+                return
+            end if
+            if (trim(value(:length)) == 'on') then
                 native_mtp_mode_requested = .true.
                 return
             end if
@@ -175,7 +182,10 @@ contains
         call get_environment_variable('FORTAI_SPEC_TYPE', value, length=length)
         if (length <= 0) call get_environment_variable('LLAMA_ARG_SPEC_TYPE', value, length=length)
         if (length <= 0) call get_environment_variable('LLAMACPP_SPEC_TYPE', value, length=length)
-        if (length > 0) native_mtp_mode_requested = trim(value(:min(length, len(value)))) == 'draft-mtp'
+        if (length > 0) then
+            length = min(length, len(value))
+            native_mtp_mode_requested = trim(value(:length)) == 'draft-mtp'
+        end if
     end function native_mtp_mode_requested
 
     function configured_external_draft_path() result(path)
@@ -191,12 +201,16 @@ contains
             allocate(character(len=0) :: path)
         else if (native_mtp_mode_requested()) then
             allocate(character(len=0) :: path)
-        else if (index(value(:min(length, len(value))), 'mtp') > 0 .or. &
-                index(value(:min(length, len(value))), 'MTP') > 0) then
-            allocate(character(len=0) :: path)
         else
-            allocate(character(len=min(length, len(value))) :: path)
-            path = trim(value(:len(path)))
+            length = min(length, len(value))
+            if (index(value(:length), 'mtp') > 0) then
+                allocate(character(len=0) :: path)
+            else if (index(value(:length), 'MTP') > 0) then
+                allocate(character(len=0) :: path)
+            else
+                allocate(character(len=length) :: path)
+                path = trim(value(:length))
+            end if
         end if
     end function configured_external_draft_path
 

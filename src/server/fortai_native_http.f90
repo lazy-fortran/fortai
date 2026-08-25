@@ -392,6 +392,45 @@ contains
         json_array_value = output%length() > 1
     end function json_array_value
 
+    logical function parse_prompt_array(text, array_key, prompts, count, max_count)
+        character(len=*), intent(in) :: text, array_key
+        type(string_t), allocatable, intent(out) :: prompts(:)
+        integer, intent(out) :: count
+        integer, intent(in) :: max_count
+        integer :: position, limit, after
+        type(string_t) :: parsed
+        type(string_t), allocatable :: grown(:)
+
+        parse_prompt_array = .false.
+        count = 0
+        allocate(prompts(0))
+        if (max_count <= 0) return
+        position = json_key(text, array_key, 1)
+        if (position == 0 .or. position > len(text)) return
+        if (text(position:position) /= '[') return
+        limit = matching_delimiter(text, position, '[', ']')
+        if (limit == 0) return
+        position = skip_space(text, position + 1)
+        do while (position < limit)
+            if (text(position:position) /= '"') return
+            if (.not. json_string(text, position, parsed, after)) return
+            if (parsed%length() == 0 .or. count >= max_count) return
+            allocate(grown(count + 1))
+            if (count > 0) grown(:count) = prompts(:count)
+            grown(count + 1) = parsed
+            call move_alloc(grown, prompts)
+            count = count + 1
+            position = skip_space(text, after)
+            if (position > limit) return
+            if (text(position:position) == ']') exit
+            if (text(position:position) /= ',') return
+            position = skip_space(text, position + 1)
+        end do
+        if (position <= limit) then
+            if (text(position:position) == ']') parse_prompt_array = count > 0
+        end if
+    end function parse_prompt_array
+
     integer function json_integer(text, key, fallback)
         character(len=*), intent(in) :: text, key
         integer, intent(in) :: fallback
@@ -1934,6 +1973,41 @@ contains
         end if
     end subroutine completion_body
 
+    subroutine completion_batch_body(model, contents, prompt_tokens, tokens, response)
+        type(string_t), intent(in) :: model, contents(:)
+        integer, intent(in) :: prompt_tokens(:), tokens(:)
+        type(string_t), intent(out) :: response
+        integer :: clock, i, prompt_total, token_total
+
+        call response%clear()
+        clock = unix_timestamp()
+        prompt_total = 0
+        token_total = 0
+        call response%append('{"id":"fortai-native","object":"text_completion","created":')
+        call response%append_int(clock)
+        call response%append(',"model":')
+        call response%append_string(json_escape(model))
+        call response%append(',"choices":[')
+        do i = 1, size(contents)
+            if (i > 1) call response%append(',')
+            call response%append('{"index":')
+            call response%append_int(i - 1)
+            call response%append(',"text":')
+            call response%append_string(json_escape(contents(i)))
+            call response%append(',"finish_reason":"stop"}')
+            prompt_total = prompt_total + prompt_tokens(i)
+            token_total = token_total + tokens(i)
+        end do
+        call response%append('],"usage":{"prompt_tokens":')
+        call response%append_int(prompt_total)
+        call response%append(',"completion_tokens":')
+        call response%append_int(token_total)
+        call response%append(',"total_tokens":')
+        call response%append_int(prompt_total + token_total)
+        call response%append('},"fortai_backend":"fortai"}')
+        call response%append(char(10))
+    end subroutine completion_batch_body
+
     subroutine append_chat_tool_object(output, call, index)
         type(string_t), intent(inout) :: output
         type(tool_call_t), intent(in) :: call
@@ -2182,9 +2256,12 @@ contains
         integer(c_int), intent(out) :: response_length, status
         type(string_t) :: request_text, model_text, method, path, body, result, prompt, generated
         type(string_t) :: content, reasoning, tools_json, clean_content, reasoning_instruction
+        type(string_t), allocatable :: prompt_batch(:), batch_generated(:)
         type(message_t), allocatable :: messages(:)
         type(tool_call_t), allocatable :: tool_calls(:)
+        integer, allocatable :: batch_prompt_tokens(:), batch_tokens(:)
         integer :: count, max_tokens, prompt_tokens, tokens, result_code, required, tool_count
+        integer :: prompt_batch_count, batch_limit, batch_index
         integer :: top_k, repeat_last_n
         integer(int64) :: seed
         real(real32) :: temperature, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty
@@ -2199,12 +2276,15 @@ contains
         logical :: temperature_valid, max_tokens_valid
         logical :: top_p_valid, min_p_valid, repeat_penalty_valid, presence_penalty_valid
         logical :: frequency_penalty_valid, top_k_valid, repeat_last_n_valid, sampling_valid
+        logical :: prompt_array
         character(len=:), allocatable :: path_value
         character(len=:), allocatable :: reasoning_format, reasoning_effort
         integer :: reasoning_budget
 
         response_length = 0_c_int
         status = 500_c_int
+        prompt_batch_count = 0
+        prompt_array = .false.
         request_count = request_count + 1_int64
         call request_text%from_c(request, int(request_length))
         call model_text%from_c(model)
@@ -2432,16 +2512,80 @@ contains
         else
             block
                 integer :: prompt_value, after
-                prompt_value = json_key(body%as_character(), 'prompt', 1)
-                if (prompt_value == 0) prompt_value = json_key(body%as_character(), 'content', 1)
-                if (prompt_value == 0 .or. .not. json_string(body%as_character(), prompt_value, prompt, after)) then
-                    call error_body(400, 'prompt must be a string', result); status = 400_c_int
+                character(len=7) :: prompt_key
+                character(len=:), allocatable :: body_text
+                body_text = body%as_character()
+                prompt_key = 'prompt'
+                prompt_value = json_key(body_text, 'prompt', 1)
+                if (prompt_value == 0) then
+                    prompt_key = 'content'
+                    prompt_value = json_key(body_text, 'content', 1)
+                end if
+                if (prompt_value == 0 .or. prompt_value > len(body_text)) then
+                    call error_body(400, 'prompt must be a string or an array of strings', result)
+                    status = 400_c_int
                     call copy_result(result, 'application/json', response, response_capacity, response_length, &
                         content_type, content_type_capacity, fortai_native_http_handle); return
                 end if
+                if (body_text(prompt_value:prompt_value) == '[') then
+                    batch_limit = server_integer_default('FORTAI_BATCH', 2048)
+                    if (batch_limit <= 0) batch_limit = 1
+                    batch_limit = min(batch_limit, max_messages)
+                    if (.not. parse_prompt_array(body_text, trim(prompt_key), prompt_batch, &
+                            prompt_batch_count, batch_limit)) then
+                        call error_body(400, 'prompt array must contain non-empty strings', result)
+                        status = 400_c_int
+                        call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                            content_type, content_type_capacity, fortai_native_http_handle); return
+                    end if
+                    prompt_array = .true.
+                    if (stream) then
+                        call error_body(400, 'streaming prompt arrays are not supported', result)
+                        status = 400_c_int
+                        call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                            content_type, content_type_capacity, fortai_native_http_handle); return
+                    end if
+                else
+                    if (.not. json_string(body_text, prompt_value, prompt, after)) then
+                        call error_body(400, 'prompt must be a string or an array of strings', result)
+                        status = 400_c_int
+                        call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                            content_type, content_type_capacity, fortai_native_http_handle); return
+                    end if
+                    allocate(prompt_batch(1))
+                    prompt_batch(1) = prompt
+                    prompt_batch_count = 1
+                end if
             end block
         end if
-        result_code = fortai_native_service_complete_text_sampling(prompt%as_character(), max_tokens, temperature, &
+        if (chat .or. responses) then
+            allocate(prompt_batch(1))
+            prompt_batch(1) = prompt
+            prompt_batch_count = 1
+        end if
+        if (prompt_array) then
+            allocate(batch_generated(prompt_batch_count), batch_prompt_tokens(prompt_batch_count), &
+                batch_tokens(prompt_batch_count))
+            do batch_index = 1, prompt_batch_count
+                result_code = fortai_native_service_complete_text_sampling(prompt_batch(batch_index)%as_character(), &
+                    max_tokens, temperature, seed, top_k, top_p, min_p, repeat_penalty, presence_penalty, &
+                    frequency_penalty, repeat_last_n, batch_generated(batch_index), batch_tokens(batch_index), &
+                    batch_prompt_tokens(batch_index))
+                if (result_code < 0) then
+                    call error_body(500, 'FortAI generation failed for prompt batch', result)
+                    status = 500_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle); return
+                end if
+            end do
+            call completion_batch_body(model_text, batch_generated, batch_prompt_tokens, batch_tokens, result)
+            status = 200_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle)
+            generation_count = generation_count + int(prompt_batch_count, int64)
+            return
+        end if
+        result_code = fortai_native_service_complete_text_sampling(prompt_batch(1)%as_character(), max_tokens, temperature, &
             seed, top_k, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty, repeat_last_n, &
             generated, tokens, prompt_tokens)
         if (result_code < 0) then

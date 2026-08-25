@@ -25,6 +25,9 @@ target model remains the correctness oracle.
 The ISO-C socket transport uses a bounded worker queue for `--threads-http`
 and `--parallel`, so multiple connections can be accepted without corrupting
 the mutable recurrent/KV state.
+`/v1/completions` accepts either one prompt string or a bounded string array;
+array prompts are decoded natively and returned as indexed choices under the
+configured `--batch-size` limit.
 
 The chat and Responses endpoints read the thinking default from the GGUF chat
 template: `enable_thinking`, `chat_template_kwargs.enable_thinking`, and
