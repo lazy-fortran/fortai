@@ -373,25 +373,30 @@ contains
         json_integer = max(0, sign * value)
     end function json_integer
 
-    integer function json_integer_checked(text, key, fallback, valid)
+    integer function json_integer_checked(text, key, fallback, valid, minimum)
         character(len=*), intent(in) :: text, key
         integer, intent(in) :: fallback
         logical, intent(out), optional :: valid
-        integer :: position, last, value
+        integer, intent(in), optional :: minimum
+        integer :: position, last, value, minimum_value, sign
 
         json_integer_checked = fallback
         if (present(valid)) valid = .true.
+        minimum_value = 0
+        if (present(minimum)) minimum_value = minimum
         position = json_key(text, key, 1)
         if (position == 0) return
         if (position > len(text)) then
             if (present(valid)) valid = .false.
             return
         end if
+        sign = 1
         if (text(position:position) == '-') then
-            if (present(valid)) valid = .false.
-            return
+            sign = -1
+            position = position + 1
+        else if (text(position:position) == '+') then
+            position = position + 1
         end if
-        if (text(position:position) == '+') position = position + 1
         last = position
         value = 0
         do while (last <= len(text))
@@ -404,6 +409,10 @@ contains
             last = last + 1
         end do
         if (last == position) then
+            if (present(valid)) valid = .false.
+            return
+        end if
+        if (sign * value < minimum_value) then
             if (present(valid)) valid = .false.
             return
         end if
@@ -2027,7 +2036,7 @@ contains
         end if
         seed = json_int64(body%as_character(), 'seed', 0_int64)
         top_k = json_integer_checked(body%as_character(), 'top_k', 20, top_k_valid)
-        repeat_last_n = json_integer_checked(body%as_character(), 'repeat_last_n', 64, repeat_last_n_valid)
+        repeat_last_n = json_integer_checked(body%as_character(), 'repeat_last_n', 64, repeat_last_n_valid, -1)
         top_p = json_real(body%as_character(), 'top_p', 0.95_real32, top_p_valid)
         min_p = json_real(body%as_character(), 'min_p', 0.0_real32, min_p_valid)
         repeat_penalty = json_real(body%as_character(), 'repeat_penalty', 1.0_real32, repeat_penalty_valid)
@@ -2035,7 +2044,7 @@ contains
         frequency_penalty = json_real(body%as_character(), 'frequency_penalty', 0.0_real32, frequency_penalty_valid)
         sampling_valid = top_p_valid .and. min_p_valid .and. repeat_penalty_valid .and. &
             presence_penalty_valid .and. frequency_penalty_valid .and. top_k_valid .and. repeat_last_n_valid
-        if (.not. sampling_valid .or. top_k < 0 .or. repeat_last_n < 0 .or. top_p <= 0.0_real32 .or. &
+        if (.not. sampling_valid .or. top_k < 0 .or. repeat_last_n < -1 .or. top_p <= 0.0_real32 .or. &
             top_p > 1.0_real32 .or. min_p < 0.0_real32 .or. min_p > 1.0_real32 .or. &
             repeat_penalty <= 0.0_real32) then
             call error_body(400, 'invalid sampling parameters', result); status = 400_c_int

@@ -278,7 +278,7 @@ contains
         type(sampling_options_t), intent(in) :: options
 
         valid_sampling_options = .false.
-        if (options%top_k < 0 .or. options%repeat_last_n < 0) return
+        if (options%top_k < 0 .or. options%repeat_last_n < -1) return
         if (.not. finite_real32(options%top_p)) return
         if (.not. finite_real32(options%min_p)) return
         if (.not. finite_real32(options%repeat_penalty)) return
@@ -294,7 +294,7 @@ contains
         type(sampling_options_t), intent(in) :: options
 
         sampling_penalties_active = .false.
-        if (options%repeat_last_n > 0) then
+        if (options%repeat_last_n /= 0) then
             if (options%repeat_penalty /= 1.0_real32) sampling_penalties_active = .true.
             if (options%presence_penalty /= 0.0_real32) sampling_penalties_active = .true.
             if (options%frequency_penalty /= 0.0_real32) sampling_penalties_active = .true.
@@ -384,8 +384,12 @@ contains
 
         adjusted = logits
         if (size(counts) > 0) counts = 0_int32
-        if (options%repeat_last_n <= 0 .or. history_count <= 0) return
-        first = max(1, history_count - options%repeat_last_n + 1)
+        if (options%repeat_last_n == 0 .or. history_count <= 0) return
+        if (options%repeat_last_n < 0) then
+            first = 1
+        else
+            first = max(1, history_count - options%repeat_last_n + 1)
+        end if
         last = min(history_count, size(history))
         if (first > last) return
         do i = first, last
