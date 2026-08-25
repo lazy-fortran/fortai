@@ -14,6 +14,7 @@ module fortai_backend_cuda
         procedure :: destroy => cuda_q8_context_destroy
         procedure :: set_position => cuda_q8_context_set_position
         procedure :: synchronize => cuda_q8_context_synchronize
+        procedure :: stream => cuda_q8_context_stream
         procedure :: capture_begin => cuda_q8_context_capture_begin
         procedure :: capture_end => cuda_q8_context_capture_end
         procedure :: graph_launch => cuda_q8_context_graph_launch
@@ -40,6 +41,7 @@ module fortai_backend_cuda
         procedure :: create => cuda_q4_context_create
         procedure :: destroy => cuda_q4_context_destroy
         procedure :: synchronize => cuda_q4_context_synchronize
+        procedure :: set_consumer_stream => cuda_q4_context_set_consumer_stream
         procedure :: matvec_device => cuda_q4_matvec_device
     end type cuda_q4_context_t
 
@@ -134,6 +136,12 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_context_synchronize
 
+        function c_context_stream(context) bind(C, name='fortai_cuda_q8_context_stream') result(stream)
+            import c_ptr
+            type(c_ptr), value :: context
+            type(c_ptr) :: stream
+        end function c_context_stream
+
         function c_context_capture_begin(context) &
                 bind(C, name='fortai_cuda_q8_context_capture_begin') result(code)
             import c_int, c_ptr
@@ -192,6 +200,14 @@ module fortai_backend_cuda
             type(c_ptr), value :: context
             integer(c_int) :: code
         end function c_q4_context_synchronize
+
+        function c_q4_context_set_consumer_stream(context, device_slot, stream) &
+                bind(C, name='fortai_cuda_q4_context_set_consumer_stream') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: context, stream
+            integer(c_int), value :: device_slot
+            integer(c_int) :: code
+        end function c_q4_context_set_consumer_stream
 
         function c_q4_weights_upload(context, value_type, host_weights, weight_bytes, rows, width, &
                 device, weights) bind(C, name='fortai_cuda_q4_weights_upload') result(code)
@@ -686,6 +702,23 @@ contains
             'CUDA Q4 context synchronization failed')
     end subroutine cuda_q4_context_synchronize
 
+    subroutine cuda_q4_context_set_consumer_stream(self, device_slot, stream, stat)
+        class(cuda_q4_context_t), intent(in) :: self
+        integer, intent(in) :: device_slot
+        type(c_ptr), intent(in) :: stream
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle) .or. device_slot < 0 .or. device_slot > 1) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 consumer stream arguments')
+            return
+        end if
+        code = c_q4_context_set_consumer_stream(self%handle, int(device_slot, c_int), stream)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 consumer stream setup failed')
+    end subroutine cuda_q4_context_set_consumer_stream
+
     subroutine cuda_q4_weights_upload(self, context, value_type, host_weights, weight_bytes, rows, width, &
             device, stat)
         class(cuda_q4_weights_t), intent(inout) :: self
@@ -955,6 +988,17 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA context synchronization failed')
     end subroutine cuda_q8_context_synchronize
+
+    function cuda_q8_context_stream(self) result(stream)
+        class(cuda_q8_context_t), intent(in) :: self
+        type(c_ptr) :: stream
+
+        if (c_associated(self%handle)) then
+            stream = c_context_stream(self%handle)
+        else
+            stream = c_null_ptr
+        end if
+    end function cuda_q8_context_stream
 
     subroutine cuda_q8_context_capture_begin(self, stat)
         class(cuda_q8_context_t), intent(in) :: self

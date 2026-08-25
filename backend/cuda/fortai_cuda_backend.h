@@ -24,6 +24,9 @@ int fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context);
 int fortai_cuda_memory_info(int device, size_t *free_bytes, size_t *total_bytes);
 int fortai_cuda_q8_context_set_position(fortai_cuda_q8_context *context, int position);
 int fortai_cuda_q8_context_synchronize(fortai_cuda_q8_context *context);
+/* Return the native CUDA stream used by this context for explicit stream
+ * hand-off with another CUDA backend.  The returned handle is borrowed. */
+void *fortai_cuda_q8_context_stream(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_capture_end(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_graph_launch(fortai_cuda_q8_context *context);

@@ -942,6 +942,11 @@ extern "C" int fortai_cuda_q8_context_synchronize(fortai_cuda_q8_context *contex
         fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "CUDA context synchronize", error);
 }
 
+extern "C" void *fortai_cuda_q8_context_stream(fortai_cuda_q8_context *context) {
+    if (!context) return nullptr;
+    return reinterpret_cast<void *>(context->impl.stream);
+}
+
 extern "C" int fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context) {
     if (!context || context->impl.graph || context->impl.graph_exec) return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);

@@ -59,6 +59,8 @@ bool fortai_supported_type(int type) {
 
 struct fortai_cuda_q4_weights;
 
+constexpr int q4_consumer_event_slots = 8;
+
 struct fortai_cuda_q4_group_plan {
     int count = 0;
     const fortai_cuda_q4_weights *weights[3] = {nullptr, nullptr, nullptr};
@@ -71,6 +73,9 @@ struct fortai_cuda_q4_context {
     ggml_backend_t devices[2] = {nullptr, nullptr};
     ggml_backend_t cpu = nullptr;
     int device_ids[2] = {0, 0};
+    cudaStream_t consumer_stream[2] = {nullptr, nullptr};
+    cudaEvent_t consumer_event[2][q4_consumer_event_slots] = {};
+    unsigned int next_consumer_event[2] = {0, 0};
     void *bridge_activation[2] = {nullptr, nullptr};
     void *bridge_output[2] = {nullptr, nullptr};
     size_t bridge_activation_bytes[2] = {0, 0};
@@ -123,6 +128,35 @@ static int fortai_cuda_q4_device_barrier(int device) {
     return FORTAI_CUDA_OK;
 }
 
+static int fortai_cuda_q4_consumer_slot(const fortai_cuda_q4_context *context, int device) {
+    if (context == nullptr) return -1;
+    for (int slot = 0; slot < 2; ++slot)
+        if (context->device_ids[slot] == device) return slot;
+    return -1;
+}
+
+/* GGML synchronizes its own stream before this hand-off.  Recording an event
+ * on the already-complete default stream and making FortAI's consumer stream
+ * wait on it establishes the cross-stream dependency without stalling every
+ * unrelated stream on the device.  Contexts without an attached consumer
+ * retain the old device-wide barrier for safety. */
+static int fortai_cuda_q4_handoff_to_consumer(fortai_cuda_q4_context *context, int device) {
+    const int slot = fortai_cuda_q4_consumer_slot(context, device);
+    if (slot < 0) return FORTAI_CUDA_INVALID;
+    if (context->consumer_stream[slot] == nullptr)
+        return fortai_cuda_q4_device_barrier(device);
+    if (cudaSetDevice(device) != cudaSuccess) return FORTAI_CUDA_RUNTIME_ERROR;
+    const int event_slot = static_cast<int>(context->next_consumer_event[slot]++ % q4_consumer_event_slots);
+    cudaEvent_t &event = context->consumer_event[slot][event_slot];
+    if (event == nullptr &&
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    if (cudaEventRecord(event, nullptr) != cudaSuccess ||
+        cudaStreamWaitEvent(context->consumer_stream[slot], event, 0) != cudaSuccess)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    return FORTAI_CUDA_OK;
+}
+
 int fortai_cuda_q4_context_create(int first_device, int second_device,
     fortai_cuda_q4_context **out) {
     if (out == nullptr || first_device < 0 || second_device < 0) return FORTAI_CUDA_INVALID;
@@ -158,6 +192,9 @@ int fortai_cuda_q4_context_destroy(fortai_cuda_q4_context * context) {
     if (context == nullptr) return FORTAI_CUDA_OK;
     for (int i = 0; i < 2; ++i) {
         cudaSetDevice(context->device_ids[i]);
+        for (int j = 0; j < q4_consumer_event_slots; ++j)
+            if (context->consumer_event[i][j] != nullptr)
+                cudaEventDestroy(context->consumer_event[i][j]);
         cudaFree(context->bridge_activation[i]);
         cudaFree(context->bridge_output[i]);
     }
@@ -222,6 +259,23 @@ int fortai_cuda_q4_context_synchronize(fortai_cuda_q4_context *context) {
         return FORTAI_CUDA_INVALID;
     ggml_backend_synchronize(context->devices[0]);
     if (context->devices[1] != context->devices[0]) ggml_backend_synchronize(context->devices[1]);
+    return FORTAI_CUDA_OK;
+}
+
+int fortai_cuda_q4_context_set_consumer_stream(fortai_cuda_q4_context *context,
+    int device_slot, void *stream) {
+    if (context == nullptr || device_slot < 0 || device_slot > 1)
+        return FORTAI_CUDA_INVALID;
+    context->consumer_stream[device_slot] = reinterpret_cast<cudaStream_t>(stream);
+    if (context->consumer_stream[device_slot] == nullptr) {
+        cudaSetDevice(context->device_ids[device_slot]);
+        for (int j = 0; j < q4_consumer_event_slots; ++j) {
+            if (context->consumer_event[device_slot][j] != nullptr)
+                cudaEventDestroy(context->consumer_event[device_slot][j]);
+            context->consumer_event[device_slot][j] = nullptr;
+        }
+        context->next_consumer_event[device_slot] = 0;
+    }
     return FORTAI_CUDA_OK;
 }
 
@@ -459,8 +513,6 @@ int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
     enum ggml_status status = ggml_backend_graph_compute_async(weights->backend, weights->graph);
     if (status == GGML_STATUS_SUCCESS)
         ggml_backend_synchronize(weights->backend);
-    if (status == GGML_STATUS_SUCCESS && fortai_cuda_q4_device_barrier(weights->device) != FORTAI_CUDA_OK)
-        status = GGML_STATUS_FAILED;
     weights->activation->data = saved_activation;
     weights->output->data = saved_output;
     if (status == GGML_STATUS_SUCCESS && remote) {
@@ -468,7 +520,7 @@ int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
         if (cudaMemcpyPeer(device_output, primary_device, output_ptr, weights->device, output_bytes) != cudaSuccess)
             return FORTAI_CUDA_RUNTIME_ERROR;
     }
-    if (status == GGML_STATUS_SUCCESS && fortai_cuda_q4_device_barrier(primary_device) != FORTAI_CUDA_OK)
+    if (status == GGML_STATUS_SUCCESS && fortai_cuda_q4_handoff_to_consumer(context, primary_device) != FORTAI_CUDA_OK)
         return FORTAI_CUDA_RUNTIME_ERROR;
     return status == GGML_STATUS_SUCCESS ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
 }
@@ -566,8 +618,6 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
         }
         enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
         if (status == GGML_STATUS_SUCCESS) ggml_backend_synchronize(plan->backend);
-        if (status == GGML_STATUS_SUCCESS && fortai_cuda_q4_device_barrier(device) != FORTAI_CUDA_OK)
-            status = GGML_STATUS_FAILED;
         for (int i = 0; i < member_count; ++i) {
             const int index = members[i];
             weights[index]->activation->data = saved_activation[i];
@@ -584,7 +634,7 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
                         bytes) != cudaSuccess) return FORTAI_CUDA_RUNTIME_ERROR;
             }
         }
-        if (fortai_cuda_q4_device_barrier(primary_device) != FORTAI_CUDA_OK)
+        if (fortai_cuda_q4_handoff_to_consumer(context, primary_device) != FORTAI_CUDA_OK)
             return FORTAI_CUDA_RUNTIME_ERROR;
     }
     return FORTAI_CUDA_OK;
@@ -617,8 +667,6 @@ int fortai_cuda_q4_embedding_device(fortai_cuda_q4_context *context,
     enum ggml_status status = ggml_backend_graph_compute_async(weights->backend, weights->embedding_graph);
     if (status == GGML_STATUS_SUCCESS)
         ggml_backend_synchronize(weights->backend);
-    if (status == GGML_STATUS_SUCCESS && fortai_cuda_q4_device_barrier(weights->device) != FORTAI_CUDA_OK)
-        status = GGML_STATUS_FAILED;
     weights->embedding_output->data = saved_output;
     if (status == GGML_STATUS_SUCCESS && remote) {
         cudaSetDevice(primary_device);
@@ -626,7 +674,7 @@ int fortai_cuda_q4_embedding_device(fortai_cuda_q4_context *context,
                 static_cast<size_t>(weights->weight->ne[0]) * sizeof(float)) != cudaSuccess)
             return FORTAI_CUDA_RUNTIME_ERROR;
     }
-    if (status == GGML_STATUS_SUCCESS && fortai_cuda_q4_device_barrier(primary_device) != FORTAI_CUDA_OK)
+    if (status == GGML_STATUS_SUCCESS && fortai_cuda_q4_handoff_to_consumer(context, primary_device) != FORTAI_CUDA_OK)
         return FORTAI_CUDA_RUNTIME_ERROR;
     return status == GGML_STATUS_SUCCESS ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
 }

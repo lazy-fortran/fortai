@@ -16,6 +16,11 @@ int fortai_cuda_q4_context_create(int first_device, int second_device,
     fortai_cuda_q4_context **context);
 int fortai_cuda_q4_context_destroy(fortai_cuda_q4_context *context);
 int fortai_cuda_q4_context_synchronize(fortai_cuda_q4_context *context);
+/* Attach the downstream CUDA stream that consumes resident Q4 results.  The
+ * stream handle is borrowed; passing a null handle restores the conservative
+ * device-wide synchronization fallback. */
+int fortai_cuda_q4_context_set_consumer_stream(fortai_cuda_q4_context *context,
+    int device_slot, void *stream);
 int fortai_cuda_q4_weights_upload(fortai_cuda_q4_context *context, int value_type,
     const void *host_weights, size_t weight_bytes, int rows, int width, int device,
     fortai_cuda_q4_weights **weights);

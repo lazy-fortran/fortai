@@ -29,6 +29,14 @@ int FORTAI_WEAK fortai_cuda_q4_context_synchronize(fortai_cuda_q4_context *conte
     return FORTAI_CUDA_OK;
 }
 
+int FORTAI_WEAK fortai_cuda_q4_context_set_consumer_stream(fortai_cuda_q4_context *context,
+    int device_slot, void *stream) {
+    (void)context;
+    (void)device_slot;
+    (void)stream;
+    return unavailable();
+}
+
 int FORTAI_WEAK fortai_cuda_q4_weights_upload(fortai_cuda_q4_context *context, int value_type,
     const void *host_weights, size_t weight_bytes, int rows, int width, int device,
     fortai_cuda_q4_weights **weights) {
@@ -168,6 +176,11 @@ int FORTAI_WEAK fortai_cuda_q8_context_set_position(fortai_cuda_q8_context *cont
 int FORTAI_WEAK fortai_cuda_q8_context_synchronize(fortai_cuda_q8_context *context) {
     (void)context;
     return unavailable();
+}
+
+void *FORTAI_WEAK fortai_cuda_q8_context_stream(fortai_cuda_q8_context *context) {
+    (void)context;
+    return NULL;
 }
 
 int FORTAI_WEAK fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context) {

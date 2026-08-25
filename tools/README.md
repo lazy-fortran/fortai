@@ -25,5 +25,7 @@ model allocation.
 
 Split two-GPU Q4_K_XL serving uses the deterministic host-boundary CUDA path by
 default. `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1` enables the resident
-all-device bridge for diagnostics; it is not yet the production default because
-its end-to-end determinism gate is still open.
+all-device bridge for diagnostics. The bridge attaches the native Q8 consumer
+stream and uses rotating CUDA events for cross-stream hand-off; it is not yet
+the production default because its end-to-end performance/determinism gate is
+still open.

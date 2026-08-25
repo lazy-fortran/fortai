@@ -571,6 +571,23 @@ contains
                 call self%cuda%destroy(cleanup_stat)
                 return
             end if
+            ! GGML's Q4 scheduler runs on a separate stream.  Attach the
+            ! native Q8 stream so the bridge can hand results across with a
+            ! CUDA event instead of synchronizing the whole device.
+            call self%cuda_q4%set_consumer_stream(0, self%cuda%stream(), stat)
+            if (.not. stat%is_ok()) then
+                do j = 1, size(self%cuda_q4_weights)
+                    call self%cuda_q4_weights(j)%destroy(cleanup_stat)
+                end do
+                deallocate(self%cuda_q4_weights)
+                do j = 1, size(self%cuda_weights)
+                    call self%cuda_weights(j)%destroy(cleanup_stat)
+                end do
+                deallocate(self%cuda_weights)
+                call self%cuda_q4%destroy(cleanup_stat)
+                call self%cuda%destroy(cleanup_stat)
+                return
+            end if
         end if
         do i = 1, size(self%layers)
             if (.not. self%layers(i)%recurrent) cycle
