@@ -17,7 +17,9 @@ thinking/no-thinking prompt form. OpenAI `tools` are formatted natively and
 Qwen3.5 XML tool calls are returned as structured function-call objects and
 streaming argument events. Sampling parameters (`top_k`, `top_p`, `min_p`,
 repeat/presence/frequency penalties, and `seed`) are applied by the native
-Fortran decoder rather than being silently ignored.
+Fortran decoder rather than being silently ignored. Successful responses
+report native prompt/completion token usage; invalid token budgets fail before
+model allocation.
 
 Split two-GPU Q4_K_XL serving uses the deterministic host-boundary CUDA path by
 default. `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1` enables the resident

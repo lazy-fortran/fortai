@@ -134,7 +134,7 @@ contains
 
     integer function fortai_native_service_complete_text_sampling(prompt_text, max_tokens, temperature, &
             seed, top_k, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty, repeat_last_n, &
-            output_text, token_count)
+            output_text, token_count, prompt_token_count)
         character(len=*), intent(in) :: prompt_text
         integer, intent(in) :: max_tokens
         real(real32), intent(in) :: temperature
@@ -143,6 +143,7 @@ contains
         real(real32), intent(in) :: top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty
         type(string_t), intent(out) :: output_text
         integer, intent(out) :: token_count
+        integer, intent(out), optional :: prompt_token_count
         type(sampling_options_t) :: options
         integer(int32), allocatable :: prompt_ids(:), generated_ids(:), sampling_history(:)
         integer(int32), allocatable :: history_counts(:), candidate_indices(:)
@@ -162,6 +163,7 @@ contains
         options%repeat_last_n = repeat_last_n
         fortai_native_service_complete_text_sampling = -1
         token_count = 0
+        if (present(prompt_token_count)) prompt_token_count = 0
         call output_text%clear()
         if (.not. service_ready) return
         if (max_tokens <= 0) return
@@ -177,6 +179,7 @@ contains
             write(error_unit, '(a)') 'fortai-native: prompt tokenization produced no tokens'
             return
         end if
+        if (present(prompt_token_count)) prompt_token_count = size(prompt_ids)
         if (size(prompt_ids) >= service_model%max_context) then
             write(error_unit, '(a,i0,a,i0,a)') 'fortai-native: prompt has ', size(prompt_ids), &
                 ' tokens but context is ', service_model%max_context, ' tokens'

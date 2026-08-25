@@ -162,7 +162,9 @@ The native server owns Qwen chat formatting and decoding.  It supports
 tokens are removed from the generated message. Sampling accepts `top_k`,
 `top_p`, `min_p`, `repeat_penalty`, `repeat_last_n`, `presence_penalty`, and
 `frequency_penalty` in addition to `temperature`/`seed`; the native sampler
-applies them before decoding. `chat_template_kwargs.enable_thinking`
+applies them before decoding. Usage reports native prompt/completion token
+counts, and malformed or unsafe token budgets are rejected before allocation.
+`chat_template_kwargs.enable_thinking`
 and Responses `reasoning.effort` use the same Qwen3.5 prompt switch, including
 the exact empty `<think>` block for hard no-thinking mode. Chat and Responses
 requests also accept OpenAI `tools`; the native formatter emits Qwen3.5's

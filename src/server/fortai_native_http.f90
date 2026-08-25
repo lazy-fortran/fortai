@@ -417,6 +417,39 @@ contains
         json_integer_checked = value
     end function json_integer_checked
 
+    integer function json_token_limit(text, responses, valid)
+        character(len=*), intent(in) :: text
+        logical, intent(in) :: responses
+        logical, intent(out) :: valid
+        integer :: value
+
+        value = 128
+        valid = .true.
+        if (responses) then
+            if (json_key(text, 'max_output_tokens', 1) > 0) then
+                value = json_integer_checked(text, 'max_output_tokens', -1, valid)
+            else if (json_key(text, 'max_completion_tokens', 1) > 0) then
+                value = json_integer_checked(text, 'max_completion_tokens', -1, valid)
+            else if (json_key(text, 'max_tokens', 1) > 0) then
+                value = json_integer_checked(text, 'max_tokens', -1, valid)
+            end if
+        else if (json_key(text, 'max_tokens', 1) > 0) then
+            value = json_integer_checked(text, 'max_tokens', -1, valid)
+        else if (json_key(text, 'max_completion_tokens', 1) > 0) then
+            value = json_integer_checked(text, 'max_completion_tokens', -1, valid)
+        end if
+        if (.not. valid) then
+            json_token_limit = 0
+            return
+        end if
+        if (value <= 0 .or. value > max_generation) then
+            valid = .false.
+            json_token_limit = 0
+            return
+        end if
+        json_token_limit = value
+    end function json_token_limit
+
     integer(int64) function json_int64(text, key, fallback)
         character(len=*), intent(in) :: text, key
         integer(int64), intent(in) :: fallback
@@ -1553,10 +1586,11 @@ contains
             60 * calendar(6) + calendar(7)
     end function unix_timestamp
 
-    subroutine completion_body(model, content, reasoning, tokens, chat, stream, response, tool_calls, tool_count)
+    subroutine completion_body(model, content, reasoning, prompt_tokens, tokens, chat, stream, response, &
+            tool_calls, tool_count)
         type(string_t), intent(in) :: model, content, reasoning
         type(tool_call_t), intent(in) :: tool_calls(:)
-        integer, intent(in) :: tokens, tool_count
+        integer, intent(in) :: prompt_tokens, tokens, tool_count
         logical, intent(in) :: chat, stream
         type(string_t), intent(out) :: response
         type(string_t) :: model_json, text_json, reasoning_json, escaped
@@ -1661,14 +1695,20 @@ contains
             else
                 call response%append('"stop"')
             end if
-            call response%append('}],"usage":{"prompt_tokens":0,"completion_tokens":')
-            call response%append_int(tokens); call response%append(',"total_tokens":'); call response%append_int(tokens)
+            call response%append('}],"usage":{"prompt_tokens":')
+            call response%append_int(prompt_tokens)
+            call response%append(',"completion_tokens":')
+            call response%append_int(tokens); call response%append(',"total_tokens":')
+            call response%append_int(prompt_tokens + tokens)
             call response%append('},"fortai_backend":"fortai"}'); call response%append(char(10))
         else
             call response%append(',"choices":[{"index":0,"text":')
             call response%append_string(text_json)
-            call response%append(',"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":')
-            call response%append_int(tokens); call response%append(',"total_tokens":'); call response%append_int(tokens)
+            call response%append(',"finish_reason":"stop"}],"usage":{"prompt_tokens":')
+            call response%append_int(prompt_tokens)
+            call response%append(',"completion_tokens":')
+            call response%append_int(tokens); call response%append(',"total_tokens":')
+            call response%append_int(prompt_tokens + tokens)
             call response%append('},"fortai_backend":"fortai"}'); call response%append(char(10))
         end if
     end subroutine completion_body
@@ -1689,10 +1729,10 @@ contains
         call output%append('}}')
     end subroutine append_chat_tool_object
 
-    function response_json(model, content, reasoning, tokens, tool_calls, tool_count) result(response)
+    function response_json(model, content, reasoning, prompt_tokens, tokens, tool_calls, tool_count) result(response)
         type(string_t), intent(in) :: model, content, reasoning
         type(tool_call_t), intent(in) :: tool_calls(:)
-        integer, intent(in) :: tokens, tool_count
+        integer, intent(in) :: prompt_tokens, tokens, tool_count
         type(string_t) :: response
         type(string_t) :: model_json, content_json, reasoning_json, arguments
         integer :: clock, i
@@ -1741,10 +1781,12 @@ contains
             call response%append('}')
             have_output = .true.
         end do
-        call response%append('],"input":[],"instructions":null,"usage":{"input_tokens":0,"output_tokens":')
+        call response%append('],"input":[],"instructions":null,"usage":{"input_tokens":')
+        call response%append_int(prompt_tokens)
+        call response%append(',"output_tokens":')
         call response%append_int(tokens)
         call response%append(',"total_tokens":')
-        call response%append_int(tokens)
+        call response%append_int(prompt_tokens + tokens)
         call response%append('},"store":false,"fortai_backend":"fortai"}')
     end function response_json
 
@@ -1761,10 +1803,10 @@ contains
         call response%append(char(10))
     end subroutine append_sse_event
 
-    function response_stream_json(model, content, reasoning, tokens, tool_calls, tool_count) result(response)
+    function response_stream_json(model, content, reasoning, prompt_tokens, tokens, tool_calls, tool_count) result(response)
         type(string_t), intent(in) :: model, content, reasoning
         type(tool_call_t), intent(in) :: tool_calls(:)
-        integer, intent(in) :: tokens, tool_count
+        integer, intent(in) :: prompt_tokens, tokens, tool_count
         type(string_t) :: response, payload, escaped, final_response, arguments
         integer :: text_index, clock, i, tool_index
         logical :: has_message
@@ -1903,7 +1945,7 @@ contains
             tool_index = tool_index + 1
         end do
 
-        final_response = response_json(model, content, reasoning, tokens, tool_calls, tool_count)
+        final_response = response_json(model, content, reasoning, prompt_tokens, tokens, tool_calls, tool_count)
         call payload%set('{"type":"response.completed","response":')
         call payload%append_string(final_response)
         call payload%append('}')
@@ -1921,11 +1963,11 @@ contains
         type(string_t) :: content, reasoning, tools_json, clean_content
         type(message_t), allocatable :: messages(:)
         type(tool_call_t), allocatable :: tool_calls(:)
-        integer :: count, max_tokens, tokens, result_code, required, tool_count
+        integer :: count, max_tokens, prompt_tokens, tokens, result_code, required, tool_count
         integer :: top_k, repeat_last_n
         integer(int64) :: seed
         real(real32) :: temperature, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty
-        logical :: okay, chat, responses, stream, enable_thinking, temperature_valid
+        logical :: okay, chat, responses, stream, enable_thinking, temperature_valid, max_tokens_valid
         logical :: top_p_valid, min_p_valid, repeat_penalty_valid, presence_penalty_valid
         logical :: frequency_penalty_valid, top_k_valid, repeat_last_n_valid, sampling_valid
         character(len=:), allocatable :: path_value
@@ -1970,13 +2012,12 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         chat = index(path_value, 'chat') > 0
-        if (responses) then
-            max_tokens = json_integer(body%as_character(), 'max_output_tokens', &
-                json_integer(body%as_character(), 'max_completion_tokens', &
-                json_integer(body%as_character(), 'max_tokens', 128)))
-        else
-            max_tokens = json_integer(body%as_character(), 'max_tokens', &
-                json_integer(body%as_character(), 'max_completion_tokens', 128))
+        max_tokens = json_token_limit(body%as_character(), responses, max_tokens_valid)
+        if (.not. max_tokens_valid) then
+            call error_body(400, 'max_tokens must be a positive integer no greater than 32768', result)
+            status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         temperature = json_real(body%as_character(), 'temperature', 0.0_real32, temperature_valid)
         if (.not. temperature_valid .or. .not. finite_real32(temperature) .or. temperature < 0.0_real32) then
@@ -2045,7 +2086,7 @@ contains
         end if
         result_code = fortai_native_service_complete_text_sampling(prompt%as_character(), max_tokens, temperature, &
             seed, top_k, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty, repeat_last_n, &
-            generated, tokens)
+            generated, tokens, prompt_tokens)
         if (result_code < 0) then
             call error_body(500, 'FortAI generation failed', result); status = 500_c_int
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
@@ -2063,12 +2104,13 @@ contains
         end if
         if (responses) then
             if (stream) then
-                result = response_stream_json(model_text, content, reasoning, tokens, tool_calls, tool_count)
+                result = response_stream_json(model_text, content, reasoning, prompt_tokens, tokens, tool_calls, tool_count)
             else
-                result = response_json(model_text, content, reasoning, tokens, tool_calls, tool_count)
+                result = response_json(model_text, content, reasoning, prompt_tokens, tokens, tool_calls, tool_count)
             end if
         else
-            call completion_body(model_text, content, reasoning, tokens, chat, stream, result, tool_calls, tool_count)
+            call completion_body(model_text, content, reasoning, prompt_tokens, tokens, chat, stream, result, &
+                tool_calls, tool_count)
         end if
         status = 200_c_int
         block
