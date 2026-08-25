@@ -426,11 +426,11 @@ __global__ void qwen_recurrent_l2_normalize(float *values, int slices, int lengt
     float epsilon) {
     const int slice = static_cast<int>(blockIdx.x);
     if (slice >= slices) return;
-    extern __shared__ float partial[];
+    extern __shared__ double partial[];
     const int lane = static_cast<int>(threadIdx.x);
-    float sum = 0.0f;
+    double sum = 0.0;
     for (int i = lane; i < length; i += blockDim.x) {
-        const float value = values[slice * length + i];
+        const double value = static_cast<double>(values[slice * length + i]);
         sum += value * value;
     }
     partial[lane] = sum;
@@ -439,7 +439,7 @@ __global__ void qwen_recurrent_l2_normalize(float *values, int slices, int lengt
         if (lane < stride) partial[lane] += partial[lane + stride];
         __syncthreads();
     }
-    const float inverse = 1.0f / fmaxf(sqrtf(partial[0]), epsilon);
+    const float inverse = static_cast<float>(1.0 / fmax(sqrt(partial[0]), static_cast<double>(epsilon)));
     for (int i = lane; i < length; i += blockDim.x)
         values[slice * length + i] *= inverse;
 }
@@ -490,15 +490,17 @@ __global__ void qwen_recurrent_gdn_normalize(float *output, const float *gate,
     const int head = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
     if (head >= value_heads || tid >= head_size) return;
-    extern __shared__ float reduction[];
+    extern __shared__ double reduction[];
     const int offset = head * head_size + tid;
-    reduction[tid] = output[offset] * output[offset];
+    const double value = static_cast<double>(output[offset]);
+    reduction[tid] = value * value;
     __syncthreads();
     for (int stride = head_size / 2; stride > 0; stride >>= 1) {
         if (tid < stride) reduction[tid] += reduction[tid + stride];
         __syncthreads();
     }
-    const float inverse = 1.0f / sqrtf(reduction[0] / static_cast<float>(head_size) + norm_epsilon);
+    const float inverse = static_cast<float>(1.0 / sqrt(
+        reduction[0] / static_cast<double>(head_size) + static_cast<double>(norm_epsilon)));
     output[offset] = output[offset] * inverse * ssm_norm[tid] * qwen_silu(gate[offset]);
 }
 
@@ -555,11 +557,11 @@ __global__ void qwen_add_float(const float *left, const float *right, float *out
 
 __global__ void qwen_rms_norm_float(const float *input, const float *weights,
     float *output, int elements, float epsilon) {
-    extern __shared__ float norm_partial[];
+    extern __shared__ double norm_partial[];
     const int lane = static_cast<int>(threadIdx.x);
-    float sum = 0.0f;
+    double sum = 0.0;
     for (int index = lane; index < elements; index += blockDim.x) {
-        const float value = input[index];
+        const double value = static_cast<double>(input[index]);
         sum += value * value;
     }
     norm_partial[lane] = sum;
@@ -568,7 +570,8 @@ __global__ void qwen_rms_norm_float(const float *input, const float *weights,
         if (lane < stride) norm_partial[lane] += norm_partial[lane + stride];
         __syncthreads();
     }
-    const float inverse = 1.0f / sqrtf(norm_partial[0] / static_cast<float>(elements) + epsilon);
+    const float inverse = static_cast<float>(1.0 / sqrt(
+        norm_partial[0] / static_cast<double>(elements) + static_cast<double>(epsilon)));
     for (int index = lane; index < elements; index += blockDim.x)
         output[index] = input[index] * inverse * weights[index];
 }
@@ -1199,7 +1202,7 @@ extern "C" int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *contex
         elements > static_cast<size_t>(INT32_MAX) || epsilon <= 0.0f)
         return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);
-    qwen_rms_norm_float<<<1, 256, 256 * sizeof(float), context->impl.stream>>>(
+    qwen_rms_norm_float<<<1, 256, 256 * sizeof(double), context->impl.stream>>>(
         static_cast<const float *>(device_input), static_cast<const float *>(device_weights),
         static_cast<float *>(device_output), static_cast<int>(elements), epsilon);
     const cudaError_t error = cudaGetLastError();
@@ -1672,7 +1675,7 @@ extern "C" int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *la
     }
     if (error == cudaSuccess) {
         const int slices = 2 * layer->impl.key_heads;
-        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(float), context->stream>>>(
+        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(double), context->stream>>>(
             layer->impl.qkv_output, slices, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
     }
@@ -1688,7 +1691,7 @@ extern "C" int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *la
     }
     if (error == cudaSuccess) {
         qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
-            static_cast<size_t>(layer->impl.head_size) * sizeof(float), context->stream>>>(
+            static_cast<size_t>(layer->impl.head_size) * sizeof(double), context->stream>>>(
             layer->impl.gdn_output, layer->impl.gate_output, layer->impl.ssm_norm,
             layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
@@ -1756,7 +1759,7 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_device(
     }
     if (error == cudaSuccess) {
         const int slices = 2 * layer->impl.key_heads;
-        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(float), context->stream>>>(
+        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(double), context->stream>>>(
             layer->impl.qkv_output, slices, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
     }
@@ -1772,7 +1775,7 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_device(
     }
     if (error == cudaSuccess) {
         qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
-            static_cast<size_t>(layer->impl.head_size) * sizeof(float), context->stream>>>(
+            static_cast<size_t>(layer->impl.head_size) * sizeof(double), context->stream>>>(
             layer->impl.gdn_output, layer->impl.gate_output, layer->impl.ssm_norm,
             layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
@@ -1815,7 +1818,7 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_core_device(
     error = cudaGetLastError();
     if (error == cudaSuccess) {
         const int slices = 2 * layer->impl.key_heads;
-        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(float), context->stream>>>(
+        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(double), context->stream>>>(
             static_cast<float *>(device_qkv), slices, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
     }
@@ -1830,7 +1833,7 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_core_device(
     }
     if (error == cudaSuccess) {
         qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
-            static_cast<size_t>(layer->impl.head_size) * sizeof(float), context->stream>>>(
+            static_cast<size_t>(layer->impl.head_size) * sizeof(double), context->stream>>>(
             layer->impl.gdn_output, static_cast<const float *>(device_gate), layer->impl.ssm_norm,
             layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
