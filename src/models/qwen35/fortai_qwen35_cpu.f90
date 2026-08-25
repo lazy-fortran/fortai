@@ -615,11 +615,23 @@ contains
         integer, intent(out) :: second_device
         character(len=8) :: split_value
         character(len=32) :: device_value
-        integer :: split_length, device_length, ios, i
+        character(len=8) :: pipeline_value
+        integer :: split_length, device_length, pipeline_length, ios, i
 
         qwen35_cuda_second_requested = .false.
         second_device = device + 1
         if (.not. allocated(self%file%tensors)) return
+        ! The all-device pipeline keeps its Q8 activations and scratch on the
+        ! primary CUDA context.  Do not place every Q8 weight on the peer GPU
+        ! in that mode; the mixed Q4 bridge still distributes its own tensors,
+        ! while a peer-resident Q8 output would fail the context ownership
+        ! check and require an extra cross-device copy for every matvec.
+        pipeline_value = ''
+        call get_environment_variable('FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE', pipeline_value, &
+            length=pipeline_length)
+        if (pipeline_length > 0) then
+            if (pipeline_value(1:1) == '1') return
+        end if
         do i = 1, size(self%file%tensors)
             if (is_q4_xl_type(self%file%tensors(i)%value_type)) then
                 qwen35_cuda_second_requested = .true.

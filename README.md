@@ -184,7 +184,10 @@ or message-array `input`, `instructions`, `reasoning.effort`, and streaming
 SSE events. Split two-GPU Q4_K_XL models
 use the deterministic host-boundary CUDA route by default; the resident
 all-device bridge remains an explicit `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1`
-diagnostic opt-in until its model-level determinism gate is closed. Multimodal
+diagnostic opt-in until its model-level determinism gate is closed. In that
+diagnostic mode, Q8 tensors stay on the primary CUDA context while Q4 tensors
+are split across the configured GPUs, avoiding invalid cross-context matvecs.
+Multimodal
 projector paths are accepted and surfaced in `/health`; image-token execution
 is not yet part of the native Qwen runtime. A standalone `--model-draft` is
 loaded and advanced by the native Fortran service for greedy requests, with
