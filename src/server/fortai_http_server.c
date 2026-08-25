@@ -21,6 +21,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern int fortai_native_http_handle(const char *, int, const char *, int, char *, int, int *,
@@ -209,13 +210,72 @@ static int fortai_parse_worker_count(void) {
     return (int)parsed;
 }
 
+static int fortai_parse_parallel_slots(void) {
+    const char *value = getenv("FORTAI_PARALLEL");
+    if (value == NULL || value[0] == '\0') return 1;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 1) return 1;
+    if (parsed > 256) parsed = 256;
+    return (int)parsed;
+}
+
+static void fortai_close_client(const fortai_transport *server, int client);
+
+static int fortai_process_accept_loop(const fortai_transport *server, int listener) {
+    while (!fortai_stop) {
+        int client = accept(listener, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        fortai_close_client(server, client);
+    }
+    return 0;
+}
+
+static int fortai_run_cpu_process_slots(const fortai_transport *server, int listener, int slots) {
+    pid_t *children = NULL;
+    int child_count = 0;
+    int result = 0;
+
+    if (slots <= 1) return -2;
+    children = (pid_t *)calloc((size_t)(slots - 1), sizeof(*children));
+    if (children == NULL) return -2;
+    for (int i = 1; i < slots; ++i) {
+        pid_t child = fork();
+        if (child < 0) {
+            result = -2;
+            break;
+        }
+        if (child == 0) {
+            (void)fortai_process_accept_loop(server, listener);
+            close(listener);
+            _exit(0);
+        }
+        children[child_count++] = child;
+    }
+    if (result == 0) result = fortai_process_accept_loop(server, listener);
+    fortai_stop = 1;
+    for (int i = 0; i < child_count; ++i) {
+        (void)kill(children[i], SIGTERM);
+    }
+    for (int i = 0; i < child_count; ++i) {
+        int status = 0;
+        while (waitpid(children[i], &status, 0) < 0 && errno == EINTR) {
+        }
+    }
+    free(children);
+    return result;
+}
+
 static void fortai_close_client(const fortai_transport *server, int client) {
     char *request = NULL;
     size_t request_length = 0;
     if (fortai_http_read_request(client, &request, &request_length) == 0) {
-        /* The Fortran model has mutable recurrent/KV state.  Keep the
-         * transport genuinely concurrent while serializing only the native
-         * model call until per-sequence state slots are available. */
+        /* CPU process slots have private model state after fork.  In the
+         * threaded transport (and for CUDA, whose contexts are not fork-safe)
+         * serialize native calls until device-owned sequence slots exist. */
         pthread_mutex_lock(&fortai_dispatch_mutex);
         (void)fortai_dispatch_request(server, client, request, (int)request_length);
         pthread_mutex_unlock(&fortai_dispatch_mutex);
@@ -313,11 +373,31 @@ int fortai_http_transport_run(const char *host, int port, const char *model, int
     int available_ready = 0;
     int space_ready = 0;
     int drained_ready = 0;
+    const int parallel_slots = fortai_parse_parallel_slots();
     signal(SIGPIPE, SIG_IGN);
     fortai_stop = 0;
     if (fortai_install_signal_handlers() != 0) return -1;
     const int listener = fortai_open_listener(host, port);
     if (listener < 0) return -1;
+
+    /* CUDA contexts and streams are not fork-safe.  Native CPU model state is
+     * fork-safe after load: immutable GGUF pages remain shared and each child
+     * gets private recurrent/KV/work pages on its first write. */
+    if (cuda == 0 && parallel_slots > 1) {
+        if (setenv("FORTAI_SLOT_MODE", "process", 1) != 0) {
+            close(listener);
+            return -1;
+        }
+        fprintf(stderr, "FORTAI_SERVER_SLOT_MODE=process slots=%d\n", parallel_slots);
+        const int process_result = fortai_run_cpu_process_slots(&server, listener, parallel_slots);
+        close(listener);
+        if (process_result != -2) return process_result;
+        fortai_stop = 0;
+        (void)setenv("FORTAI_SLOT_MODE", "serialized", 1);
+        fprintf(stderr, "fortai-server: CPU process slots unavailable; using one serialized model\n");
+    } else {
+        (void)setenv("FORTAI_SLOT_MODE", "serialized", 1);
+    }
 
     memset(&queue, 0, sizeof(queue));
     queue.server = &server;

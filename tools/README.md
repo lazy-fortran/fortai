@@ -36,9 +36,13 @@ the host-boundary oracle while the remaining layers stay resident. A
 standalone external draft model is loaded and advanced by the native Fortran
 service for greedy requests when it is a real transformer draft; MTP sidecars
 use the target's NextN path.
-The ISO-C socket transport uses a bounded worker queue for `--threads-http`
-and `--parallel`, so multiple connections can be accepted without corrupting
-the mutable recurrent/KV state.
+The ISO-C socket transport uses `--parallel` as sequence slots. On CPU, two or
+more slots are isolated forked workers: immutable GGUF pages stay shared while
+each worker owns its recurrent/KV/work state, so requests can execute at the
+same time. CUDA contexts are not fork-safe, so CUDA currently reports
+`slot_mode=serialized` and keeps native model calls ordered until per-slot
+device ownership is available. `--threads-http` still controls the bounded
+accept queue when the serialized transport is active.
 `/v1/completions` accepts either one prompt string or a bounded string array;
 array prompts are decoded natively and returned as indexed choices under the
 configured `--batch-size` limit.

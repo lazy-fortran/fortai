@@ -2857,6 +2857,7 @@ contains
         call append_setting(result, 'gpu_layers', 'FORTAI_GPU_LAYERS', '0', .false.)
         call append_setting(result, 'main_gpu', 'FORTAI_MAIN_GPU', '0', .false.)
         call append_setting(result, 'parallel', 'FORTAI_PARALLEL', '1', .false.)
+        call append_setting(result, 'slot_mode', 'FORTAI_SLOT_MODE', 'serialized', .true.)
         call append_setting(result, 'batch', 'FORTAI_BATCH', '2048', .false.)
         call append_setting(result, 'ubatch', 'FORTAI_UBATCH', '512', .false.)
         call append_setting(result, 'tensor_split', 'FORTAI_TENSOR_SPLIT', '', .true.)

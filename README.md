@@ -228,6 +228,11 @@ count, GPU-layer count, and main GPU alongside the other profile settings.
 `split-mode
 none` keeps all native tensors on `main-gpu`; `layer`, `row`, and `tensor` use
 the native two-device Q4 placement policy.
+On CPU, `--parallel`/`-np` greater than one creates isolated forked sequence
+workers after model load; immutable GGUF pages remain shared and recurrent/KV
+state is private per worker. CUDA reports `slot_mode=serialized` because CUDA
+contexts are not fork-safe; its native calls remain ordered until per-slot
+device ownership is implemented.
 Main native K/V caches support `f32`, `f16`, and `q8_0`; q8_0 storage is
 quantized with llama-compatible FP16 scales and is validated against the
 independent CUDA/CPU trace oracle. With native CUDA selected, q8_0 K/V stays
