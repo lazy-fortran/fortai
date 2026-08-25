@@ -1058,11 +1058,16 @@ contains
         character(len=8) :: graph_env
         character(len=8) :: pipeline_env
         character(len=8) :: q4_pipeline_env, q4_disable_env
+        integer :: device_layer_count
+        logical :: all_device_layers
+        logical, allocatable :: device_layer(:)
 
         call stat%clear()
         self%cuda_device_pipeline = .false.
         self%cuda_graph_enabled = .false.
         self%cuda_graph_ready = .false.
+        device_layer_count = 0
+        all_device_layers = .true.
         ! Q8_0 K/V caches are now first-class CUDA-resident storage.  The
         ! attention ABI carries the independent K/V flags, so mixed f16/q8
         ! configurations use the same resident pipeline without a host
@@ -1103,36 +1108,47 @@ contains
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA token embedding is not device resident')
             return
         end if
+        allocate(device_layer(size(self%layers)))
+        device_layer = .false.
         do i = 1, size(self%layers)
             if (self%layers(i)%recurrent) then
                 if (.not. c_associated(self%layers(i)%cuda_recurrent%handle)) then
                     write(error_unit, '(a,i0)') 'fortai-native: CUDA recurrent pipeline layer unavailable: ', i
-                    call stat%set(FORTAI_UNSUPPORTED, 'CUDA recurrent layer is not device resident')
-                    return
+                    all_device_layers = .false.
+                    cycle
                 end if
             else
                 if (.not. c_associated(self%layers(i)%cuda_attention%handle)) then
                     write(error_unit, '(a,i0)') 'fortai-native: CUDA attention pipeline layer unavailable: ', i
-                    call stat%set(FORTAI_UNSUPPORTED, 'CUDA attention layer is not device resident')
-                    return
+                    all_device_layers = .false.
+                    cycle
                 end if
             end if
             if (.not. cuda_ffn_device_ready(self, self%layers(i))) then
                 write(error_unit, '(a,i0)') 'fortai-native: CUDA FFN pipeline layer unavailable: ', i
-                call stat%set(FORTAI_UNSUPPORTED, 'CUDA FFN layer is not device resident')
-                return
+                all_device_layers = .false.
+                cycle
             end if
             if (size(self%file%tensors(self%layers(i)%attn_norm)%bytes) /= &
                 size(self%x) * storage_size(self%x(1)) / 8) then
-                call stat%set(FORTAI_UNSUPPORTED, 'CUDA RMS norm weights are not F32')
-                return
+                write(error_unit, '(a,i0)') 'fortai-native: CUDA RMS norm unavailable for layer: ', i
+                all_device_layers = .false.
+                cycle
             end if
             if (size(self%file%tensors(self%layers(i)%post_norm)%bytes) /= &
                 size(self%x) * storage_size(self%x(1)) / 8) then
-                call stat%set(FORTAI_UNSUPPORTED, 'CUDA post norm weights are not F32')
-                return
+                write(error_unit, '(a,i0)') 'fortai-native: CUDA post norm unavailable for layer: ', i
+                all_device_layers = .false.
+                cycle
             end if
+            device_layer(i) = .true.
+            device_layer_count = device_layer_count + 1
         end do
+        if (device_layer_count == 0) then
+            call stat%set(FORTAI_UNSUPPORTED, 'CUDA device pipeline has no resident layers')
+            return
+        end if
+        if (.not. all_device_layers) self%cuda_graph_enabled = .false.
         if (size(self%file%tensors(self%output_norm)%bytes) /= &
             size(self%x) * storage_size(self%x(1)) / 8) then
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA output norm weights are not F32')
@@ -1194,6 +1210,7 @@ contains
             self%cuda_logits, stat)
         if (.not. stat%is_ok()) return
         do i = 1, size(self%layers)
+            if (.not. device_layer(i)) cycle
             call self%cuda%allocate_buffer(hidden_bytes, self%cuda_attn_norm(i), stat)
             if (.not. stat%is_ok()) return
             call self%cuda%upload(self%cuda_attn_norm(i), &
@@ -1220,6 +1237,7 @@ contains
         if (.not. allocated(self%layers)) return
         do i = 1, size(self%layers)
             if (self%layers(i)%recurrent) cycle
+            if (.not. cuda_layer_kernel_ready(self, i)) cycle
             if (allocated(self%layers(i)%key_cache)) deallocate(self%layers(i)%key_cache)
             if (allocated(self%layers(i)%value_cache)) deallocate(self%layers(i)%value_cache)
             if (allocated(self%layers(i)%key_cache_q8)) deallocate(self%layers(i)%key_cache_q8)
@@ -1713,14 +1731,23 @@ contains
             .not. self%cuda_graph_enabled) then
             do i = 1, self % layer_count
                 if (self%cuda_device_pipeline) then
-                    if (self%layers(i)%recurrent) then
-                        call forward_recurrent_device(self, i, stat)
+                    if (cuda_layer_device_ready(self, i)) then
+                        if (self%layers(i)%recurrent) then
+                            call forward_recurrent_device(self, i, stat)
+                            if (.not. stat%is_ok()) return
+                            cycle
+                        end if
+                        call forward_attention_device(self, i, position, stat)
                         if (.not. stat%is_ok()) return
                         cycle
                     end if
-                    call forward_attention_device(self, i, position, stat)
+                    ! Keep the resident pipeline useful when one large
+                    ! attention cache cannot fit on the selected CUDA device:
+                    ! synchronize only this boundary and run that layer through
+                    ! the independent host cache/oracle before uploading the
+                    ! hidden state back for the next resident layer.
+                    call self%cuda%download_real(self%cuda_x, self%x, stat)
                     if (.not. stat%is_ok()) return
-                    cycle
                 end if
                 self % residual = self % x
                 call rms_norm(self % x, self % file % tensors(self % layers(i) % attn_norm), &
@@ -1768,6 +1795,10 @@ contains
                 end if
                 if (.not. stat % is_ok()) return
                 self % x = self % hidden_work + self % residual
+                if (self%cuda_device_pipeline) then
+                    call self%cuda%upload_real(self%cuda_x, self%x, stat)
+                    if (.not. stat%is_ok()) return
+                end if
             end do
         end if
 
@@ -2629,6 +2660,35 @@ contains
         if (.not. cuda_quantized_device_ready(self, layer%ffn_down)) return
         cuda_ffn_device_ready = .true.
     end function cuda_ffn_device_ready
+
+    logical function cuda_layer_kernel_ready(self, layer_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: layer_index
+
+        cuda_layer_kernel_ready = .false.
+        if (.not. allocated(self%layers)) return
+        if (layer_index <= 0 .or. layer_index > size(self%layers)) return
+        if (self%layers(layer_index)%recurrent) then
+            if (.not. c_associated(self%layers(layer_index)%cuda_recurrent%handle)) return
+        else
+            if (.not. c_associated(self%layers(layer_index)%cuda_attention%handle)) return
+        end if
+        if (.not. cuda_ffn_device_ready(self, self%layers(layer_index))) return
+        cuda_layer_kernel_ready = .true.
+    end function cuda_layer_kernel_ready
+
+    logical function cuda_layer_device_ready(self, layer_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: layer_index
+
+        cuda_layer_device_ready = .false.
+        if (.not. cuda_layer_kernel_ready(self, layer_index)) return
+        if (.not. allocated(self%cuda_attn_norm) .or. .not. allocated(self%cuda_post_norm)) return
+        if (layer_index > size(self%cuda_attn_norm) .or. layer_index > size(self%cuda_post_norm)) return
+        if (.not. c_associated(self%cuda_attn_norm(layer_index))) return
+        if (.not. c_associated(self%cuda_post_norm(layer_index))) return
+        cuda_layer_device_ready = .true.
+    end function cuda_layer_device_ready
 
     subroutine forward_attention(self, layer, position, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self

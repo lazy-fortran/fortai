@@ -200,7 +200,9 @@ avoiding invalid cross-context matvecs. Set
 `FORTAI_DISABLE_CUDA_Q4_DEVICE_PIPELINE=1` (or the compatibility spelling
 `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=0`) to select the host-boundary route.
 Native `draft-mtp` keeps only the NextN verification head on the host; the
-target decode remains resident when the configured context fits in VRAM.
+target decode remains resident when the configured context fits in VRAM. If a
+single large attention KV allocation cannot fit, FortAI retains the other
+resident layers and crosses an explicit host boundary only for that layer.
 Multimodal
 projector paths are accepted and surfaced in `/health`; image-token execution
 is not yet part of the native Qwen runtime. A standalone `--model-draft` is

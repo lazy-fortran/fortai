@@ -25,7 +25,8 @@ quantization layout on the host. The native MTP path uses the embedded NextN
 head and its two-token greedy speculative step; a configured head-only
 `mtp*.gguf` sidecar is merged into the target `blk.64` tensors and is reported
 as `mtp_sidecar_active` by `/health`. Its target decode remains CUDA-resident
-when possible and the target model remains the correctness oracle. A
+when possible; if one large attention cache cannot fit, only that layer uses
+the host-boundary oracle while the remaining layers stay resident. A
 standalone external draft model is loaded and advanced by the native Fortran
 service for greedy requests when it is a real transformer draft; MTP sidecars
 use the target's NextN path.
