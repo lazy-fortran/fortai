@@ -2407,7 +2407,9 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         thinking_explicit = thinking_explicit .or. nested_thinking_found
-        reasoning_effort = json_string_checked(body%as_character(), 'reasoning_effort', '', &
+        call apply_reasoning_environment(enable_thinking, thinking_explicit)
+        reasoning_effort = json_string_checked(body%as_character(), 'reasoning_effort', &
+            server_text_default('FORTAI_REASONING_EFFORT', ''), &
             reasoning_effort_type_valid, reasoning_effort_found)
         if (.not. reasoning_effort_type_valid) then
             call error_body(400, 'reasoning_effort must be a string', result); status = 400_c_int
@@ -2463,7 +2465,7 @@ contains
         end select
         supports_reasoning_effort = fortai_native_service_supports_reasoning_effort()
         supports_preserve_thinking = fortai_native_service_supports_preserve_thinking()
-        preserve_thinking = supports_preserve_thinking
+        preserve_thinking = server_boolean_default('FORTAI_REASONING_PRESERVE', supports_preserve_thinking)
         preserve_thinking = json_boolean_checked(body%as_character(), 'preserve_thinking', preserve_thinking, &
             preserve_thinking_valid, preserve_thinking_found)
         if (.not. preserve_thinking_valid) then
@@ -2654,6 +2656,22 @@ contains
         if (ios == 0 .and. parsed > 0 .and. parsed <= max_generation) server_reasoning_budget = parsed
     end function server_reasoning_budget
 
+    subroutine apply_reasoning_environment(enable_thinking, explicit)
+        logical, intent(inout) :: enable_thinking, explicit
+        character(len=:), allocatable :: value
+
+        if (explicit) return
+        value = server_text_default('FORTAI_REASONING', 'auto')
+        select case (trim(value))
+        case ('on', 'true', '1')
+            enable_thinking = .true.
+            explicit = .true.
+        case ('off', 'false', '0')
+            enable_thinking = .false.
+            explicit = .true.
+        end select
+    end subroutine apply_reasoning_environment
+
     function integer_text(value) result(text)
         integer, intent(in) :: value
         character(len=32) :: text
@@ -2674,6 +2692,21 @@ contains
         read(value(:length), *, iostat=ios) server_real_default
         if (ios /= 0) server_real_default = fallback
     end function server_real_default
+
+    logical function server_boolean_default(primary, fallback)
+        character(len=*), intent(in) :: primary
+        logical, intent(in) :: fallback
+        character(len=:), allocatable :: value
+
+        server_boolean_default = fallback
+        value = server_text_default(primary, '')
+        select case (trim(value))
+        case ('1', 'true', 'on', 'yes')
+            server_boolean_default = .true.
+        case ('0', 'false', 'off', 'no')
+            server_boolean_default = .false.
+        end select
+    end function server_boolean_default
 
     integer function server_integer_default(primary, fallback)
         character(len=*), intent(in) :: primary
@@ -2779,6 +2812,9 @@ contains
         call append_setting(result, 'spec_type', 'FORTAI_SPEC_TYPE', '', .true.)
         call append_setting(result, 'spec_draft_n_max', 'FORTAI_SPEC_DRAFT_N_MAX', '0', .false.)
         call append_setting(result, 'reasoning_budget', 'FORTAI_REASONING_BUDGET', '0', .false.)
+        call append_setting(result, 'reasoning_effort', 'FORTAI_REASONING_EFFORT', 'default', .true.)
+        call append_setting(result, 'reasoning', 'FORTAI_REASONING', 'auto', .true.)
+        call append_setting(result, 'reasoning_preserve', 'FORTAI_REASONING_PRESERVE', 'false', .false.)
         call append_setting(result, 'mmproj', 'FORTAI_MMPROJ', '', .true.)
         call append_setting(result, 'mmproj_offload', 'FORTAI_MMPROJ_OFFLOAD', 'true', .false.)
         call append_setting(result, 'fit', 'FORTAI_FIT', 'auto', .true.)

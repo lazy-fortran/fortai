@@ -124,6 +124,9 @@ contains
 
         okay = .true.; show_help = .false.; show_version = .false.
         call config%host%set('127.0.0.1')
+        ! Normalize llama-server's canonical LLAMA_ARG_* environment names
+        ! before reading model defaults or applying command-line overrides.
+        call import_llama_environment()
         call get_environment_variable('FORTAI_SERVER_MODEL', model_env, length=model_length)
         if (model_length <= 0) then
             call get_environment_variable('LLAMACPP_MODEL', model_env, length=model_length)
@@ -179,28 +182,32 @@ contains
                 if (i > count) then; okay = .false.; return; end if
                 if (.not. parse_integer(argument_at(i), 0, 8192, value)) then; okay = .false.; return; end if
                 config%gpu_layers = value
-            case ('--main-gpu')
+            case ('--main-gpu', '-mg')
                 i = i + 1
                 if (i > count) then; okay = .false.; return; end if
                 if (.not. parse_integer(argument_at(i), 0, 255, value)) then; okay = .false.; return; end if
                 config%main_gpu = value
-            case ('--parallel', '-np', '--tensor-split', '-ts', '--split-mode', '--model-draft', '--spec-type', &
-                    '--spec-draft-n-max', '--flash-attn', '-fa', '--cache-type-k', '--cache-type-v', &
-                    '--cache-type-k-draft', '--cache-type-v-draft', '--batch-size', '-b', '--ubatch-size', '-ub', &
-                    '--fit', '-fit', '--cache-ram', '--cache-reuse', &
-                    '--n-cpu-moe', '--reasoning-budget', '--mmproj', '--rpc', '--threads-http', '--chat-template-kwargs', &
+            case ('--parallel', '-np', '--tensor-split', '-ts', '--split-mode', '-sm', '--model-draft', '--spec-type', &
+                    '--spec-draft-model', '-md', '--spec-draft-n-max', '--flash-attn', '-fa', '--cache-type-k', '-ctk', &
+                    '--cache-type-v', '-ctv', '--cache-type-k-draft', '--spec-draft-type-k', '-ctkd', &
+                    '--cache-type-v-draft', '--spec-draft-type-v', '-ctvd', '--batch-size', '-b', '--ubatch-size', '-ub', &
+                    '--fit', '-fit', '--cache-ram', '-cram', '--cache-reuse', &
+                    '--n-cpu-moe', '--ncmoe', '--reasoning-budget', '--mmproj', '-mm', '--rpc', '--threads-http', &
                     '--temp', '--temperature', '--top-k', '--top-p', '--min-p', '--repeat-penalty', &
                     '--presence-penalty', '--frequency-penalty', '--repeat-last-n', '--seed', '--reasoning-format', &
-                    '--n-predict', '--max-tokens', '--device')
+                    '--reasoning', '--reasoning-effort', '--threads-batch', '-tb', '--n-predict', '--predict', '-n', &
+                    '--max-tokens', '--device')
                 i = i + 1; if (i > count) then; okay = .false.; return; end if
                 call argument_text_at(i, value_text)
                 call set_option_environment(option_text, value_text)
-            case ('--alias', '--served-model-name')
+            case ('--alias', '-a', '--served-model-name')
                 i = i + 1; if (i > count) then; okay = .false.; return; end if
                 call argument_text_at(i, value_text)
                 call config%alias%set(value_text)
-            case ('--jinja', '--no-jinja', '--no-mmap', '--mlock', '--no-kv-offload', '--no-context-shift', '--metrics', &
-                    '--log-timestamps', '--mmproj-offload', '--no-mmproj-offload', '--no-webui', '--no-op-offload')
+            case ('--jinja', '--no-jinja', '--mmap', '--no-mmap', '--mlock', '--kv-offload', '--no-kv-offload', &
+                    '--context-shift', '--no-context-shift', '--metrics', '--log-timestamps', '--mmproj-offload', &
+                    '--no-mmproj-offload', '--webui', '--no-ui', '--no-webui', '--op-offload', '--no-op-offload', &
+                    '--reasoning-preserve', '--no-reasoning-preserve')
                 call set_flag_environment(option_text)
             case default
                 if (len(option_text) > 0) then
@@ -217,7 +224,10 @@ contains
         end do
         device = ''; call get_environment_variable('FORTAI_SERVER_DEVICE', device, length=device_length)
         if (device_length > 0) then
-            if (trim(device(:device_length)) == 'cpu' .or. trim(device(:device_length)) == 'host') config%gpu_layers = 0
+            select case (trim(device(:device_length)))
+            case ('cpu', 'host', 'none')
+                config%gpu_layers = 0
+            end select
         end if
         if (config%model%length() == 0) okay = .false.
     end subroutine parse_arguments
@@ -237,22 +247,24 @@ contains
         select case (option)
         case ('--parallel', '-np'); name = 'FORTAI_PARALLEL'
         case ('--tensor-split', '-ts'); name = 'FORTAI_TENSOR_SPLIT'
-        case ('--split-mode'); name = 'FORTAI_SPLIT_MODE'
-        case ('--model-draft'); name = 'FORTAI_DRAFT_MODEL'
+        case ('--split-mode', '-sm'); name = 'FORTAI_SPLIT_MODE'
+        case ('--model-draft', '--spec-draft-model', '-md'); name = 'FORTAI_DRAFT_MODEL'
         case ('--spec-type'); name = 'FORTAI_SPEC_TYPE'
         case ('--spec-draft-n-max'); name = 'FORTAI_SPEC_DRAFT_N_MAX'
         case ('--flash-attn', '-fa'); name = 'FORTAI_FLASH_ATTN'
-        case ('--cache-type-k'); name = 'FORTAI_CACHE_TYPE_K'
-        case ('--cache-type-v'); name = 'FORTAI_CACHE_TYPE_V'
-        case ('--cache-type-k-draft'); name = 'FORTAI_CACHE_TYPE_K_DRAFT'
-        case ('--cache-type-v-draft'); name = 'FORTAI_CACHE_TYPE_V_DRAFT'
+        case ('--cache-type-k', '-ctk'); name = 'FORTAI_CACHE_TYPE_K'
+        case ('--cache-type-v', '-ctv'); name = 'FORTAI_CACHE_TYPE_V'
+        case ('--cache-type-k-draft', '--spec-draft-type-k', '-ctkd'); name = 'FORTAI_CACHE_TYPE_K_DRAFT'
+        case ('--cache-type-v-draft', '--spec-draft-type-v', '-ctvd'); name = 'FORTAI_CACHE_TYPE_V_DRAFT'
         case ('--ubatch-size', '-ub'); name = 'FORTAI_UBATCH'
         case ('--batch-size', '-b'); name = 'FORTAI_BATCH'
-        case ('--cache-ram'); name = 'FORTAI_CACHE_RAM'
+        case ('--cache-ram', '-cram'); name = 'FORTAI_CACHE_RAM'
         case ('--cache-reuse'); name = 'FORTAI_CACHE_REUSE'
-        case ('--n-cpu-moe'); name = 'FORTAI_N_CPU_MOE'
+        case ('--n-cpu-moe', '--ncmoe'); name = 'FORTAI_N_CPU_MOE'
         case ('--reasoning-budget'); name = 'FORTAI_REASONING_BUDGET'
-        case ('--mmproj'); name = 'FORTAI_MMPROJ'
+        case ('--reasoning-effort'); name = 'FORTAI_REASONING_EFFORT'
+        case ('--reasoning'); name = 'FORTAI_REASONING'
+        case ('--mmproj', '-mm'); name = 'FORTAI_MMPROJ'
         case ('--rpc'); name = 'FORTAI_RPC'
         case ('--threads-http'); name = 'FORTAI_THREADS_HTTP'
         case ('--fit', '-fit'); name = 'FORTAI_FIT'
@@ -267,7 +279,8 @@ contains
         case ('--repeat-last-n'); name = 'FORTAI_REPEAT_LAST_N'
         case ('--seed'); name = 'FORTAI_SEED'
         case ('--reasoning-format'); name = 'FORTAI_REASONING_FORMAT'
-        case ('--n-predict', '--max-tokens'); name = 'FORTAI_MAX_TOKENS'
+        case ('--threads-batch', '-tb'); name = 'FORTAI_THREADS_BATCH'
+        case ('--n-predict', '--predict', '-n', '--max-tokens'); name = 'FORTAI_MAX_TOKENS'
         case ('--device'); name = 'FORTAI_SERVER_DEVICE'
         case default; name = 'FORTAI_OPTION'
         end select
@@ -280,16 +293,23 @@ contains
         select case (option)
         case ('--jinja'); name = 'FORTAI_JINJA'; value = '1'
         case ('--no-jinja'); name = 'FORTAI_JINJA'; value = '0'
+        case ('--mmap'); name = 'FORTAI_NO_MMAP'; value = '0'
         case ('--no-mmap'); name = 'FORTAI_NO_MMAP'; value = '1'
         case ('--mlock'); name = 'FORTAI_MLOCK'; value = '1'
+        case ('--kv-offload'); name = 'FORTAI_NO_KV_OFFLOAD'; value = '0'
         case ('--no-kv-offload'); name = 'FORTAI_NO_KV_OFFLOAD'; value = '1'
+        case ('--context-shift'); name = 'FORTAI_NO_CONTEXT_SHIFT'; value = '0'
         case ('--no-context-shift'); name = 'FORTAI_NO_CONTEXT_SHIFT'; value = '1'
         case ('--metrics'); name = 'FORTAI_METRICS'; value = '1'
         case ('--log-timestamps'); name = 'FORTAI_LOG_TIMESTAMPS'; value = '1'
         case ('--mmproj-offload'); name = 'FORTAI_MMPROJ_OFFLOAD'; value = '1'
         case ('--no-mmproj-offload'); name = 'FORTAI_MMPROJ_OFFLOAD'; value = '0'
-        case ('--no-webui'); name = 'FORTAI_NO_WEBUI'; value = '1'
+        case ('--webui'); name = 'FORTAI_NO_WEBUI'; value = '0'
+        case ('--no-ui', '--no-webui'); name = 'FORTAI_NO_WEBUI'; value = '1'
+        case ('--op-offload'); name = 'FORTAI_NO_OP_OFFLOAD'; value = '0'
         case ('--no-op-offload'); name = 'FORTAI_NO_OP_OFFLOAD'; value = '1'
+        case ('--reasoning-preserve'); name = 'FORTAI_REASONING_PRESERVE'; value = '1'
+        case ('--no-reasoning-preserve'); name = 'FORTAI_REASONING_PRESERVE'; value = '0'
         case default; return
         end select
         call set_environment(trim(name), trim(value))
@@ -358,6 +378,161 @@ contains
         call load_text_option('FORTAI_NO_WEBUI', 'LLAMACPP_NO_WEBUI')
         call load_text_option('FORTAI_NO_OP_OFFLOAD', 'LLAMACPP_NO_OP_OFFLOAD')
     end subroutine load_environment_defaults
+
+    subroutine import_llama_environment()
+        call import_environment_alias('FORTAI_SERVER_MODEL', 'LLAMA_ARG_MODEL')
+        call import_environment_alias('FORTAI_SERVER_HOST', 'LLAMA_ARG_HOST')
+        call import_environment_alias('FORTAI_SERVER_PORT', 'LLAMA_ARG_PORT')
+        call import_environment_alias('FORTAI_CONTEXT', 'LLAMA_ARG_CTX_SIZE')
+        call import_threads_alias()
+        call import_gpu_layers_alias()
+        call import_environment_alias('FORTAI_MAIN_GPU', 'LLAMA_ARG_MAIN_GPU')
+        call import_environment_alias('FORTAI_SERVER_ALIAS', 'LLAMA_ARG_ALIAS')
+        call import_environment_alias('FORTAI_PARALLEL', 'LLAMA_ARG_N_PARALLEL')
+        call import_environment_alias('FORTAI_TENSOR_SPLIT', 'LLAMA_ARG_TENSOR_SPLIT')
+        call import_environment_alias('FORTAI_SPLIT_MODE', 'LLAMA_ARG_SPLIT_MODE')
+        call import_environment_alias('FORTAI_DRAFT_MODEL', 'LLAMA_ARG_SPEC_DRAFT_MODEL')
+        call import_environment_alias('FORTAI_DRAFT_MODEL', 'LLAMA_ARG_MODEL_DRAFT')
+        call import_environment_alias('FORTAI_SPEC_TYPE', 'LLAMA_ARG_SPEC_TYPE')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_N_MAX', 'LLAMA_ARG_SPEC_DRAFT_N_MAX')
+        call import_environment_alias('FORTAI_FLASH_ATTN', 'LLAMA_ARG_FLASH_ATTN')
+        call import_environment_alias('FORTAI_CACHE_TYPE_K', 'LLAMA_ARG_CACHE_TYPE_K')
+        call import_environment_alias('FORTAI_CACHE_TYPE_V', 'LLAMA_ARG_CACHE_TYPE_V')
+        call import_environment_alias('FORTAI_CACHE_TYPE_K_DRAFT', 'LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K')
+        call import_environment_alias('FORTAI_CACHE_TYPE_V_DRAFT', 'LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V')
+        call import_environment_alias('FORTAI_BATCH', 'LLAMA_ARG_BATCH')
+        call import_environment_alias('FORTAI_UBATCH', 'LLAMA_ARG_UBATCH')
+        call import_environment_alias('FORTAI_FIT', 'LLAMA_ARG_FIT')
+        call import_environment_alias('FORTAI_CACHE_RAM', 'LLAMA_ARG_CACHE_RAM')
+        call import_environment_alias('FORTAI_CACHE_REUSE', 'LLAMA_ARG_CACHE_REUSE')
+        call import_environment_alias('FORTAI_N_CPU_MOE', 'LLAMA_ARG_N_CPU_MOE')
+        call import_environment_alias('FORTAI_REASONING_BUDGET', 'LLAMA_ARG_THINK_BUDGET')
+        call import_environment_alias('FORTAI_REASONING_EFFORT', 'LLAMA_ARG_REASONING_EFFORT')
+        call import_environment_alias('FORTAI_REASONING', 'LLAMA_ARG_REASONING')
+        call import_environment_alias('FORTAI_REASONING_PRESERVE', 'LLAMA_ARG_REASONING_PRESERVE')
+        call import_environment_alias('FORTAI_MMPROJ', 'LLAMA_ARG_MMPROJ')
+        call import_environment_alias('FORTAI_MMPROJ_OFFLOAD', 'LLAMA_ARG_MMPROJ_OFFLOAD')
+        call import_environment_alias('FORTAI_RPC', 'LLAMA_ARG_RPC')
+        call import_environment_alias('FORTAI_THREADS_HTTP', 'LLAMA_ARG_THREADS_HTTP')
+        call import_environment_alias('FORTAI_CHAT_TEMPLATE_KWARGS', 'LLAMA_ARG_CHAT_TEMPLATE_KWARGS')
+        call import_environment_alias('FORTAI_TEMPERATURE', 'LLAMA_ARG_TEMP')
+        call import_environment_alias('FORTAI_TOP_K', 'LLAMA_ARG_TOP_K')
+        call import_environment_alias('FORTAI_TOP_P', 'LLAMA_ARG_TOP_P')
+        call import_environment_alias('FORTAI_MIN_P', 'LLAMA_ARG_MIN_P')
+        call import_environment_alias('FORTAI_REPEAT_PENALTY', 'LLAMA_ARG_REPEAT_PENALTY')
+        call import_environment_alias('FORTAI_PRESENCE_PENALTY', 'LLAMA_ARG_PRESENCE_PENALTY')
+        call import_environment_alias('FORTAI_FREQUENCY_PENALTY', 'LLAMA_ARG_FREQUENCY_PENALTY')
+        call import_environment_alias('FORTAI_REPEAT_LAST_N', 'LLAMA_ARG_REPEAT_LAST_N')
+        call import_environment_alias('FORTAI_SEED', 'LLAMA_ARG_SEED')
+        call import_environment_alias('FORTAI_REASONING_FORMAT', 'LLAMA_ARG_THINK')
+        call import_environment_alias('FORTAI_MAX_TOKENS', 'LLAMA_ARG_N_PREDICT')
+        call import_environment_alias('FORTAI_SERVER_DEVICE', 'LLAMA_ARG_DEVICE')
+        call import_environment_alias('FORTAI_THREADS_BATCH', 'LLAMA_ARG_THREADS_BATCH')
+        call import_environment_alias('FORTAI_MLOCK', 'LLAMA_ARG_MLOCK')
+        call import_environment_alias('FORTAI_METRICS', 'LLAMA_ARG_ENDPOINT_METRICS')
+        call import_environment_alias('FORTAI_LOG_TIMESTAMPS', 'LLAMA_ARG_LOG_TIMESTAMPS')
+        call import_inverse_boolean_alias('FORTAI_NO_MMAP', 'LLAMA_ARG_MMAP')
+        call import_inverse_boolean_alias('FORTAI_NO_KV_OFFLOAD', 'LLAMA_ARG_KV_OFFLOAD')
+        call import_inverse_boolean_alias('FORTAI_NO_OP_OFFLOAD', 'LLAMA_ARG_OP_OFFLOAD')
+        call import_inverse_boolean_alias('FORTAI_NO_CONTEXT_SHIFT', 'LLAMA_ARG_CONTEXT_SHIFT')
+        call import_ui_alias()
+    end subroutine import_llama_environment
+
+    subroutine import_environment_alias(target_name, source_name)
+        character(len=*), intent(in) :: target_name, source_name
+        character(len=4096) :: value
+        integer :: length
+
+        value = ''
+        call get_environment_variable(target_name, value, length=length)
+        if (length > 0) return
+        value = ''
+        call get_environment_variable(source_name, value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) return
+        call set_environment(target_name, value(:length))
+    end subroutine import_environment_alias
+
+    subroutine import_threads_alias()
+        character(len=64) :: value
+        integer :: length, ios, parsed
+
+        value = ''
+        call get_environment_variable('FORTAI_THREADS', value, length=length)
+        if (length > 0) return
+        value = ''
+        call get_environment_variable('LLAMA_ARG_THREADS', value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) return
+        parsed = 0
+        read(value(:length), *, iostat=ios) parsed
+        if (ios /= 0) return
+        if (parsed < 0) parsed = 0
+        call set_environment('FORTAI_THREADS', int_text(parsed))
+    end subroutine import_threads_alias
+
+    subroutine import_gpu_layers_alias()
+        character(len=64) :: value
+        integer :: length, ios, parsed
+
+        value = ''
+        call get_environment_variable('FORTAI_GPU_LAYERS', value, length=length)
+        if (length > 0) return
+        value = ''
+        call get_environment_variable('LLAMA_ARG_N_GPU_LAYERS', value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) return
+        select case (trim(value(:length)))
+        case ('auto', 'all')
+            call set_environment('FORTAI_GPU_LAYERS', '999')
+            return
+        case ('none', 'off')
+            call set_environment('FORTAI_GPU_LAYERS', '0')
+            return
+        end select
+        parsed = 0
+        read(value(:length), *, iostat=ios) parsed
+        if (ios == 0 .and. parsed >= 0) call set_environment('FORTAI_GPU_LAYERS', int_text(parsed))
+    end subroutine import_gpu_layers_alias
+
+    subroutine import_inverse_boolean_alias(target_name, source_name)
+        character(len=*), intent(in) :: target_name, source_name
+        character(len=64) :: value
+        integer :: length
+
+        value = ''
+        call get_environment_variable(target_name, value, length=length)
+        if (length > 0) return
+        value = ''
+        call get_environment_variable(source_name, value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) return
+        select case (trim(value(:length)))
+        case ('0', 'false', 'off', 'no')
+            call set_environment(target_name, '1')
+        case default
+            call set_environment(target_name, '0')
+        end select
+    end subroutine import_inverse_boolean_alias
+
+    subroutine import_ui_alias()
+        character(len=64) :: value
+        integer :: length
+
+        value = ''
+        call get_environment_variable('FORTAI_NO_WEBUI', value, length=length)
+        if (length > 0) return
+        value = ''
+        call get_environment_variable('LLAMA_ARG_UI', value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) return
+        select case (trim(value(:length)))
+        case ('0', 'false', 'off', 'no')
+            call set_environment('FORTAI_NO_WEBUI', '1')
+        case default
+            call set_environment('FORTAI_NO_WEBUI', '0')
+        end select
+    end subroutine import_ui_alias
 
     subroutine load_text_environment(primary, secondary, target)
         character(len=*), intent(in) :: primary, secondary
@@ -437,15 +612,15 @@ contains
         write(output_unit, '(a)') '  -c, --ctx-size N             context size'
         write(output_unit, '(a)') '  -t, --threads N              CPU threads'
         write(output_unit, '(a)') '  -ngl, --n-gpu-layers N       GPU layers (0=CPU)'
-        write(output_unit, '(a)') '  --main-gpu N                 primary GPU'
-        write(output_unit, '(a)') '  --alias NAME                 served model id (default qwen)'
+        write(output_unit, '(a)') '  --main-gpu N / -mg           primary GPU'
+        write(output_unit, '(a)') '  --alias NAME / -a            served model id (default qwen)'
         write(output_unit, '(a)') '  --parallel N / -np N         resident sequence slots'
         write(output_unit, '(a)') '  -b, --batch-size N           logical prompt batch limit'
         write(output_unit, '(a)') '  -ub, --ubatch-size N         physical prompt microbatch limit'
         write(output_unit, '(a)') '  --flash-attn MODE / -fa      attention mode'
         write(output_unit, '(a)') '  --tensor-split A,B / -ts     two-GPU tensor fractions'
-        write(output_unit, '(a)') '  --split-mode MODE            layer or row split policy'
-        write(output_unit, '(a)') '  --model-draft PATH           speculative draft/MTP model'
+        write(output_unit, '(a)') '  --split-mode MODE / -sm      none, layer, row, or tensor policy'
+        write(output_unit, '(a)') '  --model-draft PATH / -md     speculative draft/MTP model'
         write(output_unit, '(a)') '  --spec-type TYPE             speculative mode (draft-mtp)'
         write(output_unit, '(a)') '  --spec-draft-n-max N         maximum speculative draft tokens'
         write(output_unit, '(a)') '  --cache-type-k TYPE          K cache type'

@@ -11,13 +11,14 @@ compatible `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
 `fo build` builds the CPU diagnostic binary. Set `FORTAI_SERVER_BIN` only when
 selecting an already-built FortAI binary explicitly.
 
-The native CLI accepts the production llama.cpp profile controls (`--alias`,
-`--parallel`/`-np`, `--tensor-split`/`-ts`, `--model-draft`, `--spec-type`,
-`--flash-attn`/`-fa`, `--fit`/`-fit`,
+The native CLI accepts the production llama.cpp profile controls (`--alias`/
+`-a`, `--parallel`/`-np`, `--tensor-split`/`-ts`, `--model-draft`/`-md`,
+`--spec-type`, `--flash-attn`/`-fa`, `--fit`/`-fit`,
 K/V cache types, batch/ubatch, cache budget/reuse, sampler defaults, reasoning
 budget, mmproj path/offload, and `--no-webui`) and mirrors their
-`LLAMACPP_*` environment variables into `FORTAI_*`. `/health` reports the
-effective values. Main Qwen K/V caches support `f16`, `f32`, and `q8_0`; native
+`LLAMA_ARG_*` and legacy `LLAMACPP_*` environment variables into `FORTAI_*`.
+`/health` reports the effective values. Main Qwen K/V caches support `f16`,
+`f32`, and `q8_0`; native
 CUDA keeps q8_0 K/V resident with mixed f16/q8_0 combinations, while the
 host-controlled/MTP path uses the same quantization layout on the host. The
 native MTP path uses the embedded NextN head and its two-token greedy
@@ -51,4 +52,6 @@ default when flash attention is enabled. Set
 The bridge uses an explicit device fence for cross-stream hand-off on hosts
 without CUDA peer access. `FORTAI_TENSOR_SPLIT=a,b` (also accepted as
 `--tensor-split a,b`/`-ts a,b`) controls native Q4 byte placement across the two GPUs;
-fractions are normalized and invalid values fail initialization.
+fractions are normalized and invalid values fail initialization. `split-mode
+none` keeps native tensors on `main-gpu`; `layer`, `row`, and `tensor` select
+the native two-device Q4 placement policy.

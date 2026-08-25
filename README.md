@@ -141,8 +141,13 @@ The model runner accepts a GGUF file, an initial Qwen tokenizer ID, a decode
 step count, and a context limit. The persistent model fetch manifest is in
 `.provenance/models.tsv`.
 
-The resident llama.cpp adapter honors the corresponding `FORTAI_*`,
-`LLAMA_ARG_*`, and local service `LLAMACPP_*` settings for flash attention,
+The native server honors the same canonical `LLAMA_ARG_*` environment names as
+`llama-server` (and also accepts the corresponding `FORTAI_*` and legacy
+`LLAMACPP_*` names).  The launcher normalizes those settings before model
+initialization, including split mode, tensor fractions, draft/MTP cache types,
+reasoning controls, and server/UI switches.  The resident llama.cpp adapter
+honors the corresponding `FORTAI_*`, `LLAMA_ARG_*`, and local service
+`LLAMACPP_*` settings for flash attention,
 batch/ubatch sizes, parallel sequence count, K/V cache types, KQV and generic
 operation offload, SWA/KV-unified mode, thread-batch count, and multi-GPU
 tensor splitting. The CUDA runner reports `vram_*_bytes` before and after
@@ -200,9 +205,11 @@ For native split-Q4 placement, `FORTAI_TENSOR_SPLIT=a,b` (or
 `--tensor-split a,b`/`-ts a,b`) supplies normalized non-negative fractions for
 the two visible GPUs; omitted values retain equal-byte balancing, and malformed
 values fail model initialization instead of being ignored. The native server
-also accepts llama.cpp's `-np`, `-fa`, and `-fit` short forms, so the same
-production command line can be used on a separate FortAI port while llama.cpp
-remains resident.
+also accepts llama.cpp's `-np`, `-fa`, `-fit`, `-sm`, `-mg`, `-md`, `-ctk`,
+`-ctv`, and `-cram` short forms, so the same production command line can be
+used on a separate FortAI port while llama.cpp remains resident. `split-mode
+none` keeps all native tensors on `main-gpu`; `layer`, `row`, and `tensor` use
+the native two-device Q4 placement policy.
 Main native K/V caches support `f32`, `f16`, and `q8_0`; q8_0 storage is
 quantized with llama-compatible FP16 scales and is validated against the
 independent CUDA/CPU trace oracle. With native CUDA selected, q8_0 K/V stays

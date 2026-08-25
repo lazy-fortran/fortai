@@ -622,6 +622,7 @@ contains
         qwen35_cuda_second_requested = .false.
         second_device = device + 1
         if (.not. allocated(self%file%tensors)) return
+        if (cuda_split_mode_none()) return
         have_q4 = .false.
         do i = 1, size(self%file%tensors)
             if (is_q4_xl_type(self%file%tensors(i)%value_type)) then
@@ -682,6 +683,8 @@ contains
         integer :: tensor_split_length, tensor_split_status
 
         call stat%clear()
+        call validate_cuda_split_mode(stat)
+        if (.not. stat%is_ok()) return
         self%cuda_q4_group_enabled = .true.
         group_env = ''
         call get_environment_variable('FORTAI_CUDA_Q4_GROUP', group_env, length=group_length)
@@ -787,6 +790,7 @@ contains
         if (have_q4) then
             self%cuda_q4_resident = .true.
             q4_split = .true.
+            if (cuda_split_mode_none()) q4_split = .false.
             tensor_split_custom = .false.
             tensor_split_fraction = 0.5_real64
             resident_env = ''
@@ -1006,6 +1010,43 @@ contains
         call setup_cuda_device_pipeline(self, cleanup_stat)
         if (.not. cleanup_stat%is_ok()) call cleanup_stat%clear()
     end subroutine qwen35_cpu_enable_cuda
+
+    logical function cuda_split_mode_none()
+        character(len=32) :: value
+        integer :: length
+
+        cuda_split_mode_none = .false.
+        value = ''
+        call get_environment_variable('FORTAI_SPLIT_MODE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_SPLIT_MODE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_SPLIT_MODE', value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) return
+        cuda_split_mode_none = trim(value(:length)) == 'none'
+    end function cuda_split_mode_none
+
+    subroutine validate_cuda_split_mode(stat)
+        type(status_t), intent(out) :: stat
+        character(len=32) :: value
+        integer :: length
+
+        call stat%clear()
+        value = ''
+        call get_environment_variable('FORTAI_SPLIT_MODE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_SPLIT_MODE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_SPLIT_MODE', value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) then
+            call stat%set(FORTAI_INVALID, 'CUDA split mode is too long')
+            return
+        end if
+        select case (trim(value(:length)))
+        case ('none', 'layer', 'row', 'tensor')
+            continue
+        case default
+            call stat%set(FORTAI_INVALID, 'CUDA split mode must be none, layer, row, or tensor')
+        end select
+    end subroutine validate_cuda_split_mode
 
     subroutine setup_cuda_device_pipeline(self, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
