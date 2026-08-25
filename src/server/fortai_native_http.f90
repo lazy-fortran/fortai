@@ -32,6 +32,7 @@ module fortai_native_http
     end type tool_call_t
 
     public :: fortai_native_http_handle
+    public :: fortai_native_http_json_integer_checked
 
 contains
 
@@ -457,14 +458,14 @@ contains
         json_integer = max(0, sign * value)
     end function json_integer
 
-    integer function json_integer_checked(text, key, fallback, valid, minimum)
+    integer function fortai_native_http_json_integer_checked(text, key, fallback, valid, minimum)
         character(len=*), intent(in) :: text, key
         integer, intent(in) :: fallback
         logical, intent(out), optional :: valid
         integer, intent(in), optional :: minimum
         integer :: position, last, value, minimum_value, sign
 
-        json_integer_checked = fallback
+        fortai_native_http_json_integer_checked = fallback
         if (present(valid)) valid = .true.
         minimum_value = 0
         if (present(minimum)) minimum_value = minimum
@@ -507,8 +508,12 @@ contains
                 return
             end if
         end if
-        json_integer_checked = value
-    end function json_integer_checked
+        ! Preserve the parsed sign.  In particular, llama.cpp uses
+        ! repeat_last_n=-1 to mean "use the complete available history";
+        ! returning the unsigned magnitude silently changed that to a one
+        ! token window.
+        fortai_native_http_json_integer_checked = sign * value
+    end function fortai_native_http_json_integer_checked
 
     integer function json_token_limit(text, responses, valid)
         character(len=*), intent(in) :: text
@@ -520,16 +525,16 @@ contains
         valid = .true.
         if (responses) then
             if (json_key(text, 'max_output_tokens', 1) > 0) then
-                value = json_integer_checked(text, 'max_output_tokens', -1, valid)
+                value = fortai_native_http_json_integer_checked(text, 'max_output_tokens', -1, valid)
             else if (json_key(text, 'max_completion_tokens', 1) > 0) then
-                value = json_integer_checked(text, 'max_completion_tokens', -1, valid)
+                value = fortai_native_http_json_integer_checked(text, 'max_completion_tokens', -1, valid)
             else if (json_key(text, 'max_tokens', 1) > 0) then
-                value = json_integer_checked(text, 'max_tokens', -1, valid)
+                value = fortai_native_http_json_integer_checked(text, 'max_tokens', -1, valid)
             end if
         else if (json_key(text, 'max_tokens', 1) > 0) then
-            value = json_integer_checked(text, 'max_tokens', -1, valid)
+            value = fortai_native_http_json_integer_checked(text, 'max_tokens', -1, valid)
         else if (json_key(text, 'max_completion_tokens', 1) > 0) then
-            value = json_integer_checked(text, 'max_completion_tokens', -1, valid)
+            value = fortai_native_http_json_integer_checked(text, 'max_completion_tokens', -1, valid)
         end if
         if (.not. valid) then
             json_token_limit = 0
@@ -2358,8 +2363,9 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         seed = json_int64(body%as_character(), 'seed', server_int64_default('FORTAI_SEED', 0_int64))
-        top_k = json_integer_checked(body%as_character(), 'top_k', server_integer_default('FORTAI_TOP_K', 20), top_k_valid)
-        repeat_last_n = json_integer_checked(body%as_character(), 'repeat_last_n', &
+        top_k = fortai_native_http_json_integer_checked(body%as_character(), 'top_k', &
+            server_integer_default('FORTAI_TOP_K', 20), top_k_valid)
+        repeat_last_n = fortai_native_http_json_integer_checked(body%as_character(), 'repeat_last_n', &
             server_integer_default('FORTAI_REPEAT_LAST_N', 64), repeat_last_n_valid, -1)
         top_p = json_real(body%as_character(), 'top_p', server_real_default('FORTAI_TOP_P', 0.95_real32), top_p_valid)
         min_p = json_real(body%as_character(), 'min_p', server_real_default('FORTAI_MIN_P', 0.0_real32), min_p_valid)

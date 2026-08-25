@@ -14,6 +14,7 @@ program test_fortai_smoke
     use fortai_qwen35_gdn, only: gdn_reference_step
     use fortai_qwen35_mtp, only: qwen35_mtp_available
     use fortai_qwen35_vision, only: qwen35_vision_available
+    use fortai_native_http, only: fortai_native_http_json_integer_checked
     use fortai_sampler, only: sampler_t
     use fortai_speculative, only: speculative_t
     use fortai_status, only: status_t
@@ -64,6 +65,7 @@ program test_fortai_smoke
     call test_cpu_matvec(failures)
     call test_tokenizer(failures)
     call test_sampler(failures)
+    call test_http_integer_parser(failures)
     call test_speculative(failures)
     call test_ir_contracts(failures)
     call test_device_and_arena(failures)
@@ -77,6 +79,21 @@ program test_fortai_smoke
     print '(a)', 'FortAI smoke tests passed'
 
 contains
+
+    subroutine test_http_integer_parser(failures)
+        integer, intent(inout) :: failures
+        logical :: valid
+        integer :: value
+
+        value = fortai_native_http_json_integer_checked( &
+            '{"repeat_last_n":-1}', 'repeat_last_n', 64, valid, -1)
+        call require(valid .and. value == -1, &
+            'HTTP repeat_last_n=-1 preserves the full-history sentinel', failures)
+        value = fortai_native_http_json_integer_checked( &
+            '{"top_k":-1}', 'top_k', 20, valid)
+        call require((.not. valid) .and. value == 20, &
+            'HTTP top_k rejects negative values', failures)
+    end subroutine test_http_integer_parser
 
     subroutine require(condition, message, failures)
         logical, intent(in) :: condition
