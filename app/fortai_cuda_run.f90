@@ -12,7 +12,8 @@ program fortai_cuda_run
     character(len=512) :: model_path, argument
     integer(int64) :: token, steps, context, position, next_token
     integer(int64) :: first_position, last_position
-    integer :: clock_start, clock_end, clock_rate, max_index, ios, device, trace_length
+    integer :: clock_start, clock_end, clock_rate, max_index, ios, device, second_device, trace_length
+    integer :: second_device_length, second_device_ios
     integer :: disable_cuda_length
     integer :: sample_start, sample_end, top_count, trace_top_length, trace_top_ios, rank, top_index
     integer :: spec_count, emitted
@@ -23,11 +24,15 @@ program fortai_cuda_run
     logical :: trace_enabled, disable_cuda, exclude_prompt
     character(len=8) :: disable_cuda_env
     character(len=16) :: exclude_prompt_text
+    character(len=16) :: second_device_text
     integer :: exclude_prompt_length
     integer(int64) :: speculative_tokens(32)
     integer(c_size_t) :: vram_free_before, vram_total_before
     integer(c_size_t) :: vram_free_after, vram_total_after
+    integer(c_size_t) :: vram_second_free_before, vram_second_total_before
+    integer(c_size_t) :: vram_second_free_after, vram_second_total_after
     logical :: vram_before_ok, vram_after_ok
+    logical :: vram_second_before_ok, vram_second_after_ok
     real(real32) :: maximum_logit
 
     call get_command_argument(1, model_path)
@@ -48,8 +53,19 @@ program fortai_cuda_run
     call get_command_argument(5, argument)
     if (len_trim(argument) > 0) read (argument, *, iostat=ios) device
     if (steps <= 0_int64 .or. context <= 0_int64 .or. device < 0) error stop 2
+    second_device = device + 1
+    second_device_text = ''
+    call get_environment_variable('FORTAI_CUDA_Q4_SECOND_DEVICE', second_device_text, &
+        length=second_device_length)
+    if (second_device_length > 0) then
+        read (second_device_text(:min(second_device_length, len(second_device_text))), *, &
+            iostat=second_device_ios) second_device
+        if (second_device_ios /= 0 .or. second_device < 0) second_device = device + 1
+    end if
     call cuda_memory_info(device, vram_free_before, vram_total_before, stat)
     vram_before_ok = stat%is_ok()
+    call cuda_memory_info(second_device, vram_second_free_before, vram_second_total_before, stat)
+    vram_second_before_ok = stat%is_ok()
     call get_environment_variable('FORTAI_TRACE_TOKENS', trace_tokens, length=trace_length)
     trace_enabled = .false.
     if (trace_length > 0) trace_enabled = trace_tokens(1:trace_length) == '1'
@@ -80,6 +96,8 @@ program fortai_cuda_run
     end if
     call cuda_memory_info(device, vram_free_after, vram_total_after, stat)
     vram_after_ok = stat%is_ok()
+    call cuda_memory_info(second_device, vram_second_free_after, vram_second_total_after, stat)
+    vram_second_after_ok = stat%is_ok()
     call system_clock(load_end)
     allocate (logits(model%vocabulary_size))
     if (top_count > 0) allocate (ranked_logits(model%vocabulary_size))
@@ -206,6 +224,18 @@ program fortai_cuda_run
         print '(a,i0)', 'vram_free_after_bytes=', vram_free_after
         if (vram_before_ok .and. vram_free_before >= vram_free_after) then
             print '(a,i0)', 'vram_delta_bytes=', vram_free_before - vram_free_after
+        end if
+    end if
+    if (vram_second_before_ok) then
+        print '(a,i0)', 'vram_second_device=', second_device
+        print '(a,i0)', 'vram_second_total_before_bytes=', vram_second_total_before
+        print '(a,i0)', 'vram_second_free_before_bytes=', vram_second_free_before
+    end if
+    if (vram_second_after_ok) then
+        print '(a,i0)', 'vram_second_total_after_bytes=', vram_second_total_after
+        print '(a,i0)', 'vram_second_free_after_bytes=', vram_second_free_after
+        if (vram_second_before_ok .and. vram_second_free_before >= vram_second_free_after) then
+            print '(a,i0)', 'vram_second_delta_bytes=', vram_second_free_before - vram_second_free_after
         end if
     end if
     call model%close()
