@@ -159,9 +159,14 @@ server never launches `llama-server` and reports `X-FortAI-Backend: fortai`.
 The native server owns Qwen chat formatting and decoding.  It supports
 `temperature`/`seed`, `stream`, and Qwen thinking controls (`enable_thinking`,
 `reasoning_format`) while exposing reasoning as `reasoning_content`; stop
-tokens are removed from the generated message. Responses requests accept
-string or message-array `input`, `instructions`, `reasoning.effort`, and
-streaming SSE events. Split two-GPU Q4_K_XL models
+tokens are removed from the generated message. `chat_template_kwargs.enable_thinking`
+and Responses `reasoning.effort` use the same Qwen3.5 prompt switch, including
+the exact empty `<think>` block for hard no-thinking mode. Chat and Responses
+requests also accept OpenAI `tools`; the native formatter emits Qwen3.5's
+`<tool_call><function=...>` protocol and returns structured function-call
+items (including streaming argument deltas). Responses requests accept string
+or message-array `input`, `instructions`, `reasoning.effort`, and streaming
+SSE events. Split two-GPU Q4_K_XL models
 use the deterministic host-boundary CUDA route by default; the resident
 all-device bridge remains an explicit `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1`
 diagnostic opt-in until its model-level determinism gate is closed.  Multimodal

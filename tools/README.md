@@ -11,6 +11,12 @@ compatible `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
 `fo build` builds the CPU diagnostic binary. Set `FORTAI_SERVER_BIN` only when
 selecting an already-built FortAI binary explicitly.
 
+The chat and Responses endpoints share the Qwen3.5 template: `enable_thinking`,
+`chat_template_kwargs.enable_thinking`, and `reasoning.effort` select the hard
+thinking/no-thinking prompt form. OpenAI `tools` are formatted natively and
+Qwen3.5 XML tool calls are returned as structured function-call objects and
+streaming argument events.
+
 Split two-GPU Q4_K_XL serving uses the deterministic host-boundary CUDA path by
 default. `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1` enables the resident
 all-device bridge for diagnostics; it is not yet the production default because

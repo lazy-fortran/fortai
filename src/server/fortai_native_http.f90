@@ -18,7 +18,13 @@ module fortai_native_http
         type(string_t) :: role
         type(string_t) :: content
         type(string_t) :: reasoning_content
+        type(string_t) :: tool_calls
     end type message_t
+
+    type :: tool_call_t
+        type(string_t) :: name
+        type(string_t) :: arguments
+    end type tool_call_t
 
     public :: fortai_native_http_handle
 
@@ -234,7 +240,9 @@ contains
         integer, intent(in) :: first
         type(string_t), intent(out) :: output
         integer, intent(out) :: after
-        integer :: limit, value
+        integer :: limit, value, position
+        logical :: found
+        type(string_t) :: parsed
 
         call output%clear()
         after = 0
@@ -263,17 +271,81 @@ contains
             json_content = .false.
             return
         end if
-        value = json_key(text, 'text', first, limit)
-        if (value == 0) then
-            json_content = .false.
-            return
-        end if
-        if (text(value:value) /= '"') then
-            json_content = .false.
-            return
-        end if
-        json_content = json_string(text, value, output, after)
+        call output%clear()
+        found = .false.
+        position = first + 1
+        do
+            value = json_key(text, 'text', position, limit)
+            if (value == 0) exit
+            if (value > limit) exit
+            if (text(value:value) /= '"') then
+                json_content = .false.
+                return
+            end if
+            if (.not. json_string(text, value, parsed, after)) then
+                json_content = .false.
+                return
+            end if
+            call output%append_string(parsed)
+            found = .true.
+            position = after
+            if (position > limit) exit
+        end do
+        json_content = found
     end function json_content
+
+    logical function json_raw_value(text, first, output, after)
+        character(len=*), intent(in) :: text
+        integer, intent(in) :: first
+        type(string_t), intent(out) :: output
+        integer, intent(out) :: after
+        integer :: limit, value_end
+        type(string_t) :: ignored
+
+        call output%clear()
+        after = 0
+        json_raw_value = .false.
+        if (first < 1 .or. first > len(text)) return
+        select case (text(first:first))
+        case ('"')
+            if (.not. json_string(text, first, ignored, after)) return
+            call output%set(text(first:after - 1))
+        case ('[', '{')
+            limit = matching_delimiter(text, first, text(first:first), merge(']', '}', text(first:first) == '['))
+            if (limit == 0) return
+            call output%set(text(first:limit))
+            after = limit + 1
+        case default
+            value_end = first
+            do while (value_end <= len(text))
+                select case (text(value_end:value_end))
+                case (',', '}', ']', ' ', char(9), char(10), char(13))
+                    exit
+                case default
+                    value_end = value_end + 1
+                end select
+            end do
+            if (value_end <= first) return
+            call output%set(text(first:value_end - 1))
+            after = value_end
+        end select
+        json_raw_value = output%length() > 0
+    end function json_raw_value
+
+    logical function json_array_value(text, key, output)
+        character(len=*), intent(in) :: text, key
+        type(string_t), intent(out) :: output
+        integer :: position, after
+
+        call output%clear()
+        json_array_value = .false.
+        position = json_key(text, key, 1)
+        if (position == 0) return
+        if (position > len(text)) return
+        if (text(position:position) /= '[') return
+        if (.not. json_raw_value(text, position, output, after)) return
+        json_array_value = output%length() > 1
+    end function json_array_value
 
     integer function json_integer(text, key, fallback)
         character(len=*), intent(in) :: text, key
@@ -440,7 +512,8 @@ contains
         character(len=*), intent(in) :: text, array_key
         type(message_t), allocatable, intent(out) :: messages(:)
         integer, intent(out) :: count
-        integer :: position, limit, object_end, role_value, content_value, reasoning_value, after
+        integer :: position, limit, object_end, role_value, content_value, reasoning_value, tool_calls_value, after
+        character(len=:), allocatable :: tool_calls_text
         type(message_t), allocatable :: grown(:)
         type(message_t) :: message
 
@@ -466,8 +539,9 @@ contains
             role_value = json_key(text, 'role', position, object_end)
             content_value = json_key(text, 'content', position, object_end)
             reasoning_value = json_key(text, 'reasoning_content', position, object_end)
+            tool_calls_value = json_key(text, 'tool_calls', position, object_end)
             if (role_value == 0) return
-            if (content_value == 0 .and. reasoning_value == 0) return
+            if (content_value == 0 .and. reasoning_value == 0 .and. tool_calls_value == 0) return
             if (.not. json_string(text, role_value, message%role, after)) return
             call message%content%clear()
             if (content_value > 0) then
@@ -476,6 +550,14 @@ contains
             call message%reasoning_content%clear()
             if (reasoning_value > 0) then
                 if (.not. json_string(text, reasoning_value, message%reasoning_content, after)) return
+            end if
+            call message%tool_calls%clear()
+            if (tool_calls_value > 0) then
+                if (.not. json_raw_value(text, tool_calls_value, message%tool_calls, after)) return
+                tool_calls_text = message%tool_calls%as_character()
+                if (len(tool_calls_text) > 0) then
+                    if (tool_calls_text(1:1) /= '[') return
+                end if
             end if
             allocate(grown(count + 1))
             if (count > 0) grown(:count) = messages
@@ -499,7 +581,12 @@ contains
         character(len=*), intent(in) :: text
         type(message_t), allocatable, intent(out) :: messages(:)
         integer, intent(out) :: count
+        integer :: i
         parse_messages = parse_message_array(text, 'messages', messages, count)
+        if (.not. parse_messages) return
+        do i = 1, count
+            if (messages(i)%role%as_character() == 'developer') call messages(i)%role%set('system')
+        end do
     end function parse_messages
 
     logical function parse_response_messages(text, messages, count)
@@ -524,6 +611,7 @@ contains
             call input_messages(1)%role%set('user')
             if (.not. json_string(text, position, input_messages(1)%content, after)) return
             call input_messages(1)%reasoning_content%clear()
+            call input_messages(1)%tool_calls%clear()
             input_count = 1
         else
             return
@@ -535,6 +623,7 @@ contains
             call instruction%role%set('system')
             call instruction%content%set(instructions)
             call instruction%reasoning_content%clear()
+            call instruction%tool_calls%clear()
             grown(1) = instruction
             if (input_count > 0) grown(2:) = input_messages(:input_count)
             call move_alloc(grown, messages)
@@ -552,60 +641,125 @@ contains
         parse_response_messages = count > 0
     end function parse_response_messages
 
-    function format_chat(messages, count, enable_thinking) result(prompt)
+    function format_chat(messages, count, enable_thinking, tools_json) result(prompt)
         type(message_t), intent(in) :: messages(:)
         integer, intent(in) :: count
         logical, intent(in) :: enable_thinking
+        type(string_t), intent(in) :: tools_json
         type(string_t) :: prompt
-        integer :: i, last_user_index
+        integer :: i, start_index, last_user_index
         character(len=:), allocatable :: role, reasoning, raw_content
         type(string_t) :: content, parsed_reasoning
+        logical :: tool_group_open
+
         call prompt%clear()
         last_user_index = 0
         do i = 1, count
-            if (messages(i)%role%as_character() == 'user') last_user_index = i
+            if (messages(i)%role%as_character() == 'user') then
+                raw_content = messages(i)%content%as_character()
+                if (.not. is_tool_response(raw_content)) last_user_index = i
+            end if
         end do
-        do i = 1, count
+
+        start_index = 1
+        if (has_tool_entries(tools_json)) then
+            if (count > 0) then
+                if (messages(1)%role%as_character() == 'system') then
+                    call append_tool_system(prompt, tools_json, messages(1)%content, .true.)
+                    start_index = 2
+                else
+                    call content%clear()
+                    call append_tool_system(prompt, tools_json, content, .false.)
+                end if
+            else
+                call content%clear()
+                call append_tool_system(prompt, tools_json, content, .false.)
+            end if
+        else if (count > 0) then
+            if (messages(1)%role%as_character() == 'system') then
+                call prompt%append('<|im_start|>system')
+                call prompt%append(char(10))
+                call prompt%append_string(messages(1)%content)
+                call prompt%append('<|im_end|>')
+                call prompt%append(char(10))
+                start_index = 2
+            end if
+        end if
+
+        tool_group_open = .false.
+        do i = start_index, count
+            role = messages(i)%role%as_character()
+            if (role == 'system') cycle
+            if (role == 'tool') then
+                if (.not. tool_group_open) then
+                    call prompt%append('<|im_start|>user')
+                    tool_group_open = .true.
+                end if
+                call prompt%append(char(10))
+                call prompt%append('<tool_response>')
+                call prompt%append(char(10))
+                call prompt%append_string(messages(i)%content)
+                call prompt%append(char(10))
+                call prompt%append('</tool_response>')
+                if (i == count) then
+                    call prompt%append('<|im_end|>')
+                    call prompt%append(char(10))
+                    tool_group_open = .false.
+                else
+                    role = messages(i + 1)%role%as_character()
+                    if (role /= 'tool') then
+                        call prompt%append('<|im_end|>')
+                        call prompt%append(char(10))
+                        tool_group_open = .false.
+                    end if
+                end if
+                cycle
+            end if
+
             call prompt%append('<|im_start|>')
             call prompt%append_string(messages(i)%role)
             call prompt%append(char(10))
-            role = messages(i)%role%as_character()
-            reasoning = messages(i)%reasoning_content%as_character()
             content = messages(i)%content
             raw_content = content%as_character()
-            ! Qwen's template closes every historical assistant thinking block,
-            ! even when it is empty.  If a client sent the legacy inline form,
-            ! recover its two fields before rebuilding the canonical block.
+            reasoning = messages(i)%reasoning_content%as_character()
             if (role == 'assistant') then
-                if (len(reasoning) == 0 .and. index(raw_content, '</think>') > 0) then
-                    call split_reasoning(raw_content, .true., 'auto', content, parsed_reasoning)
-                    reasoning = parsed_reasoning%as_character()
+                ! Recover the structured fields when a client sends the
+                ! canonical inline Qwen block instead of reasoning_content.
+                if (len(reasoning) == 0) then
+                    if (index(raw_content, '</think>') > 0) then
+                        call split_reasoning(raw_content, .true., 'auto', content, parsed_reasoning)
+                        reasoning = parsed_reasoning%as_character()
+                    end if
                 end if
-                ! Qwen3.5 only preserves a hidden reasoning block for an
-                ! assistant continuation after the last user turn.  Earlier
-                ! assistant turns contribute visible content, while their
-                ! reasoning is intentionally omitted from the next prompt.
+                ! Qwen3.5 keeps reasoning only for assistant turns after the
+                ! latest real user query (including multi-step tool turns).
                 if (i > last_user_index) then
                     call prompt%append('<think>')
                     call prompt%append(char(10))
-                    call prompt%append(reasoning)
+                    call append_trimmed_text(prompt, reasoning)
                     call prompt%append(char(10))
                     call prompt%append('</think>')
                     call prompt%append(char(10))
                     call prompt%append(char(10))
+                    call prompt%append_string(content)
+                else
+                    call prompt%append_string(content)
                 end if
+                if (messages(i)%tool_calls%length() > 0) then
+                    call append_assistant_tool_calls(prompt, messages(i)%tool_calls, content%length() > 0)
+                end if
+            else
+                call prompt%append_string(content)
             end if
-            ! Emit the normalized content so legacy inline think markers do not
-            ! get fed back into the model as ordinary assistant text.
-            call prompt%append_string(content)
             call prompt%append('<|im_end|>')
             call prompt%append(char(10))
         end do
+        if (tool_group_open) then
+            call prompt%append('<|im_end|>')
+            call prompt%append(char(10))
+        end if
         call prompt%append('<|im_start|>assistant')
         call prompt%append(char(10))
-        ! Qwen3's template keeps the thinking block open for generation and
-        ! closes it in the prompt when thinking is disabled.  This is the
-        ! exact distinction consumed by llama.cpp's Qwen chat template.
         if (enable_thinking) then
             call prompt%append('<think>')
             call prompt%append(char(10))
@@ -618,6 +772,561 @@ contains
             call prompt%append(char(10))
         end if
     end function format_chat
+
+    logical function is_tool_response(text)
+        character(len=*), intent(in) :: text
+        character(len=*), parameter :: opening = '<tool_response>'
+        character(len=*), parameter :: closing = '</tool_response>'
+        integer :: first, last
+
+        is_tool_response = .false.
+        call trim_bounds(text, first, last)
+        if (first > last) return
+        if (last - first + 1 < len(opening) + len(closing)) return
+        if (text(first:first + len(opening) - 1) /= opening) return
+        if (text(last - len(closing) + 1:last) /= closing) return
+        is_tool_response = .true.
+    end function is_tool_response
+
+    logical function has_tool_entries(value)
+        type(string_t), intent(in) :: value
+        character(len=:), allocatable :: text
+
+        text = value%as_character()
+        has_tool_entries = .false.
+        if (len(text) < 3) return
+        if (text(1:1) /= '[' .or. text(len(text):len(text)) /= ']') return
+        has_tool_entries = index(text, '{') > 0
+    end function has_tool_entries
+
+    subroutine trim_bounds(text, first, last)
+        character(len=*), intent(in) :: text
+        integer, intent(out) :: first, last
+
+        first = 1
+        last = len(text)
+        do while (first <= last)
+            if (iachar(text(first:first)) > 32) exit
+            first = first + 1
+        end do
+        do while (last >= first)
+            if (iachar(text(last:last)) > 32) exit
+            last = last - 1
+        end do
+    end subroutine trim_bounds
+
+    subroutine append_trimmed_text(output, text)
+        type(string_t), intent(inout) :: output
+        character(len=*), intent(in) :: text
+        integer :: first, last
+
+        call trim_bounds(text, first, last)
+        if (first <= last) call output%append(text(first:last))
+    end subroutine append_trimmed_text
+
+    subroutine append_tool_system(prompt, tools_json, system_content, has_system_content)
+        type(string_t), intent(inout) :: prompt
+        type(string_t), intent(in) :: tools_json, system_content
+        logical, intent(in) :: has_system_content
+
+        call prompt%append('<|im_start|>system')
+        call prompt%append(char(10))
+        call prompt%append('# Tools')
+        call prompt%append(char(10))
+        call prompt%append(char(10))
+        call prompt%append('You have access to the following functions:')
+        call prompt%append(char(10))
+        call prompt%append(char(10))
+        call prompt%append('<tools>')
+        call append_tool_array_entries(prompt, tools_json)
+        call prompt%append(char(10))
+        call prompt%append('</tools>')
+        call prompt%append(char(10))
+        call prompt%append(char(10))
+        call prompt%append('If you choose to call a function ONLY reply in the following format with NO suffix:')
+        call prompt%append(char(10))
+        call prompt%append(char(10))
+        call prompt%append('<tool_call>')
+        call prompt%append(char(10))
+        call prompt%append('<function=example_function_name>')
+        call prompt%append(char(10))
+        call prompt%append('<parameter=example_parameter_1>')
+        call prompt%append(char(10))
+        call prompt%append('value_1')
+        call prompt%append(char(10))
+        call prompt%append('</parameter>')
+        call prompt%append(char(10))
+        call prompt%append('<parameter=example_parameter_2>')
+        call prompt%append(char(10))
+        call prompt%append('This is the value for the second parameter')
+        call prompt%append(char(10))
+        call prompt%append('that can span')
+        call prompt%append(char(10))
+        call prompt%append('multiple lines')
+        call prompt%append(char(10))
+        call prompt%append('</parameter>')
+        call prompt%append(char(10))
+        call prompt%append('</function>')
+        call prompt%append(char(10))
+        call prompt%append('</tool_call>')
+        call prompt%append(char(10))
+        call prompt%append(char(10))
+        call prompt%append('<IMPORTANT>')
+        call prompt%append(char(10))
+        call prompt%append('Reminder:')
+        call prompt%append(char(10))
+        call prompt%append('- Function calls MUST follow the specified format: an inner <function=...>')
+        call prompt%append('</function> block must be nested within <tool_call></tool_call> XML tags')
+        call prompt%append(char(10))
+        call prompt%append('- Required parameters MUST be specified')
+        call prompt%append(char(10))
+        call prompt%append('- You may provide optional reasoning for your function call in natural language BEFORE')
+        call prompt%append(' the function call, but NOT after')
+        call prompt%append(char(10))
+        call prompt%append('- If there is no function call available, answer the question like normal with')
+        call prompt%append(' your current knowledge and do not tell the user about function calls')
+        call prompt%append(char(10))
+        call prompt%append('</IMPORTANT>')
+        if (has_system_content) then
+            call prompt%append(char(10))
+            call prompt%append(char(10))
+            call append_trimmed_text(prompt, system_content%as_character())
+        end if
+        call prompt%append('<|im_end|>')
+        call prompt%append(char(10))
+    end subroutine append_tool_system
+
+    subroutine append_tool_array_entries(prompt, tools_json)
+        type(string_t), intent(inout) :: prompt
+        type(string_t), intent(in) :: tools_json
+        character(len=:), allocatable :: text
+        type(string_t) :: item
+        integer :: position, limit, after
+
+        text = tools_json%as_character()
+        if (len(text) < 2) return
+        position = 2
+        limit = len(text) - 1
+        do
+            position = skip_space(text, position)
+            if (position > limit) exit
+            if (text(position:position) == ']') exit
+            if (text(position:position) /= '{') return
+            if (.not. json_raw_value(text, position, item, after)) return
+            call prompt%append(char(10))
+            call prompt%append_string(item)
+            position = skip_space(text, after)
+            if (position > limit) exit
+            if (text(position:position) == ',') then
+                position = position + 1
+            else if (text(position:position) == ']') then
+                exit
+            else
+                return
+            end if
+        end do
+    end subroutine append_tool_array_entries
+
+    subroutine append_assistant_tool_calls(prompt, raw_calls, has_content)
+        type(string_t), intent(inout) :: prompt
+        type(string_t), intent(in) :: raw_calls
+        logical, intent(in) :: has_content
+        character(len=:), allocatable :: text, object_text, function_text
+        character(len=:), allocatable :: name
+        type(string_t) :: item, arguments
+        integer :: position, limit, after, object_end, function_value, function_end, name_value
+        integer :: call_index
+        logical :: first_call
+
+        text = raw_calls%as_character()
+        if (len(text) < 2) return
+        if (text(1:1) /= '[') return
+        limit = matching_delimiter(text, 1, '[', ']')
+        if (limit == 0) return
+        position = 2
+        call_index = 0
+        first_call = .true.
+        do
+            position = skip_space(text, position)
+            if (position >= limit) exit
+            if (text(position:position) /= '{') return
+            object_end = matching_delimiter(text, position, '{', '}')
+            if (object_end == 0 .or. object_end > limit) return
+            object_text = text(position:object_end)
+            function_value = json_key(object_text, 'function', 1)
+            if (function_value > 0) then
+                if (function_value > len(object_text)) return
+                if (object_text(function_value:function_value) /= '{') return
+                function_end = matching_delimiter(object_text, function_value, '{', '}')
+                if (function_end == 0) return
+                function_text = object_text(function_value:function_end)
+            else
+                function_text = object_text
+            end if
+            name_value = json_key(function_text, 'name', 1)
+            if (name_value == 0) return
+            name = json_string_value(function_text, 'name', '')
+            if (len(name) == 0) return
+            call arguments%clear()
+            name_value = json_key(function_text, 'arguments', 1)
+            if (name_value > 0) then
+                if (.not. json_raw_value(function_text, name_value, arguments, after)) return
+            end if
+            call_index = call_index + 1
+            if (first_call) then
+                if (has_content) then
+                    call prompt%append(char(10))
+                    call prompt%append(char(10))
+                end if
+                first_call = .false.
+            else
+                call prompt%append(char(10))
+            end if
+            call prompt%append('<tool_call>')
+            call prompt%append(char(10))
+            call prompt%append('<function=')
+            call prompt%append(name)
+            call prompt%append('>')
+            call prompt%append(char(10))
+            call append_json_parameters(prompt, arguments)
+            call prompt%append('</function>')
+            call prompt%append(char(10))
+            call prompt%append('</tool_call>')
+            position = skip_space(text, object_end + 1)
+            if (position >= limit) exit
+            if (text(position:position) == ',') then
+                position = position + 1
+            else if (text(position:position) == ']') then
+                exit
+            else
+                return
+            end if
+        end do
+    end subroutine append_assistant_tool_calls
+
+    subroutine append_json_parameters(prompt, arguments)
+        type(string_t), intent(inout) :: prompt
+        type(string_t), intent(in) :: arguments
+        character(len=:), allocatable :: text, key, raw_value, value
+        type(string_t) :: parsed_key, parsed_value
+        integer :: position, limit, colon, after
+
+        text = arguments%as_character()
+        if (len(text) < 2) return
+        if (text(1:1) /= '{') return
+        limit = matching_delimiter(text, 1, '{', '}')
+        if (limit == 0) return
+        position = 2
+        do
+            position = skip_space(text, position)
+            if (position >= limit) exit
+            if (text(position:position) /= '"') return
+            if (.not. json_string(text, position, parsed_key, after)) return
+            key = parsed_key%as_character()
+            colon = skip_space(text, after)
+            if (colon > limit) return
+            if (text(colon:colon) /= ':') return
+            colon = skip_space(text, colon + 1)
+            if (.not. json_raw_value(text, colon, parsed_value, after)) return
+            raw_value = parsed_value%as_character()
+            call prompt%append('<parameter=')
+            call prompt%append(key)
+            call prompt%append('>')
+            call prompt%append(char(10))
+            if (len(raw_value) > 0) then
+                if (raw_value(1:1) == '"') then
+                    if (.not. json_string(raw_value, 1, parsed_value, after)) return
+                    value = parsed_value%as_character()
+                    call prompt%append(value)
+                else
+                    call prompt%append(raw_value)
+                end if
+            end if
+            call prompt%append(char(10))
+            call prompt%append('</parameter>')
+            call prompt%append(char(10))
+            position = skip_space(text, after)
+            if (position >= limit) exit
+            if (text(position:position) == ',') then
+                position = position + 1
+            else if (text(position:position) == '}') then
+                exit
+            else
+                return
+            end if
+        end do
+    end subroutine append_json_parameters
+
+    subroutine parse_tool_calls(raw, visible, calls, count)
+        character(len=*), intent(in) :: raw
+        type(string_t), intent(out) :: visible
+        type(tool_call_t), allocatable, intent(out) :: calls(:)
+        integer, intent(out) :: count
+        character(len=*), parameter :: opening = '<tool_call>'
+        character(len=*), parameter :: function_opening = '<function='
+        character(len=*), parameter :: closing = '</tool_call>'
+        character(len=*), parameter :: function_closing = '</function>'
+        character(len=:), allocatable :: segment
+        type(string_t) :: name, arguments
+        integer :: scan, copied, relative, function_relative, open_position, body_position, close_position
+        integer :: opening_length, closing_length
+        logical :: okay, function_style
+
+        call visible%clear()
+        allocate(calls(0))
+        count = 0
+        if (len(raw) == 0) return
+        scan = 1
+        copied = 1
+        do while (scan <= len(raw))
+            relative = index(raw(scan:), opening)
+            function_relative = index(raw(scan:), function_opening)
+            if (relative == 0) then
+                if (function_relative == 0) exit
+                function_style = .true.
+                relative = function_relative
+                opening_length = 0
+            else if (function_relative == 0) then
+                function_style = .false.
+                opening_length = len(opening)
+            else if (function_relative < relative) then
+                function_style = .true.
+                relative = function_relative
+                opening_length = 0
+            else
+                function_style = .false.
+                opening_length = len(opening)
+            end if
+            open_position = scan + relative - 1
+            body_position = open_position + opening_length
+            if (body_position > len(raw)) exit
+            relative = index(raw(body_position:), closing)
+            closing_length = len(closing)
+            if (relative == 0 .and. function_style) then
+                relative = index(raw(body_position:), function_closing)
+                closing_length = len(function_closing)
+            end if
+            if (relative == 0) exit
+            close_position = body_position + relative - 1
+            if (close_position > body_position) then
+                segment = raw(body_position:close_position - 1)
+            else
+                segment = ''
+            end if
+            call parse_tool_segment(segment, name, arguments, okay)
+            if (okay) then
+                if (open_position > copied) call visible%append(raw(copied:open_position - 1))
+                call append_tool_call(calls, count, name, arguments)
+                copied = close_position + closing_length
+                if (function_style) then
+                    if (copied + len(closing) - 1 <= len(raw)) then
+                        if (raw(copied:copied + len(closing) - 1) == closing) copied = copied + len(closing)
+                    end if
+                end if
+                scan = copied
+            else
+                scan = close_position + closing_length
+            end if
+        end do
+        if (copied <= len(raw)) call visible%append(raw(copied:))
+        if (count == 0) then
+            call visible%set(raw)
+        else
+            call trim_visible_boundaries(visible)
+        end if
+    end subroutine parse_tool_calls
+
+    subroutine parse_tool_segment(segment, name, arguments, okay)
+        character(len=*), intent(in) :: segment
+        type(string_t), intent(out) :: name, arguments
+        logical, intent(out) :: okay
+        character(len=:), allocatable :: function_name, raw_value
+        type(string_t) :: parsed_name, parsed_arguments
+        integer :: function_position, name_start, name_end, argument_position, after
+
+        call name%clear()
+        call arguments%set('{}')
+        okay = .false.
+        function_position = index(segment, '<function=')
+        if (function_position > 0) then
+            name_start = function_position + len('<function=')
+            if (name_start > len(segment)) return
+            name_end = index(segment(name_start:), '>')
+            if (name_end == 0) return
+            name_end = name_start + name_end - 2
+            if (name_end < name_start) return
+            function_name = segment(name_start:name_end)
+            call name%set(function_name)
+            if (name_end + 2 <= len(segment)) then
+                call parse_xml_parameters(segment(name_end + 2:), arguments)
+            end if
+            okay = name%length() > 0
+            return
+        end if
+
+        call trim_segment(segment, parsed_name)
+        raw_value = parsed_name%as_character()
+        if (len(raw_value) == 0) return
+        if (raw_value(1:1) /= '{') return
+        function_name = json_string_value(raw_value, 'name', '')
+        if (len(function_name) == 0) return
+        call name%set(function_name)
+        argument_position = json_key(raw_value, 'arguments', 1)
+        if (argument_position > 0) then
+            if (.not. json_raw_value(raw_value, argument_position, parsed_arguments, after)) return
+            call arguments%set(parsed_arguments%as_character())
+        end if
+        okay = .true.
+    end subroutine parse_tool_segment
+
+    subroutine parse_xml_parameters(text, arguments)
+        character(len=*), intent(in) :: text
+        type(string_t), intent(out) :: arguments
+        character(len=:), allocatable :: parameter_name, parameter_value
+        type(string_t) :: key, value
+        integer :: scan, relative, parameter_position, name_start, name_end
+        integer :: value_start, value_end, close_position, parameter_count
+
+        call arguments%set('{}')
+        scan = 1
+        parameter_count = 0
+        do while (scan <= len(text))
+            relative = index(text(scan:), '<parameter=')
+            if (relative == 0) exit
+            parameter_position = scan + relative - 1
+            name_start = parameter_position + len('<parameter=')
+            if (name_start > len(text)) exit
+            relative = index(text(name_start:), '>')
+            if (relative == 0) exit
+            name_end = name_start + relative - 2
+            if (name_end < name_start) exit
+            parameter_name = text(name_start:name_end)
+            value_start = name_end + 2
+            if (value_start > len(text)) exit
+            relative = index(text(value_start:), '</parameter>')
+            if (relative == 0) exit
+            close_position = value_start + relative - 1
+            value_end = close_position - 1
+            if (value_end >= value_start) then
+                parameter_value = text(value_start:value_end)
+            else
+                parameter_value = ''
+            end if
+            call key%set(parameter_name)
+            call value%set(parameter_value)
+            call append_json_parameter(arguments, parameter_count, key, value)
+            scan = close_position + len('</parameter>')
+        end do
+        if (parameter_count > 0) call arguments%append('}')
+    end subroutine parse_xml_parameters
+
+    subroutine append_json_parameter(arguments, parameter_count, key, value)
+        type(string_t), intent(inout) :: arguments
+        integer, intent(inout) :: parameter_count
+        type(string_t), intent(in) :: key, value
+        type(string_t) :: escaped_key
+
+        if (parameter_count == 0) then
+            call arguments%clear()
+            call arguments%append('{')
+        else
+            call arguments%append(',')
+        end if
+        escaped_key = json_escape(key)
+        call arguments%append_string(escaped_key)
+        call arguments%append(':')
+        call append_json_argument_value(arguments, value)
+        parameter_count = parameter_count + 1
+    end subroutine append_json_parameter
+
+    subroutine append_json_argument_value(output, value)
+        type(string_t), intent(inout) :: output
+        type(string_t), intent(in) :: value
+        character(len=:), allocatable :: text
+        type(string_t) :: trimmed
+        integer :: first, last, delimiter
+        logical :: raw_json
+
+        text = value%as_character()
+        call trim_bounds(text, first, last)
+        if (first > last) then
+            call output%append('""')
+            return
+        end if
+        call trimmed%set(text(first:last))
+        raw_json = .false.
+        if (text(first:first) == '{' .or. text(first:first) == '[') then
+            delimiter = matching_delimiter(text, first, text(first:first), &
+                merge(']', '}', text(first:first) == '['))
+            raw_json = delimiter == last
+        else if (text(first:last) == 'true' .or. text(first:last) == 'false' .or. &
+            text(first:last) == 'null') then
+            raw_json = .true.
+        else
+            raw_json = numeric_literal(text(first:last))
+        end if
+        if (raw_json) then
+            call output%append(text(first:last))
+        else
+            call output%append_string(json_escape(trimmed))
+        end if
+    end subroutine append_json_argument_value
+
+    logical function numeric_literal(text)
+        character(len=*), intent(in) :: text
+        integer :: i
+        logical :: digit_seen
+
+        numeric_literal = .false.
+        if (len(text) == 0) return
+        digit_seen = .false.
+        do i = 1, len(text)
+            select case (text(i:i))
+            case ('0':'9')
+                digit_seen = .true.
+            case ('-', '+', '.', 'e', 'E')
+                continue
+            case default
+                return
+            end select
+        end do
+        numeric_literal = digit_seen
+    end function numeric_literal
+
+    subroutine append_tool_call(calls, count, name, arguments)
+        type(tool_call_t), allocatable, intent(inout) :: calls(:)
+        integer, intent(inout) :: count
+        type(string_t), intent(in) :: name, arguments
+        type(tool_call_t), allocatable :: grown(:)
+
+        allocate(grown(count + 1))
+        if (count > 0) grown(:count) = calls
+        grown(count + 1)%name = name
+        grown(count + 1)%arguments = arguments
+        call move_alloc(grown, calls)
+        count = count + 1
+    end subroutine append_tool_call
+
+    subroutine trim_segment(text, output)
+        character(len=*), intent(in) :: text
+        type(string_t), intent(out) :: output
+        integer :: first, last
+
+        call trim_bounds(text, first, last)
+        call output%clear()
+        if (first <= last) call output%set(text(first:last))
+    end subroutine trim_segment
+
+    subroutine trim_visible_boundaries(value)
+        type(string_t), intent(inout) :: value
+        character(len=:), allocatable :: text
+        integer :: first, last
+
+        text = value%as_character()
+        call trim_bounds(text, first, last)
+        call value%clear()
+        if (first <= last) call value%set(text(first:last))
+    end subroutine trim_visible_boundaries
 
     subroutine split_reasoning(raw, enable_thinking, reasoning_format, content, reasoning)
         character(len=*), intent(in) :: raw, reasoning_format
@@ -800,13 +1509,14 @@ contains
             60 * calendar(6) + calendar(7)
     end function unix_timestamp
 
-    subroutine completion_body(model, content, reasoning, tokens, chat, stream, response)
+    subroutine completion_body(model, content, reasoning, tokens, chat, stream, response, tool_calls, tool_count)
         type(string_t), intent(in) :: model, content, reasoning
-        integer, intent(in) :: tokens
+        type(tool_call_t), intent(in) :: tool_calls(:)
+        integer, intent(in) :: tokens, tool_count
         logical, intent(in) :: chat, stream
         type(string_t), intent(out) :: response
-        type(string_t) :: model_json, text_json, reasoning_json
-        integer :: clock
+        type(string_t) :: model_json, text_json, reasoning_json, escaped
+        integer :: clock, i
 
         call response%clear()
         clock = unix_timestamp()
@@ -814,9 +1524,8 @@ contains
         text_json = json_escape(content)
         if (reasoning%length() > 0) reasoning_json = json_escape(reasoning)
         if (chat .and. stream) then
-            ! A streaming response is an SSE sequence.  Reasoning and visible
-            ! content are separate deltas, matching llama.cpp and clients
-            ! that render the hidden channel independently.
+            ! Reasoning, visible content, and function calls are independent
+            ! deltas so OpenAI clients can render or dispatch each channel.
             if (reasoning%length() > 0) then
                 call response%append('data: {"id":"fortai-native","object":"chat.completion.chunk","created":')
                 call response%append_int(clock)
@@ -827,23 +1536,48 @@ contains
                 call response%append('},"finish_reason":null}],"fortai_backend":"fortai"}')
                 call response%append(char(10)); call response%append(char(10))
             end if
-            call response%append('data: {"id":"fortai-native","object":"chat.completion.chunk","created":')
-            call response%append_int(clock)
-            call response%append(',"model":')
-            call response%append_string(model_json)
-            if (reasoning%length() == 0) then
-                call response%append(',"choices":[{"index":0,"delta":{"role":"assistant","content":')
-            else
-                call response%append(',"choices":[{"index":0,"delta":{"content":')
+            if (content%length() > 0 .or. tool_count == 0) then
+                call response%append('data: {"id":"fortai-native","object":"chat.completion.chunk","created":')
+                call response%append_int(clock)
+                call response%append(',"model":')
+                call response%append_string(model_json)
+                if (reasoning%length() == 0) then
+                    call response%append(',"choices":[{"index":0,"delta":{"role":"assistant","content":')
+                else
+                    call response%append(',"choices":[{"index":0,"delta":{"content":')
+                end if
+                call response%append_string(text_json)
+                call response%append('},"finish_reason":null}],"fortai_backend":"fortai"}')
+                call response%append(char(10)); call response%append(char(10))
             end if
-            call response%append_string(text_json)
-            call response%append('},"finish_reason":null}],"fortai_backend":"fortai"}')
-            call response%append(char(10)); call response%append(char(10))
+            do i = 1, tool_count
+                escaped = json_escape(tool_calls(i)%arguments)
+                call response%append('data: {"id":"fortai-native","object":"chat.completion.chunk","created":')
+                call response%append_int(clock)
+                call response%append(',"model":')
+                call response%append_string(model_json)
+                call response%append(',"choices":[{"index":0,"delta":{"tool_calls":[{"index":')
+                call response%append_int(i - 1)
+                call response%append(',"id":"fortai-tool-call-')
+                call response%append_int(i)
+                call response%append('","type":"function","function":{"name":')
+                call response%append_string(json_escape(tool_calls(i)%name))
+                call response%append(',"arguments":')
+                call response%append_string(escaped)
+                call response%append('}}]},"finish_reason":null}],"fortai_backend":"fortai"}')
+                call response%append(char(10)); call response%append(char(10))
+            end do
             call response%append('data: {"id":"fortai-native","object":"chat.completion.chunk","created":')
             call response%append_int(clock)
             call response%append(',"model":')
             call response%append_string(model_json)
-            call response%append(',"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"fortai_backend":"fortai"}')
+            call response%append(',"choices":[{"index":0,"delta":{},"finish_reason":')
+            if (tool_count > 0) then
+                call response%append('"tool_calls"')
+            else
+                call response%append('"stop"')
+            end if
+            call response%append('}],"fortai_backend":"fortai"}')
             call response%append(char(10)); call response%append(char(10))
             call response%append('data: [DONE]'); call response%append(char(10)); call response%append(char(10))
             return
@@ -860,12 +1594,30 @@ contains
         call response%append_string(model_json)
         if (chat) then
             call response%append(',"choices":[{"index":0,"message":{"role":"assistant","content":')
-            call response%append_string(text_json)
+            if (content%length() == 0 .and. tool_count > 0) then
+                call response%append('null')
+            else
+                call response%append_string(text_json)
+            end if
             if (reasoning%length() > 0) then
                 call response%append(',"reasoning_content":')
                 call response%append_string(reasoning_json)
             end if
-            call response%append('},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":')
+            if (tool_count > 0) then
+                call response%append(',"tool_calls":[')
+                do i = 1, tool_count
+                    if (i > 1) call response%append(',')
+                    call append_chat_tool_object(response, tool_calls(i), i)
+                end do
+                call response%append(']')
+            end if
+            call response%append('},"finish_reason":')
+            if (tool_count > 0) then
+                call response%append('"tool_calls"')
+            else
+                call response%append('"stop"')
+            end if
+            call response%append('}],"usage":{"prompt_tokens":0,"completion_tokens":')
             call response%append_int(tokens); call response%append(',"total_tokens":'); call response%append_int(tokens)
             call response%append('},"fortai_backend":"fortai"}'); call response%append(char(10))
         else
@@ -877,12 +1629,30 @@ contains
         end if
     end subroutine completion_body
 
-    function response_json(model, content, reasoning, tokens) result(response)
+    subroutine append_chat_tool_object(output, call, index)
+        type(string_t), intent(inout) :: output
+        type(tool_call_t), intent(in) :: call
+        integer, intent(in) :: index
+        type(string_t) :: arguments
+
+        arguments = json_escape(call%arguments)
+        call output%append('{"id":"fortai-tool-call-')
+        call output%append_int(index)
+        call output%append('","type":"function","function":{"name":')
+        call output%append_string(json_escape(call%name))
+        call output%append(',"arguments":')
+        call output%append_string(arguments)
+        call output%append('}}')
+    end subroutine append_chat_tool_object
+
+    function response_json(model, content, reasoning, tokens, tool_calls, tool_count) result(response)
         type(string_t), intent(in) :: model, content, reasoning
-        integer, intent(in) :: tokens
+        type(tool_call_t), intent(in) :: tool_calls(:)
+        integer, intent(in) :: tokens, tool_count
         type(string_t) :: response
-        type(string_t) :: model_json, content_json, reasoning_json
-        integer :: clock
+        type(string_t) :: model_json, content_json, reasoning_json, arguments
+        integer :: clock, i
+        logical :: have_output
 
         call response%clear()
         clock = unix_timestamp()
@@ -896,16 +1666,37 @@ contains
         call response%append(',"status":"completed","model":')
         call response%append_string(model_json)
         call response%append(',"output":[')
+        have_output = .false.
         if (reasoning%length() > 0) then
             call response%append('{"id":"fortai-native-reasoning","type":"reasoning","status":"completed",')
             call response%append('"summary":[{"type":"summary_text","text":')
             call response%append_string(reasoning_json)
-            call response%append('}]},')
+            call response%append('}]}')
+            have_output = .true.
         end if
-        call response%append('{"id":"fortai-native-message","type":"message","role":"assistant",')
-        call response%append('"status":"completed","content":[{"type":"output_text","text":')
-        call response%append_string(content_json)
-        call response%append(',"annotations":[]}]}')
+        if (content%length() > 0 .or. tool_count == 0) then
+            if (have_output) call response%append(',')
+            call response%append('{"id":"fortai-native-message","type":"message","role":"assistant",')
+            call response%append('"status":"completed","content":[{"type":"output_text","text":')
+            call response%append_string(content_json)
+            call response%append(',"annotations":[]}]}')
+            have_output = .true.
+        end if
+        do i = 1, tool_count
+            if (have_output) call response%append(',')
+            arguments = json_escape(tool_calls(i)%arguments)
+            call response%append('{"id":"fortai-tool-call-')
+            call response%append_int(i)
+            call response%append('","type":"function_call","status":"completed",')
+            call response%append('"call_id":"fortai-tool-call-')
+            call response%append_int(i)
+            call response%append('","name":')
+            call response%append_string(json_escape(tool_calls(i)%name))
+            call response%append(',"arguments":')
+            call response%append_string(arguments)
+            call response%append('}')
+            have_output = .true.
+        end do
         call response%append('],"input":[],"instructions":null,"usage":{"input_tokens":0,"output_tokens":')
         call response%append_int(tokens)
         call response%append(',"total_tokens":')
@@ -926,11 +1717,13 @@ contains
         call response%append(char(10))
     end subroutine append_sse_event
 
-    function response_stream_json(model, content, reasoning, tokens) result(response)
+    function response_stream_json(model, content, reasoning, tokens, tool_calls, tool_count) result(response)
         type(string_t), intent(in) :: model, content, reasoning
-        integer, intent(in) :: tokens
-        type(string_t) :: response, payload, escaped, final_response
-        integer :: text_index, clock
+        type(tool_call_t), intent(in) :: tool_calls(:)
+        integer, intent(in) :: tokens, tool_count
+        type(string_t) :: response, payload, escaped, final_response, arguments
+        integer :: text_index, clock, i, tool_index
+        logical :: has_message
 
         call response%clear()
         clock = unix_timestamp()
@@ -975,6 +1768,8 @@ contains
             text_index = 1
         end if
 
+        has_message = content%length() > 0 .or. tool_count == 0
+        if (has_message) then
         call payload%set('{"type":"response.output_item.added","output_index":')
         call payload%append_int(text_index)
         call payload%append(',"item":{"id":"fortai-native-message","type":"message",')
@@ -1015,8 +1810,56 @@ contains
         call payload%append_string(escaped)
         call payload%append(',"annotations":[]}]}}')
         call append_sse_event(response, 'response.output_item.done', payload)
+        end if
 
-        final_response = response_json(model, content, reasoning, tokens)
+        tool_index = text_index
+        if (has_message) tool_index = tool_index + 1
+        do i = 1, tool_count
+            arguments = json_escape(tool_calls(i)%arguments)
+            call payload%set('{"type":"response.output_item.added","output_index":')
+            call payload%append_int(tool_index)
+            call payload%append(',"item":{"id":"fortai-tool-call-')
+            call payload%append_int(i)
+            call payload%append('","type":"function_call","status":"in_progress",')
+            call payload%append('"call_id":"fortai-tool-call-')
+            call payload%append_int(i)
+            call payload%append('","name":')
+            call payload%append_string(json_escape(tool_calls(i)%name))
+            call payload%append(',"arguments":""}}')
+            call append_sse_event(response, 'response.output_item.added', payload)
+            call payload%set('{"type":"response.function_call_arguments.delta","item_id":"fortai-tool-call-')
+            call payload%append_int(i)
+            call payload%append('","output_index":')
+            call payload%append_int(tool_index)
+            call payload%append(',"delta":')
+            call payload%append_string(arguments)
+            call payload%append('}')
+            call append_sse_event(response, 'response.function_call_arguments.delta', payload)
+            call payload%set('{"type":"response.function_call_arguments.done","item_id":"fortai-tool-call-')
+            call payload%append_int(i)
+            call payload%append('","output_index":')
+            call payload%append_int(tool_index)
+            call payload%append(',"arguments":')
+            call payload%append_string(arguments)
+            call payload%append('}')
+            call append_sse_event(response, 'response.function_call_arguments.done', payload)
+            call payload%set('{"type":"response.output_item.done","output_index":')
+            call payload%append_int(tool_index)
+            call payload%append(',"item":{"id":"fortai-tool-call-')
+            call payload%append_int(i)
+            call payload%append('","type":"function_call","status":"completed",')
+            call payload%append('"call_id":"fortai-tool-call-')
+            call payload%append_int(i)
+            call payload%append('","name":')
+            call payload%append_string(json_escape(tool_calls(i)%name))
+            call payload%append(',"arguments":')
+            call payload%append_string(arguments)
+            call payload%append('}}')
+            call append_sse_event(response, 'response.output_item.done', payload)
+            tool_index = tool_index + 1
+        end do
+
+        final_response = response_json(model, content, reasoning, tokens, tool_calls, tool_count)
         call payload%set('{"type":"response.completed","response":')
         call payload%append_string(final_response)
         call payload%append('}')
@@ -1031,9 +1874,10 @@ contains
         character(kind=c_char), intent(out) :: response(*), content_type(*)
         integer(c_int), intent(out) :: response_length, status
         type(string_t) :: request_text, model_text, method, path, body, result, prompt, generated
-        type(string_t) :: content, reasoning
+        type(string_t) :: content, reasoning, tools_json, clean_content
         type(message_t), allocatable :: messages(:)
-        integer :: count, max_tokens, tokens, result_code, required
+        type(tool_call_t), allocatable :: tool_calls(:)
+        integer :: count, max_tokens, tokens, result_code, required, tool_count
         integer(int64) :: seed
         real(real32) :: temperature
         logical :: okay, chat, responses, stream, enable_thinking, temperature_valid
@@ -1108,20 +1952,22 @@ contains
             enable_thinking = .true.
         end select
         reasoning_format = json_string_value(body%as_character(), 'reasoning_format', 'auto')
+        call tools_json%clear()
+        if (.not. json_array_value(body%as_character(), 'tools', tools_json)) call tools_json%clear()
         if (responses) then
             if (.not. parse_response_messages(body%as_character(), messages, count)) then
                 call error_body(400, 'input must contain a string or message array', result); status = 400_c_int
                 call copy_result(result, 'application/json', response, response_capacity, response_length, &
                     content_type, content_type_capacity, fortai_native_http_handle); return
             end if
-            prompt = format_chat(messages, count, enable_thinking)
+            prompt = format_chat(messages, count, enable_thinking, tools_json)
         else if (chat) then
             if (.not. parse_messages(body%as_character(), messages, count)) then
                 call error_body(400, 'messages must contain role/content strings', result); status = 400_c_int
                 call copy_result(result, 'application/json', response, response_capacity, response_length, &
                     content_type, content_type_capacity, fortai_native_http_handle); return
             end if
-            prompt = format_chat(messages, count, enable_thinking)
+            prompt = format_chat(messages, count, enable_thinking, tools_json)
         else
             block
             integer :: prompt_value, after
@@ -1143,18 +1989,22 @@ contains
         end if
         if (responses .or. chat) then
             call split_reasoning(generated%as_character(), enable_thinking, reasoning_format, content, reasoning)
+            call parse_tool_calls(content%as_character(), clean_content, tool_calls, tool_count)
+            content = clean_content
         else
             content = generated
             call reasoning%clear()
+            allocate(tool_calls(0))
+            tool_count = 0
         end if
         if (responses) then
             if (stream) then
-                result = response_stream_json(model_text, content, reasoning, tokens)
+                result = response_stream_json(model_text, content, reasoning, tokens, tool_calls, tool_count)
             else
-                result = response_json(model_text, content, reasoning, tokens)
+                result = response_json(model_text, content, reasoning, tokens, tool_calls, tool_count)
             end if
         else
-            call completion_body(model_text, content, reasoning, tokens, chat, stream, result)
+            call completion_body(model_text, content, reasoning, tokens, chat, stream, result, tool_calls, tool_count)
         end if
         status = 200_c_int
         block
