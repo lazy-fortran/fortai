@@ -2408,6 +2408,15 @@ contains
         ! OpenAI-compatible clients use both a top-level field and the
         ! llama.cpp-compatible chat_template_kwargs object.  Responses uses
         ! reasoning.effort; the latter wins when supplied.
+        enable_thinking = json_boolean_checked(server_chat_template_kwargs(), 'enable_thinking', enable_thinking, &
+            nested_thinking_valid, nested_thinking_found)
+        if (.not. nested_thinking_valid) then
+            call error_body(500, 'FORTAI_CHAT_TEMPLATE_KWARGS must contain a valid JSON object', result)
+            status = 500_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        thinking_explicit = thinking_explicit .or. nested_thinking_found
         enable_thinking = json_object_boolean_checked(body%as_character(), 'chat_template_kwargs', &
             'enable_thinking', enable_thinking, nested_thinking_valid, nested_thinking_found)
         if (.not. nested_thinking_valid) then
@@ -2423,6 +2432,14 @@ contains
             reasoning_effort_type_valid, reasoning_effort_found)
         if (.not. reasoning_effort_type_valid) then
             call error_body(400, 'reasoning_effort must be a string', result); status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        reasoning_effort = json_string_checked(server_chat_template_kwargs(), 'reasoning_effort', reasoning_effort, &
+            nested_reasoning_effort_valid, nested_reasoning_effort_found)
+        if (.not. nested_reasoning_effort_valid) then
+            call error_body(500, 'FORTAI_CHAT_TEMPLATE_KWARGS.reasoning_effort must be a string', result)
+            status = 500_c_int
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
@@ -2476,6 +2493,14 @@ contains
         supports_reasoning_effort = fortai_native_service_supports_reasoning_effort()
         supports_preserve_thinking = fortai_native_service_supports_preserve_thinking()
         preserve_thinking = server_boolean_default('FORTAI_REASONING_PRESERVE', supports_preserve_thinking)
+        preserve_thinking = json_boolean_checked(server_chat_template_kwargs(), 'preserve_thinking', preserve_thinking, &
+            preserve_thinking_valid, preserve_thinking_found)
+        if (.not. preserve_thinking_valid) then
+            call error_body(500, 'FORTAI_CHAT_TEMPLATE_KWARGS.preserve_thinking must be a boolean', result)
+            status = 500_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
         preserve_thinking = json_boolean_checked(body%as_character(), 'preserve_thinking', preserve_thinking, &
             preserve_thinking_valid, preserve_thinking_found)
         if (.not. preserve_thinking_valid) then
@@ -2764,6 +2789,22 @@ contains
         end if
     end function server_text_default
 
+    function server_chat_template_kwargs() result(text)
+        character(len=:), allocatable :: text
+        character(len=4096) :: value
+        integer :: length
+
+        value = ''
+        call get_environment_variable('FORTAI_CHAT_TEMPLATE_KWARGS', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_CHAT_TEMPLATE_KWARGS', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_CHAT_TEMPLATE_KWARGS', value, length=length)
+        if (length <= 0 .or. length > len(value)) then
+            text = '{}'
+        else
+            text = value(:length)
+        end if
+    end function server_chat_template_kwargs
+
     logical function server_web_ui_enabled()
         character(len=16) :: value
         integer :: length
@@ -2832,6 +2873,7 @@ contains
         call append_setting(result, 'reasoning_effort', 'FORTAI_REASONING_EFFORT', 'default', .true.)
         call append_setting(result, 'reasoning', 'FORTAI_REASONING', 'auto', .true.)
         call append_setting(result, 'reasoning_preserve', 'FORTAI_REASONING_PRESERVE', 'false', .false.)
+        call append_setting(result, 'chat_template_kwargs', 'FORTAI_CHAT_TEMPLATE_KWARGS', '{}', .true.)
         call append_setting(result, 'mmproj', 'FORTAI_MMPROJ', '', .true.)
         call append_setting(result, 'mmproj_offload', 'FORTAI_MMPROJ_OFFLOAD', 'true', .false.)
         call append_setting(result, 'fit', 'FORTAI_FIT', 'auto', .true.)

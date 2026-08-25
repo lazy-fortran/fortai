@@ -175,6 +175,10 @@ backend, and serves `/`, `/health`, read-only `/props`, `/metrics`, `/v1/models`
 `/v1/completions`, and the OpenAI Responses-compatible `/v1/responses` wire
 API. The root endpoint is a small llama.cpp-style chat UI. The
 server never launches `llama-server` and reports `X-FortAI-Backend: fortai`.
+The native CLI accepts the production launcher's `--chat-template-kwargs`
+JSON object and applies its `enable_thinking`, `preserve_thinking`, and
+`reasoning_effort` values as request defaults, matching the corresponding
+llama.cpp configuration.
 The native server owns Qwen chat formatting and decoding.  It supports
 `temperature`/`seed`, `stream`, and Qwen thinking controls (`enable_thinking`,
 `reasoning_format`) while exposing reasoning as `reasoning_content`; stop

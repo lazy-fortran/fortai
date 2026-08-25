@@ -238,7 +238,7 @@ contains
                     '--temp', '--temperature', '--top-k', '--top-p', '--min-p', '--repeat-penalty', &
                     '--presence-penalty', '--frequency-penalty', '--repeat-last-n', '--seed', '--reasoning-format', &
                     '--reasoning', '--reasoning-effort', '--threads-batch', '-tb', '--n-predict', '--predict', '-n', &
-                    '--max-tokens', '--device')
+                    '--max-tokens', '--device', '--chat-template-kwargs')
                 i = i + 1; if (i > count) then; okay = .false.; return; end if
                 call argument_text_at(i, value_text)
                 call set_option_environment(option_text, value_text)
@@ -689,6 +689,7 @@ contains
         write(output_unit, '(a)') '  --mmproj-offload/--no-mmproj-offload'
         write(output_unit, '(a)') '  --threads-http N             HTTP worker threads'
         write(output_unit, '(a)') '  --reasoning-budget N         thinking token budget'
+        write(output_unit, '(a)') '  --chat-template-kwargs JSON  template defaults (JSON object)'
         write(output_unit, '(a)') '  --temp N                     default sampling temperature'
         write(output_unit, '(a)') '  --top-k N / --top-p N        default sampling cutoffs'
         write(output_unit, '(a)') '  --no-webui                   disable the embedded web UI'
