@@ -3,8 +3,8 @@
 FortAI is a Fortran-native AI runtime for model loading, execution planning,
 sampling, and architecture-specialized accelerator backends.
 
-The first delivery is a buildable Qwen3.5 CPU reference path and an
-experimental device-resident CUDA path. It contains the
+The first delivery is a buildable Qwen3.5 CPU reference path and a validated
+device-resident CUDA path. It contains the
 public runtime types, GGUF Q8_0 loading, Qwen3.5 hybrid recurrent/full-attention
 execution for the 0.8B, 2B, and 4B model family, native OpenMP/SIMD matvecs,
 and persistent benchmark/provenance tooling. The CUDA path keeps recurrent
@@ -12,8 +12,9 @@ state, attention KV caches, activations, and FFN execution on the RTX 5060 Ti.
 CUDA Graph replay is available as an explicit opt-in, but is disabled by
 default on the tested RTX 5060 Ti until it passes the end-to-end gate; Q4
 mixed-quant `UD-Q4_K_XL` tensors are now handled natively through the exact
-GGML CPU decoder and a persistent two-GPU GGML CUDA bridge. The native path is
-experimental until its model-level promotion gate is closed. A separate
+GGML CPU decoder and a persistent two-GPU GGML CUDA bridge. Native Qwen3.8
+NextN/MTP is correctness-stable on the host-controlled KV path; the
+workload-specific speed gate remains explicit. A separate
 compatibility smoke remains available as an independent upstream llama.cpp
 oracle.
 
@@ -190,11 +191,12 @@ and their provenance logic are tracked.
 
 ## Status
 
-Version 0.1.0 includes an experimental model-level Qwen3.5 CPU runtime for
-Q8_0 GGUF and a device-resident CUDA Qwen3.5 path. Exact trace and centered
+Version 0.1.0 includes a validated model-level Qwen3.5 CPU runtime for Q8_0
+GGUF and a device-resident CUDA Qwen3.5 path. Exact trace and centered
 top-logit parity are checked independently against llama.cpp (8-token traces
 and top-8 logits pass at 1e-2 tolerance on CPU and CUDA). The native mixed-
-quant fallback remains experimental: the earlier 2B Q4_K_M probe measured
+quant fallback remains a correctness-first compatibility path: the earlier 2B
+Q4_K_M probe measured
 7.33 tok/s CPU versus 22.30 tok/s for llama.cpp at eight threads, and 76.9
 tok/s CUDA versus 213.2 tok/s at two threads. When the resident llama.cpp ABI
 library is available, the model runner automatically uses the same resident

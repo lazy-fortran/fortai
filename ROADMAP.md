@@ -305,14 +305,19 @@ review_verdict: PASS
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
-| FAI-CUDA-001 | single-device CUDA backend | experimental, device-resident Qwen path at measured parity | independent ABI oracle, model trace parity, and paired llama.cpp benchmark |
-| FAI-CUDA-001A | host-controlled Qwen3.5 CUDA integration slice | experimental, measured slower | weights resident, model correctness smoke, persistent transfer/launch profile; cannot be promoted |
-| FAI-CUDA-001B | device-resident Qwen3.5 recurrent, attention, KV, and FFN path | experimental, measured at llama.cpp parity | 0.8B/2B/4B smoke, CUDA trace parity, and fewer host activation round trips |
-| FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | experimental, opt-in, variance-sensitive on RTX 5060 Ti | matched Nsight profile and end-to-end speed at least equal to the direct resident plan and llama.cpp |
-| FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | experimental, native two-device placement implemented | two-device placement, transfer accounting, and stable generation oracle |
-| FAI-CUDA-002 | native mixed-quant Q4/IQ kernels and fused GDN kernels | experimental, GGML CPU/CUDA bridge implemented | Q3/Q4/Q5/Q6/IQ tensor coverage, independent llama.cpp oracle, and validated kernel tournament on named GPUs; `benchmark/run_q4_cuda_compat.sh` remains oracle-only |
+| FAI-CUDA-001 | single-device CUDA backend | validated, device-resident Qwen path at measured parity | independent ABI oracle, model trace parity, and paired llama.cpp benchmark |
+| FAI-CUDA-001A | host-controlled Qwen3.5 CUDA integration slice | validated compatibility fallback; measured slower | weights resident, model correctness smoke, and persistent transfer/launch profile |
+| FAI-CUDA-001B | device-resident Qwen3.5 recurrent, attention, KV, and FFN path | validated at fixture-scope llama.cpp parity | 0.8B/2B/4B smoke, CUDA trace parity, and fewer host activation round trips |
+| FAI-CUDA-001C | CUDA Graph capture and launch-plan replay | open opt-in gate; variance-sensitive on RTX 5060 Ti | matched Nsight profile and end-to-end speed at least equal to the direct resident plan and llama.cpp |
+| FAI-MGPU-001 | Qwen3.8-27B multi-GPU split | validated placement and exact target trace; throughput gate open | two-device placement, transfer accounting, and stable generation oracle |
+| FAI-CUDA-002 | native mixed-quant Q4/IQ kernels and fused GDN kernels | validated GGML CPU/CUDA bridge; native-kernel promotion open | Q3/Q4/Q5/Q6/IQ tensor coverage, independent llama.cpp oracle, and validated kernel tournament on named GPUs; `benchmark/run_q4_cuda_compat.sh` remains oracle-only |
 | FAI-CUDA-003A | Native Fortran Qwen3.8 NextN/MTP graph | stable opt-in host-controlled KV path with exact greedy target verification, explicit capability reporting, and safe missing-head rejection | rebuilt CUDA 27B trace, ordinary-target trace parity, and native smoke/oracle checks |
 | FAI-CUDA-003B | Batched target verification/speculative throughput | open performance gate; native single-token target verification is intentionally not promoted as a speedup until the batched recurrent/attention path is implemented | end-to-end throughput at least tied with the fair llama.cpp MTP reference |
+
+Native MTP deliberately keeps the host-boundary path even when Q4 weights are
+split across both GPUs. The explicit `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1`
+bridge remains diagnostic until its longer 27B recurrent trace is exact; the
+stable MTP mode must not trade target-token correctness for a shorter host path.
 
 The 27B path must include multi-GPU placement from its first production CUDA
 implementation. A single-device prototype may be used for kernel debugging,
@@ -324,7 +329,7 @@ FortAI production status is scoped to a named model, quantization, hardware,
 context, batch, and workload. For each such tuple, the selected FortAI
 implementation must match or beat the fastest independently measured
 competing harness under the same conditions. A slower candidate remains
-experimental and cannot become the default execution plan. If no fair
+unpromoted and cannot become the default execution plan. If no fair
 comparison exists, the result stays unpromoted until one is available.
 
 ## Benchmark and provenance
@@ -370,8 +375,8 @@ measured a maximum centered-logit error of `2.431842038852494e-7` against its
 model-level runs with sequential FortAI execution. The 0.8B paired oracle
 run is explicitly shared-service correctness evidence and performance-
 ineligible; the 2B and 4B scaling runs do not start a llama-server.
-The CUDA evidence now includes an experimental device-resident Qwen3.5 path
-for the 0.8B, 2B, and 4B fixtures. The eight-token CUDA token traces match
+The CUDA evidence now includes a validated device-resident Qwen3.5 path for
+the 0.8B, 2B, and 4B fixtures. The eight-token CUDA token traces match
 llama.cpp on all three fixtures. Repeated 64-token paired runs put the direct
 and graph launch plans within normal run-to-run variance of llama.cpp (the
 observed medians range from a small deficit to a small lead), so this is an

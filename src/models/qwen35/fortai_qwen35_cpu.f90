@@ -751,9 +751,9 @@ contains
         self%cuda_graph_enabled = .false.
         self%cuda_graph_ready = .false.
         ! Native MTP consumes the target pre-output hidden state on the host
-        ! and shares the host KV implementation for its attention block.
-        ! Keep the device-resident graph disabled until hidden-state export is
-        ! implemented for that explicit mode.
+        ! and shares the host KV implementation for its attention block.  Do
+        ! not mix that stateful hand-off with the opt-in device pipeline until
+        ! its longer-sequence oracle is closed.
         if (self%mtp_active) return
         call get_environment_variable('FORTAI_DISABLE_CUDA_DEVICE_PIPELINE', pipeline_env, length=pipeline_length)
         if (pipeline_length > 0) then
@@ -771,7 +771,7 @@ contains
         ! Mixed-device Q4_K_XL currently uses GGML-CUDA on a second scheduler
         ! and peer bridges.  Keep the production resident path deterministic
         ! by using the verified host-boundary CUDA route unless explicitly
-        ! opting into the experimental all-device bridge.
+        ! opting into the diagnostic all-device bridge.
         if (self%cuda_q4_split) then
             q4_pipeline_env = ''
             call get_environment_variable('FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE', &
@@ -1257,12 +1257,19 @@ contains
                 call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP workspace is not allocated')
                 return
             end if
-            if (position /= self%mtp_last_target_position + 1_int64) then
-                call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP requires sequential positions')
-                return
+            if (position == 0_int64) then
+                if (self%mtp_last_target_position /= -1_int64) then
+                    call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP position restarted without reset')
+                    return
+                end if
+            else
+                if (position /= self%mtp_last_target_position + 1_int64) then
+                    call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP requires sequential positions')
+                    return
+                end if
+                call qwen35_cpu_mtp_pair(self, token_id, position, self%mtp_pending_hidden, stat)
+                if (.not. stat%is_ok()) return
             end if
-            call qwen35_cpu_mtp_pair(self, token_id, position, self%mtp_pending_hidden, stat)
-            if (.not. stat%is_ok()) return
         end if
         if (self%fast_enabled) then
             if (fortai_llama_fast_context_decode(self%fast_handle, int(token_id, c_int), &
@@ -1463,7 +1470,16 @@ contains
             call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP logits workspace is not allocated')
             return
         end if
-        call qwen35_cpu_mtp_pair(self, token_id, position, self%x, stat)
+        if (.not. allocated(self%mtp_pending_hidden)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP hidden workspace is not allocated')
+            return
+        end if
+        if (position <= 0_int64 .or. &
+            position /= self%mtp_last_target_position + 1_int64) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP draft requires the next position')
+            return
+        end if
+        call qwen35_cpu_mtp_pair(self, token_id, position, self%mtp_pending_hidden, stat)
         if (.not. stat%is_ok()) return
         next_token = int(maxloc(self%mtp_logits, dim=1) - 1, int64)
         logit_sum = sum(self%mtp_logits)
