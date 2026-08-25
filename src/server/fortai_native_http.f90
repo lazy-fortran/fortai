@@ -89,6 +89,46 @@ contains
         end do
     end function json_key
 
+    integer function json_top_level_key(text, key)
+        character(len=*), intent(in) :: text, key
+        type(string_t) :: member, ignored
+        integer :: position, object_end, after, colon, value_position, value_after
+
+        json_top_level_key = 0
+        position = skip_space(text, 1)
+        if (position > len(text)) return
+        if (text(position:position) /= '{') return
+        object_end = matching_delimiter(text, position, '{', '}')
+        if (object_end == 0) return
+        position = position + 1
+        do while (position < object_end)
+            position = skip_space(text, position)
+            if (position >= object_end) return
+            if (text(position:position) == '}') return
+            if (text(position:position) /= '"') return
+            if (.not. json_string(text, position, member, after)) return
+            colon = skip_space(text, after)
+            if (colon >= object_end) return
+            if (text(colon:colon) /= ':') return
+            value_position = skip_space(text, colon + 1)
+            if (value_position >= object_end) return
+            if (member%as_character() == key) then
+                json_top_level_key = value_position
+                return
+            end if
+            if (.not. json_raw_value(text, value_position, ignored, value_after)) return
+            position = skip_space(text, value_after)
+            if (position >= object_end) return
+            if (text(position:position) == ',') then
+                position = position + 1
+            else if (text(position:position) == '}') then
+                return
+            else
+                return
+            end if
+        end do
+    end function json_top_level_key
+
     integer function matching_delimiter(text, first, opening, closing)
         character(len=*), intent(in) :: text
         integer, intent(in) :: first
@@ -341,7 +381,7 @@ contains
 
         call output%clear()
         json_array_value = .false.
-        position = json_key(text, key, 1)
+        position = json_top_level_key(text, key)
         if (position == 0) return
         if (position > len(text)) return
         if (text(position:position) /= '[') return
@@ -545,7 +585,7 @@ contains
         json_boolean_checked = fallback
         valid = .true.
         found = .false.
-        position = json_key(text, key, 1)
+        position = json_top_level_key(text, key)
         if (position == 0) return
         found = .true.
         position = skip_space(text, position)
@@ -590,7 +630,7 @@ contains
         json_object_boolean_checked = fallback
         valid = .true.
         found = .false.
-        object_value = json_key(text, object_key, 1)
+        object_value = json_top_level_key(text, object_key)
         if (object_value == 0) return
         if (object_value > len(text)) then
             valid = .false.
@@ -614,7 +654,7 @@ contains
         integer :: object_value, object_end
 
         json_object_boolean = fallback
-        object_value = json_key(text, object_key, 1)
+        object_value = json_top_level_key(text, object_key)
         if (object_value == 0 .or. object_value > len(text)) return
         if (text(object_value:object_value) /= '{') return
         object_end = matching_delimiter(text, object_value, '{', '}')
@@ -647,37 +687,70 @@ contains
         end select
     end function normalize_reasoning_effort
 
-    function json_object_string_value(text, object_key, key, fallback) result(value)
+    function json_string_checked(text, key, fallback, valid, found) result(value)
+        character(len=*), intent(in) :: text, key, fallback
+        logical, intent(out) :: valid, found
+        character(len=:), allocatable :: value
+        type(string_t) :: parsed
+        integer :: position, after
+
+        call parsed%set(fallback)
+        valid = .true.
+        found = .false.
+        position = json_top_level_key(text, key)
+        if (position == 0) then
+            value = parsed%as_character()
+            return
+        end if
+        found = .true.
+        if (.not. json_string(text, position, parsed, after)) then
+            valid = .false.
+            call parsed%set(fallback)
+        end if
+        value = parsed%as_character()
+    end function json_string_checked
+
+    function json_object_string_checked(text, object_key, key, fallback, valid, found) result(value)
         character(len=*), intent(in) :: text, object_key, key, fallback
+        logical, intent(out) :: valid, found
         character(len=:), allocatable :: value
         type(string_t) :: parsed
         integer :: object_value, object_end, position, after
 
         call parsed%set(fallback)
-        object_value = json_key(text, object_key, 1)
-        if (object_value <= 0) then
+        valid = .true.
+        found = .false.
+        object_value = json_top_level_key(text, object_key)
+        if (object_value == 0) then
             value = parsed%as_character()
             return
         end if
         if (object_value > len(text)) then
+            valid = .false.
             value = parsed%as_character()
             return
         end if
         if (text(object_value:object_value) /= '{') then
+            valid = .false.
             value = parsed%as_character()
             return
         end if
         object_end = matching_delimiter(text, object_value, '{', '}')
         if (object_end == 0) then
+            valid = .false.
             value = parsed%as_character()
             return
         end if
-        position = json_key(text, key, object_value, object_end)
+        position = json_top_level_key(text(object_value:object_end), key)
         if (position > 0) then
-            if (.not. json_string(text, position, parsed, after)) call parsed%set(fallback)
+            found = .true.
+            if (.not. json_string(text(object_value:object_end), position, parsed, after)) then
+                valid = .false.
+                call parsed%set(fallback)
+            end if
         end if
         value = parsed%as_character()
-    end function json_object_string_value
+    end function json_object_string_checked
 
     function json_string_value(text, key, fallback) result(value)
         character(len=*), intent(in) :: text, key, fallback
@@ -835,14 +908,23 @@ contains
         type(string_t), intent(in) :: reasoning_instruction
         logical, intent(in) :: preserve_thinking
         type(string_t) :: prompt
-        integer :: i, start_index, last_user_index
+        integer :: i, start_index, last_user_index, leading_system_count
         character(len=:), allocatable :: role, reasoning, raw_content
-        type(string_t) :: content, parsed_reasoning
-        logical :: tool_group_open, has_real_reasoning, has_system_message
+        type(string_t) :: content, parsed_reasoning, merged_system
+        logical :: tool_group_open, has_real_reasoning
 
         call prompt%clear()
-        has_system_message = count > 0
-        if (has_system_message) has_system_message = messages(1)%role%as_character() == 'system'
+        call merged_system%clear()
+        leading_system_count = 0
+        do while (leading_system_count < count)
+            if (messages(leading_system_count + 1)%role%as_character() /= 'system') exit
+            leading_system_count = leading_system_count + 1
+            raw_content = messages(leading_system_count)%content%as_character()
+            if (has_nonblank_text(raw_content)) then
+                if (merged_system%length() > 0) call merged_system%append(char(10))
+                call append_trimmed_text(merged_system, raw_content)
+            end if
+        end do
         last_user_index = 0
         do i = 1, count
             if (messages(i)%role%as_character() == 'user') then
@@ -853,45 +935,22 @@ contains
 
         start_index = 1
         if (has_tool_entries(tools_json)) then
-            if (count > 0) then
-                if (messages(1)%role%as_character() == 'system') then
-                    call append_tool_system(prompt, tools_json, messages(1)%content, &
-                        has_nonblank_text(messages(1)%content%as_character()), reasoning_instruction)
-                    start_index = 2
-                else
-                    call content%clear()
-                    call append_tool_system(prompt, tools_json, content, .false., reasoning_instruction)
-                end if
-            else
-                call content%clear()
-                call append_tool_system(prompt, tools_json, content, .false., reasoning_instruction)
-            end if
-        else if (count > 0) then
-            if (messages(1)%role%as_character() == 'system') then
-                call prompt%append('<|im_start|>system')
-                call prompt%append(char(10))
-                if (reasoning_instruction%length() > 0) then
-                    call append_trimmed_text(prompt, reasoning_instruction%as_character())
-                    if (has_nonblank_text(messages(1)%content%as_character())) then
-                        call prompt%append(char(10))
-                        call prompt%append(char(10))
-                    end if
-                end if
-                call prompt%append_string(messages(1)%content)
-                call prompt%append('<|im_end|>')
-                call prompt%append(char(10))
-                start_index = 2
-            end if
-        end if
-
-        if (.not. has_tool_entries(tools_json) .and. reasoning_instruction%length() > 0) then
-            if (.not. has_system_message) then
-                call prompt%append('<|im_start|>system')
-                call prompt%append(char(10))
+            call append_tool_system(prompt, tools_json, merged_system, merged_system%length() > 0, reasoning_instruction)
+            start_index = leading_system_count + 1
+        else if (merged_system%length() > 0 .or. reasoning_instruction%length() > 0) then
+            call prompt%append('<|im_start|>system')
+            call prompt%append(char(10))
+            if (reasoning_instruction%length() > 0) then
                 call append_trimmed_text(prompt, reasoning_instruction%as_character())
-                call prompt%append('<|im_end|>')
-                call prompt%append(char(10))
+                if (merged_system%length() > 0) then
+                    call prompt%append(char(10))
+                    call prompt%append(char(10))
+                end if
             end if
+            if (merged_system%length() > 0) call prompt%append_string(merged_system)
+            call prompt%append('<|im_end|>')
+            call prompt%append(char(10))
+            start_index = leading_system_count + 1
         end if
 
         tool_group_open = .false.
@@ -906,7 +965,7 @@ contains
                 call prompt%append(char(10))
                 call prompt%append('<tool_response>')
                 call prompt%append(char(10))
-                call prompt%append_string(messages(i)%content)
+                call append_trimmed_text(prompt, messages(i)%content%as_character())
                 call prompt%append(char(10))
                 call prompt%append('</tool_response>')
                 if (i == count) then
@@ -939,6 +998,9 @@ contains
                         reasoning = parsed_reasoning%as_character()
                     end if
                 end if
+                raw_content = content%as_character()
+                call content%clear()
+                call append_trimmed_text(content, raw_content)
                 has_real_reasoning = has_nonblank_text(reasoning)
                 ! Qwen3.5 keeps reasoning only for assistant turns after the
                 ! latest real user query (including multi-step tool turns).
@@ -966,7 +1028,7 @@ contains
                     call append_assistant_tool_calls(prompt, messages(i)%tool_calls, content%length() > 0)
                 end if
             else
-                call prompt%append_string(content)
+                call append_trimmed_text(prompt, content%as_character())
             end if
             call prompt%append('<|im_end|>')
             call prompt%append(char(10))
@@ -2124,9 +2186,13 @@ contains
         integer(int64) :: seed
         real(real32) :: temperature, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty
         logical :: okay, chat, responses, stream, enable_thinking, preserve_thinking
-        logical :: reasoning_effort_valid, supports_reasoning_effort, supports_preserve_thinking
+        logical :: reasoning_effort_valid, reasoning_effort_type_valid, reasoning_effort_found
+        logical :: nested_reasoning_effort_valid, nested_reasoning_effort_found
+        logical :: response_reasoning_effort_valid, response_reasoning_effort_found
+        logical :: supports_reasoning_effort, supports_preserve_thinking
         logical :: thinking_explicit, enable_thinking_valid, nested_thinking_valid, nested_thinking_found
         logical :: preserve_thinking_valid, preserve_thinking_found
+        logical :: reasoning_format_valid, reasoning_format_found
         logical :: temperature_valid, max_tokens_valid
         logical :: top_p_valid, min_p_valid, repeat_penalty_valid, presence_penalty_valid
         logical :: frequency_penalty_valid, top_k_valid, repeat_last_n_valid, sampling_valid
@@ -2222,10 +2288,28 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         thinking_explicit = thinking_explicit .or. nested_thinking_found
-        reasoning_effort = json_string_value(body%as_character(), 'reasoning_effort', '')
-        reasoning_effort = json_object_string_value(body%as_character(), 'chat_template_kwargs', &
-            'reasoning_effort', reasoning_effort)
-        reasoning_effort = json_object_string_value(body%as_character(), 'reasoning', 'effort', reasoning_effort)
+        reasoning_effort = json_string_checked(body%as_character(), 'reasoning_effort', '', &
+            reasoning_effort_type_valid, reasoning_effort_found)
+        if (.not. reasoning_effort_type_valid) then
+            call error_body(400, 'reasoning_effort must be a string', result); status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        reasoning_effort = json_object_string_checked(body%as_character(), 'chat_template_kwargs', &
+            'reasoning_effort', reasoning_effort, nested_reasoning_effort_valid, nested_reasoning_effort_found)
+        if (.not. nested_reasoning_effort_valid) then
+            call error_body(400, 'chat_template_kwargs.reasoning_effort must be a string', result)
+            status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        reasoning_effort = json_object_string_checked(body%as_character(), 'reasoning', 'effort', reasoning_effort, &
+            response_reasoning_effort_valid, response_reasoning_effort_found)
+        if (.not. response_reasoning_effort_valid) then
+            call error_body(400, 'reasoning.effort must be a string', result); status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
         reasoning_effort = normalize_reasoning_effort(reasoning_effort, reasoning_effort_valid)
         if (.not. reasoning_effort_valid) then
             call error_body(400, 'reasoning_effort must be one of default, minimal, low, medium, high, xhigh, or max', result)
@@ -2239,7 +2323,24 @@ contains
         case ('low', 'medium', 'xhigh')
             if (.not. thinking_explicit) enable_thinking = .true.
         end select
-        reasoning_format = json_string_value(body%as_character(), 'reasoning_format', 'auto')
+        reasoning_format = json_string_checked(body%as_character(), 'reasoning_format', 'auto', &
+            reasoning_format_valid, reasoning_format_found)
+        if (.not. reasoning_format_valid) then
+            call error_body(400, 'reasoning_format must be a string', result); status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        select case (trim(reasoning_format))
+        case ('', 'auto', 'deepseek')
+            reasoning_format = 'auto'
+        case ('none', 'deepseek-legacy')
+            continue
+        case default
+            call error_body(400, 'reasoning_format must be one of none, auto, deepseek, or deepseek-legacy', result)
+            status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end select
         supports_reasoning_effort = fortai_native_service_supports_reasoning_effort()
         supports_preserve_thinking = fortai_native_service_supports_preserve_thinking()
         preserve_thinking = supports_preserve_thinking
