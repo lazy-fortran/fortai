@@ -119,12 +119,17 @@ reports. `ERR_NVGPUCTRPERM` is recorded when the host denies performance
 counter access; it does not invalidate the CUDA-event timing or correctness
 gate.
 
-The experimental model-level CUDA slice can be built and compared with:
+The native model-level CUDA path can be built and compared with:
 
 ```bash
 downloads=/mnt/storage/code/lazy-fortran/fortai/.provenance/downloads
 OMP_NUM_THREADS=2 benchmark/compare_qwen35_cuda_llama.sh \
   "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
+
+# exercise native device-resident q8_0 K/V (mixed f16/q8_0 forms are supported)
+FORTAI_LLAMA_FASTPATH=native FORTAI_CACHE_TYPE_K=q8_0 FORTAI_CACHE_TYPE_V=q8_0 \
+  benchmark/check_qwen35_cuda_trace.sh \
+  "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 8 128 0
 benchmark/profile_qwen35_cuda.sh \
   "$downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf" 9419 16 128 0
 benchmark/profile_qwen35_cuda_llama.sh \
@@ -136,7 +141,7 @@ benchmark/repeat_compare_qwen35_cuda.sh \
 ```
 
 The model path uploads Q8 weights once and keeps the token embedding lookup,
-activations, recurrent state, attention KV caches, FFN projections, and final
+activations, recurrent state, attention KV caches (f16/f32 or native q8_0), FFN projections, and final
 logit projection device-resident. Only the logits needed by the current host
 sampler and the next-token/control values cross the boundary. The path is
 host-controlled at the model-call boundary and uses a resident CUDA Graph only

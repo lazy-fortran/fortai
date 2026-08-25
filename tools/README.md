@@ -16,7 +16,9 @@ The native CLI accepts the production llama.cpp profile controls (`--alias`,
 K/V cache types, batch/ubatch, cache budget/reuse, sampler defaults, reasoning
 budget, mmproj path/offload, and `--no-webui`) and mirrors their
 `LLAMACPP_*` environment variables into `FORTAI_*`. `/health` reports the
-effective values. Main Qwen K/V caches support `f16`, `f32`, and `q8_0`; the
+effective values. Main Qwen K/V caches support `f16`, `f32`, and `q8_0`; native
+CUDA keeps q8_0 K/V resident with mixed f16/q8_0 combinations, while the
+host-controlled/MTP path uses the same quantization layout on the host. The
 native MTP path uses an embedded NextN head and validates an external draft
 path when one is configured.
 

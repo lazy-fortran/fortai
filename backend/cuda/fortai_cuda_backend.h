@@ -162,12 +162,14 @@ int fortai_cuda_qwen35_attention_create(fortai_cuda_q8_context *context,
     const void *key_norm, size_t key_norm_bytes,
     int heads, int key_value_heads, int head_size, int value_size,
     int max_context, int rope_dimension, float rope_base, float norm_epsilon,
+    int cache_key_q8, int cache_value_q8,
     fortai_cuda_qwen35_attention **layer);
 int fortai_cuda_qwen35_attention_create_state(fortai_cuda_q8_context *context,
     const void *query_norm, size_t query_norm_bytes, const void *key_norm,
     size_t key_norm_bytes, int heads, int key_value_heads, int head_size,
     int value_size, int max_context, int rope_dimension, float rope_base,
-    float norm_epsilon, fortai_cuda_qwen35_attention **layer);
+    float norm_epsilon, int cache_key_q8, int cache_value_q8,
+    fortai_cuda_qwen35_attention **layer);
 int fortai_cuda_qwen35_attention_destroy(fortai_cuda_qwen35_attention *layer);
 int fortai_cuda_qwen35_attention_reset(fortai_cuda_qwen35_attention *layer);
 int fortai_cuda_qwen35_attention_run_device(fortai_cuda_qwen35_attention *layer,

@@ -543,6 +543,7 @@ int FORTAI_WEAK fortai_cuda_qwen35_attention_create(
     size_t query_norm_bytes, const void *key_norm, size_t key_norm_bytes,
     int heads, int key_value_heads, int head_size, int value_size, int max_context,
     int rope_dimension, float rope_base, float norm_epsilon,
+    int cache_key_q8, int cache_value_q8,
     fortai_cuda_qwen35_attention **layer) {
     (void)context;
     (void)query_weights;
@@ -561,6 +562,8 @@ int FORTAI_WEAK fortai_cuda_qwen35_attention_create(
     (void)rope_dimension;
     (void)rope_base;
     (void)norm_epsilon;
+    (void)cache_key_q8;
+    (void)cache_value_q8;
     if (layer) *layer = NULL;
     return unavailable();
 }
@@ -569,11 +572,12 @@ int FORTAI_WEAK fortai_cuda_qwen35_attention_create_state(
     fortai_cuda_q8_context *context, const void *query_norm, size_t query_norm_bytes,
     const void *key_norm, size_t key_norm_bytes, int heads, int key_value_heads,
     int head_size, int value_size, int max_context, int rope_dimension,
-    float rope_base, float norm_epsilon, fortai_cuda_qwen35_attention **layer) {
+    float rope_base, float norm_epsilon, int cache_key_q8, int cache_value_q8,
+    fortai_cuda_qwen35_attention **layer) {
     (void)context; (void)query_norm; (void)query_norm_bytes; (void)key_norm;
     (void)key_norm_bytes; (void)heads; (void)key_value_heads; (void)head_size;
     (void)value_size; (void)max_context; (void)rope_dimension; (void)rope_base;
-    (void)norm_epsilon;
+    (void)norm_epsilon; (void)cache_key_q8; (void)cache_value_q8;
     if (layer) *layer = NULL;
     return unavailable();
 }

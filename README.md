@@ -8,7 +8,9 @@ device-resident CUDA path. It contains the
 public runtime types, GGUF Q8_0 loading, Qwen3.5 hybrid recurrent/full-attention
 execution for the 0.8B, 2B, and 4B model family, native OpenMP/SIMD matvecs,
 and persistent benchmark/provenance tooling. The CUDA path keeps recurrent
-state, attention KV caches, activations, and FFN execution on the RTX 5060 Ti.
+state, attention KV caches, activations, and FFN execution on the RTX 5060 Ti;
+native q8_0 K/V caches are resident and use the same FP16-scale byte layout as
+the independent CPU oracle (mixed f16/q8_0 K/V is supported too).
 CUDA Graph replay is available as an explicit opt-in, but is disabled by
 default on the tested RTX 5060 Ti until it passes the end-to-end gate; Q4
 mixed-quant `UD-Q4_K_XL` tensors are now handled natively through the exact
@@ -192,7 +194,9 @@ visible GPUs; omitted values retain equal-byte balancing, and malformed values
 fail model initialization instead of being ignored.
 Main native K/V caches support `f32`, `f16`, and `q8_0`; q8_0 storage is
 quantized with llama-compatible FP16 scales and is validated against the
-independent CUDA/CPU trace oracle.
+independent CUDA/CPU trace oracle. With native CUDA selected, q8_0 K/V stays
+device-resident, including full-context streaming softmax; the host cache is
+retained only for the host-controlled/MTP path.
 
 Benchmark results, logs, and perf data stay machine-local under
 `benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts

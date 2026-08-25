@@ -576,7 +576,8 @@ module fortai_backend_cuda
         function c_qwen35_attention_create(context, query_weights, key_weights, value_weights, &
                 output_weights, query_norm, query_norm_bytes, key_norm, key_norm_bytes, heads, &
                 key_value_heads, head_size, value_size, max_context, rope_dimension, rope_base, &
-                norm_epsilon, layer) bind(C, name='fortai_cuda_qwen35_attention_create') result(code)
+                norm_epsilon, cache_key_q8, cache_value_q8, layer) &
+                bind(C, name='fortai_cuda_qwen35_attention_create') result(code)
             import c_float, c_int, c_int8_t, c_ptr, c_size_t
             type(c_ptr), value :: context, query_weights, key_weights, value_weights, output_weights
             integer(c_int8_t), target, intent(in) :: query_norm(*), key_norm(*)
@@ -584,19 +585,22 @@ module fortai_backend_cuda
             integer(c_int), value :: heads, key_value_heads, head_size, value_size, max_context
             integer(c_int), value :: rope_dimension
             real(c_float), value :: rope_base, norm_epsilon
+            integer(c_int), value :: cache_key_q8, cache_value_q8
             type(c_ptr) :: layer
             integer(c_int) :: code
         end function c_qwen35_attention_create
 
         function c_qwen35_attention_create_state(context, query_norm, query_norm_bytes, key_norm, key_norm_bytes, &
                 heads, key_value_heads, head_size, value_size, max_context, rope_dimension, rope_base, &
-                norm_epsilon, layer) bind(C, name='fortai_cuda_qwen35_attention_create_state') result(code)
+                norm_epsilon, cache_key_q8, cache_value_q8, layer) &
+                bind(C, name='fortai_cuda_qwen35_attention_create_state') result(code)
             import c_float, c_int, c_int8_t, c_ptr, c_size_t
             type(c_ptr), value :: context
             integer(c_int8_t), target, intent(in) :: query_norm(*), key_norm(*)
             integer(c_size_t), value :: query_norm_bytes, key_norm_bytes
             integer(c_int), value :: heads, key_value_heads, head_size, value_size, max_context, rope_dimension
             real(c_float), value :: rope_base, norm_epsilon
+            integer(c_int), value :: cache_key_q8, cache_value_q8
             type(c_ptr) :: layer
             integer(c_int) :: code
         end function c_qwen35_attention_create_state
@@ -837,7 +841,7 @@ contains
 
         call stat%clear()
         if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
-                .not. c_associated(device_activation) .or. .not. c_associated(device_output)) then
+            .not. c_associated(device_activation) .or. .not. c_associated(device_output)) then
             call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 resident matvec arguments')
             return
         end if
@@ -860,8 +864,8 @@ contains
 
         call stat%clear()
         if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
-                .not. c_associated(second_weights%handle) .or. .not. c_associated(device_activation) .or. &
-                .not. c_associated(first_output) .or. .not. c_associated(second_output)) then
+            .not. c_associated(second_weights%handle) .or. .not. c_associated(device_activation) .or. &
+            .not. c_associated(first_output) .or. .not. c_associated(second_output)) then
             call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 resident pair arguments')
             return
         end if
@@ -891,9 +895,9 @@ contains
 
         call stat%clear()
         if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
-                .not. c_associated(second_weights%handle) .or. .not. c_associated(third_weights%handle) .or. &
-                .not. c_associated(device_activation) .or. .not. c_associated(first_output) .or. &
-                .not. c_associated(second_output) .or. .not. c_associated(third_output)) then
+            .not. c_associated(second_weights%handle) .or. .not. c_associated(third_weights%handle) .or. &
+            .not. c_associated(device_activation) .or. .not. c_associated(first_output) .or. &
+            .not. c_associated(second_output) .or. .not. c_associated(third_output)) then
             call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 resident triplet arguments')
             return
         end if
@@ -921,7 +925,7 @@ contains
 
         call stat%clear()
         if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
-                .not. c_associated(device_output)) then
+            .not. c_associated(device_output)) then
             call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 resident embedding arguments')
             return
         end if
@@ -1322,7 +1326,7 @@ contains
 
         call stat%clear()
         if (.not. c_associated(context%handle) .or. .not. c_associated(device_gate) .or. &
-                .not. c_associated(device_up)) then
+            .not. c_associated(device_up)) then
             call stat%set(FORTAI_INVALID, 'invalid CUDA SiLU product arguments')
             return
         end if
@@ -1560,7 +1564,7 @@ contains
 
         call stat%clear()
         if (.not. c_associated(context%handle) .or. size(conv_weights) <= 0 .or. size(ssm_a) <= 0 .or. &
-                size(ssm_dt) <= 0 .or. size(ssm_norm) <= 0) then
+            size(ssm_dt) <= 0 .or. size(ssm_norm) <= 0) then
             call stat%set(FORTAI_INVALID, 'invalid Qwen3.5 CUDA recurrent state arguments')
             return
         end if
@@ -1654,8 +1658,8 @@ contains
 
         call stat%clear()
         if (.not. c_associated(self%handle) .or. .not. c_associated(device_qkv) .or. &
-                .not. c_associated(device_gate) .or. .not. c_associated(device_alpha) .or. &
-                .not. c_associated(device_beta) .or. .not. c_associated(device_output)) then
+            .not. c_associated(device_gate) .or. .not. c_associated(device_alpha) .or. &
+            .not. c_associated(device_beta) .or. .not. c_associated(device_output)) then
             call stat%set(FORTAI_INVALID, 'invalid Qwen3.5 CUDA recurrent core arguments')
             return
         end if
@@ -1668,7 +1672,7 @@ contains
     subroutine cuda_qwen35_attention_create(self, context, query_weights, key_weights, value_weights, &
             output_weights, query_norm, query_norm_bytes, key_norm, key_norm_bytes, heads, &
             key_value_heads, head_size, value_size, max_context, rope_dimension, rope_base, &
-            norm_epsilon, stat)
+            norm_epsilon, stat, cache_key_q8, cache_value_q8)
         class(cuda_qwen35_attention_t), intent(inout) :: self
         class(cuda_q8_context_t), intent(in) :: context
         class(cuda_q8_weights_t), intent(in) :: query_weights, key_weights, value_weights, output_weights
@@ -1677,7 +1681,8 @@ contains
         integer, intent(in) :: heads, key_value_heads, head_size, value_size, max_context, rope_dimension
         real(c_float), intent(in) :: rope_base, norm_epsilon
         type(status_t), intent(out) :: stat
-        integer(c_int) :: code
+        logical, intent(in), optional :: cache_key_q8, cache_value_q8
+        integer(c_int) :: code, cache_key_q8_c, cache_value_q8_c
 
         call stat%clear()
         if (.not. c_associated(context%handle) .or. .not. c_associated(query_weights%handle) .or. &
@@ -1687,11 +1692,19 @@ contains
             return
         end if
         if (c_associated(self%handle)) call self%destroy(stat)
+        cache_key_q8_c = 0_c_int
+        cache_value_q8_c = 0_c_int
+        if (present(cache_key_q8)) then
+            if (cache_key_q8) cache_key_q8_c = 1_c_int
+        end if
+        if (present(cache_value_q8)) then
+            if (cache_value_q8) cache_value_q8_c = 1_c_int
+        end if
         code = c_qwen35_attention_create(context%handle, query_weights%handle, key_weights%handle, &
             value_weights%handle, output_weights%handle, query_norm, query_norm_bytes, key_norm, &
             key_norm_bytes, int(heads, c_int), int(key_value_heads, c_int), int(head_size, c_int), &
             int(value_size, c_int), int(max_context, c_int), int(rope_dimension, c_int), rope_base, &
-            norm_epsilon, self%handle)
+            norm_epsilon, cache_key_q8_c, cache_value_q8_c, self%handle)
         if (code /= FORTAI_CUDA_OK) then
             self%handle = c_null_ptr
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA Qwen attention creation failed')
@@ -1700,7 +1713,7 @@ contains
 
     subroutine cuda_qwen35_attention_create_state(self, context, query_norm, query_norm_bytes, key_norm, &
             key_norm_bytes, heads, key_value_heads, head_size, value_size, max_context, rope_dimension, &
-            rope_base, norm_epsilon, stat)
+            rope_base, norm_epsilon, stat, cache_key_q8, cache_value_q8)
         class(cuda_qwen35_attention_t), intent(inout) :: self
         class(cuda_q8_context_t), intent(in) :: context
         integer(c_int8_t), contiguous, target, intent(in) :: query_norm(:), key_norm(:)
@@ -1708,7 +1721,8 @@ contains
         integer, intent(in) :: heads, key_value_heads, head_size, value_size, max_context, rope_dimension
         real(c_float), intent(in) :: rope_base, norm_epsilon
         type(status_t), intent(out) :: stat
-        integer(c_int) :: code
+        logical, intent(in), optional :: cache_key_q8, cache_value_q8
+        integer(c_int) :: code, cache_key_q8_c, cache_value_q8_c
 
         call stat%clear()
         if (.not. c_associated(context%handle) .or. size(query_norm) <= 0 .or. size(key_norm) <= 0) then
@@ -1716,10 +1730,18 @@ contains
             return
         end if
         if (c_associated(self%handle)) call self%destroy(stat)
+        cache_key_q8_c = 0_c_int
+        cache_value_q8_c = 0_c_int
+        if (present(cache_key_q8)) then
+            if (cache_key_q8) cache_key_q8_c = 1_c_int
+        end if
+        if (present(cache_value_q8)) then
+            if (cache_value_q8) cache_value_q8_c = 1_c_int
+        end if
         code = c_qwen35_attention_create_state(context%handle, query_norm, query_norm_bytes, key_norm, &
             key_norm_bytes, int(heads, c_int), int(key_value_heads, c_int), int(head_size, c_int), &
             int(value_size, c_int), int(max_context, c_int), int(rope_dimension, c_int), rope_base, &
-            norm_epsilon, self%handle)
+            norm_epsilon, cache_key_q8_c, cache_value_q8_c, self%handle)
         if (code /= FORTAI_CUDA_OK) then
             self%handle = c_null_ptr
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA Qwen attention state creation failed')
@@ -1783,8 +1805,8 @@ contains
 
         call stat%clear()
         if (.not. c_associated(self%handle) .or. .not. c_associated(device_query) .or. &
-                .not. c_associated(device_key) .or. .not. c_associated(device_value) .or. &
-                .not. c_associated(device_output) .or. position < 0) then
+            .not. c_associated(device_key) .or. .not. c_associated(device_value) .or. &
+            .not. c_associated(device_output) .or. position < 0) then
             call stat%set(FORTAI_INVALID, 'invalid CUDA Qwen attention core arguments')
             return
         end if

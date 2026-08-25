@@ -584,16 +584,28 @@ contains
         key_row = self%attention_head_size + 2 * key_blocks
         value_row = self%value_length + 2 * value_blocks
         if (self%cache_key_q8) then
-            allocate(layer%key_cache_q8(key_row * self%attention_heads_kv * self%max_context))
-            allocate(layer%key_cache_q8_scales(key_blocks * self%attention_heads_kv * self%max_context))
+            if (.not. allocated(layer%key_cache_q8)) then
+                allocate(layer%key_cache_q8(key_row * self%attention_heads_kv * self%max_context))
+            end if
+            if (.not. allocated(layer%key_cache_q8_scales)) then
+                allocate(layer%key_cache_q8_scales(key_blocks * self%attention_heads_kv * self%max_context))
+            end if
         else
-            allocate(layer%key_cache(self%attention_head_size * self%attention_heads_kv * self%max_context))
+            if (.not. allocated(layer%key_cache)) then
+                allocate(layer%key_cache(self%attention_head_size * self%attention_heads_kv * self%max_context))
+            end if
         end if
         if (self%cache_value_q8) then
-            allocate(layer%value_cache_q8(value_row * self%attention_heads_kv * self%max_context))
-            allocate(layer%value_cache_q8_scales(value_blocks * self%attention_heads_kv * self%max_context))
+            if (.not. allocated(layer%value_cache_q8)) then
+                allocate(layer%value_cache_q8(value_row * self%attention_heads_kv * self%max_context))
+            end if
+            if (.not. allocated(layer%value_cache_q8_scales)) then
+                allocate(layer%value_cache_q8_scales(value_blocks * self%attention_heads_kv * self%max_context))
+            end if
         else
-            allocate(layer%value_cache(self%value_length * self%attention_heads_kv * self%max_context))
+            if (.not. allocated(layer%value_cache)) then
+                allocate(layer%value_cache(self%value_length * self%attention_heads_kv * self%max_context))
+            end if
         end if
     end subroutine allocate_attention_cache
 
@@ -668,6 +680,11 @@ contains
         if (.not. allocated(self%file%tensors)) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA model is not open')
             return
+        end if
+        if (allocated(self%layers)) then
+            do i = 1, size(self%layers)
+                if (.not. self%layers(i)%recurrent) call allocate_attention_cache(self, self%layers(i))
+            end do
         end if
         if (allocated(self%cuda_weights)) then
             call cuda_device_pipeline_cleanup(self, cleanup_stat)
@@ -950,7 +967,7 @@ contains
                     int(size(self%file%tensors(self%layers(i)%k_norm)%bytes), c_size_t), &
                     self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
                     self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
-                    self%norm_epsilon, cleanup_stat)
+                    self%norm_epsilon, cleanup_stat, self%cache_key_q8, self%cache_value_q8)
             else
                 call self%layers(i)%cuda_attention%create_state(self%cuda, &
                     self%file%tensors(self%layers(i)%q_norm)%bytes, &
@@ -959,7 +976,7 @@ contains
                     int(size(self%file%tensors(self%layers(i)%k_norm)%bytes), c_size_t), &
                     self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
                     self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
-                    self%norm_epsilon, cleanup_stat)
+                    self%norm_epsilon, cleanup_stat, self%cache_key_q8, self%cache_value_q8)
             end if
             if (.not. cleanup_stat%is_ok()) call cleanup_stat%clear()
         end do
@@ -987,10 +1004,10 @@ contains
         ! not mix that stateful hand-off with the opt-in device pipeline until
         ! its longer-sequence oracle is closed.
         if (self%mtp_active) return
-        ! Native quantized KV storage is owned by the host flash-attention
-        ! boundary. Keep this path explicit instead of allocating a second
-        ! full-precision device cache.
-        if (self%cache_key_q8 .or. self%cache_value_q8) return
+        ! Q8_0 K/V caches are now first-class CUDA-resident storage.  The
+        ! attention ABI carries the independent K/V flags, so mixed f16/q8
+        ! configurations use the same resident pipeline without a host
+        ! dequantization round trip.
         if (.not. self%flash_attention_enabled) return
         call get_environment_variable('FORTAI_DISABLE_CUDA_DEVICE_PIPELINE', pipeline_env, length=pipeline_length)
         if (pipeline_length > 0) then
@@ -1127,7 +1144,26 @@ contains
         ! resident mixed-quant pipeline deterministic; a graph capture of the
         ! Q8 stream cannot capture work submitted to that second scheduler.
         if (self%cuda_q4_resident) self%cuda_graph_enabled = .false.
+        call release_host_attention_caches(self)
     end subroutine setup_cuda_device_pipeline
+
+    subroutine release_host_attention_caches(self)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer :: i
+
+        if (.not. allocated(self%layers)) return
+        do i = 1, size(self%layers)
+            if (self%layers(i)%recurrent) cycle
+            if (allocated(self%layers(i)%key_cache)) deallocate(self%layers(i)%key_cache)
+            if (allocated(self%layers(i)%value_cache)) deallocate(self%layers(i)%value_cache)
+            if (allocated(self%layers(i)%key_cache_q8)) deallocate(self%layers(i)%key_cache_q8)
+            if (allocated(self%layers(i)%value_cache_q8)) deallocate(self%layers(i)%value_cache_q8)
+            if (allocated(self%layers(i)%key_cache_q8_scales)) &
+                deallocate(self%layers(i)%key_cache_q8_scales)
+            if (allocated(self%layers(i)%value_cache_q8_scales)) &
+                deallocate(self%layers(i)%value_cache_q8_scales)
+        end do
+    end subroutine release_host_attention_caches
 
     subroutine cuda_device_pipeline_cleanup(self, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
