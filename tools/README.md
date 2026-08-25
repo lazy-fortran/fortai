@@ -15,7 +15,7 @@ The native CLI accepts the production llama.cpp profile controls (`--alias`/
 `-a`, `--parallel`/`-np`, `--tensor-split`/`-ts`, `--model-draft`/`-md`,
 `--spec-type`, `--flash-attn`/`-fa`, `--fit`/`-fit`,
 K/V cache types, batch/ubatch, cache budget/reuse, sampler defaults, reasoning
-budget, mmproj path/offload, and `--no-webui`) and mirrors their
+budget, mmproj path/offload, `--ui`/`--no-ui`, and `--no-webui`) and mirrors their
 `LLAMA_ARG_*` and legacy `LLAMACPP_*` environment variables into `FORTAI_*`.
 `/health` reports the effective values. Main Qwen K/V caches support `f16`,
 `f32`, and `q8_0`; native

@@ -215,8 +215,10 @@ For native split-Q4 placement, `FORTAI_TENSOR_SPLIT=a,b` (or
 the two visible GPUs; omitted values retain equal-byte balancing, and malformed
 values fail model initialization instead of being ignored. The native server
 also accepts llama.cpp's `-np`, `-fa`, `-fit`, `-sm`, `-mg`, `-md`, `-ctk`,
-`-ctv`, and `-cram` short forms, so the same production command line can be
-used on a separate FortAI port while llama.cpp remains resident. `split-mode
+`-ctv`, and `-cram` short forms, plus `--ui`/`--no-ui` and llama's `auto`/
+`all`/`none` GPU-layer values and `-t -1` automatic-thread spelling, so the
+same production command line can be used on a separate FortAI port while
+llama.cpp remains resident. `split-mode
 none` keeps all native tensors on `main-gpu`; `layer`, `row`, and `tensor` use
 the native two-device Q4 placement policy.
 Main native K/V caches support `f32`, `f16`, and `q8_0`; q8_0 storage is

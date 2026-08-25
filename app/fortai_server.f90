@@ -111,6 +111,48 @@ contains
         parse_integer = ios == 0 .and. value >= minimum .and. value <= maximum
     end function parse_integer
 
+    logical function parse_thread_count(argument, value)
+        type(string_t), intent(in) :: argument
+        integer, intent(out) :: value
+        character(len=:), allocatable :: text
+        integer :: ios
+
+        text = argument%as_character()
+        value = 0
+        read(text, *, iostat=ios) value
+        if (ios /= 0) then
+            parse_thread_count = .false.
+            return
+        end if
+        ! llama-server uses -1 for the automatic thread count.  FortAI's
+        ! zero value is the same policy and is resolved against online CPUs
+        ! immediately before native model initialization.
+        if (value == -1) value = 0
+        parse_thread_count = value >= 0 .and. value <= 4096
+    end function parse_thread_count
+
+    logical function parse_gpu_layers(argument, value)
+        type(string_t), intent(in) :: argument
+        integer, intent(out) :: value
+        character(len=:), allocatable :: text
+        integer :: ios
+
+        text = argument%as_character()
+        select case (trim(text))
+        case ('auto', 'all')
+            value = 999
+            parse_gpu_layers = .true.
+            return
+        case ('none', 'off')
+            value = 0
+            parse_gpu_layers = .true.
+            return
+        end select
+        value = 0
+        read(text, *, iostat=ios) value
+        parse_gpu_layers = ios == 0 .and. value >= 0 .and. value <= 8192
+    end function parse_gpu_layers
+
     subroutine parse_arguments(config, okay, show_help, show_version)
         type(server_config_t), intent(inout) :: config
         logical, intent(out) :: okay, show_help, show_version
@@ -175,12 +217,12 @@ contains
             case ('-t', '--threads')
                 i = i + 1
                 if (i > count) then; okay = .false.; return; end if
-                if (.not. parse_integer(argument_at(i), 1, 4096, value)) then; okay = .false.; return; end if
+                if (.not. parse_thread_count(argument_at(i), value)) then; okay = .false.; return; end if
                 config%threads = value
             case ('-ngl', '--n-gpu-layers', '--gpu-layers')
                 i = i + 1
                 if (i > count) then; okay = .false.; return; end if
-                if (.not. parse_integer(argument_at(i), 0, 8192, value)) then; okay = .false.; return; end if
+                if (.not. parse_gpu_layers(argument_at(i), value)) then; okay = .false.; return; end if
                 config%gpu_layers = value
             case ('--main-gpu', '-mg')
                 i = i + 1
@@ -207,7 +249,7 @@ contains
             case ('--jinja', '--no-jinja', '--mmap', '--no-mmap', '--mlock', '--kv-offload', '--no-kv-offload', &
                     '--context-shift', '--no-context-shift', '--metrics', '--log-timestamps', '--mmproj-offload', &
                     '--no-mmproj-offload', '--webui', '--no-ui', '--no-webui', '--op-offload', '--no-op-offload', &
-                    '--reasoning-preserve', '--no-reasoning-preserve')
+                    '--reasoning-preserve', '--no-reasoning-preserve', '--ui')
                 call set_flag_environment(option_text)
             case default
                 if (len(option_text) > 0) then
@@ -304,7 +346,7 @@ contains
         case ('--log-timestamps'); name = 'FORTAI_LOG_TIMESTAMPS'; value = '1'
         case ('--mmproj-offload'); name = 'FORTAI_MMPROJ_OFFLOAD'; value = '1'
         case ('--no-mmproj-offload'); name = 'FORTAI_MMPROJ_OFFLOAD'; value = '0'
-        case ('--webui'); name = 'FORTAI_NO_WEBUI'; value = '0'
+        case ('--webui', '--ui'); name = 'FORTAI_NO_WEBUI'; value = '0'
         case ('--no-ui', '--no-webui'); name = 'FORTAI_NO_WEBUI'; value = '1'
         case ('--op-offload'); name = 'FORTAI_NO_OP_OFFLOAD'; value = '0'
         case ('--no-op-offload'); name = 'FORTAI_NO_OP_OFFLOAD'; value = '1'
@@ -318,9 +360,6 @@ contains
     subroutine load_environment_defaults(config, okay)
         type(server_config_t), intent(inout) :: config
         logical, intent(out) :: okay
-        character(len=4096) :: value
-        integer :: length
-
         okay = .true.
         call load_text_environment('FORTAI_SERVER_HOST', 'LLAMACPP_HOST', config%host)
         call load_integer_environment('FORTAI_SERVER_PORT', 'LLAMACPP_PORT', 1, 65535, config%port, okay)
@@ -329,11 +368,7 @@ contains
         call load_integer_environment('FORTAI_GPU_LAYERS', 'LLAMACPP_GPU_LAYERS', 0, 8192, config%gpu_layers, okay)
         call load_integer_environment('FORTAI_MAIN_GPU', 'LLAMACPP_MAIN_GPU', 0, 255, config%main_gpu, okay)
         if (.not. okay) return
-        value = ''; call get_environment_variable('FORTAI_SERVER_ALIAS', value, length=length)
-        if (length <= 0) call get_environment_variable('LLAMACPP_SERVED_ALIAS', value, length=length)
-        if (length <= 0) call get_environment_variable('LLAMACPP_MODEL_ALIAS', value, length=length)
-        if (length > 0 .and. length <= len(value)) call config%alias%set(value(:length))
-        call load_text_environment('FORTAI_ALIAS', 'LLAMACPP_SERVED_ALIAS', config%alias)
+        call load_alias_environment(config%alias)
         call load_text_option('FORTAI_PARALLEL', 'LLAMACPP_PARALLEL')
         call load_text_option('FORTAI_TENSOR_SPLIT', 'LLAMACPP_TENSOR_SPLIT')
         call load_text_option('FORTAI_SPLIT_MODE', 'LLAMACPP_SPLIT_MODE')
@@ -378,6 +413,22 @@ contains
         call load_text_option('FORTAI_NO_WEBUI', 'LLAMACPP_NO_WEBUI')
         call load_text_option('FORTAI_NO_OP_OFFLOAD', 'LLAMACPP_NO_OP_OFFLOAD')
     end subroutine load_environment_defaults
+
+    subroutine load_alias_environment(alias)
+        type(string_t), intent(inout) :: alias
+        character(len=4096) :: value
+        integer :: length
+
+        ! Keep the same precedence as the canonical llama arguments: an
+        ! explicitly supplied LLAMA_ARG_ALIAS (normalized to
+        ! FORTAI_SERVER_ALIAS) wins over the legacy LLAMACPP_* names.
+        value = ''
+        call get_environment_variable('FORTAI_SERVER_ALIAS', value, length=length)
+        if (length <= 0) call get_environment_variable('FORTAI_ALIAS', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_SERVED_ALIAS', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_MODEL_ALIAS', value, length=length)
+        if (length > 0 .and. length <= len(value)) call alias%set(value(:length))
+    end subroutine load_alias_environment
 
     subroutine import_llama_environment()
         call import_environment_alias('FORTAI_SERVER_MODEL', 'LLAMA_ARG_MODEL')
