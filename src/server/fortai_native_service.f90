@@ -127,8 +127,19 @@ contains
         if (.not. service_ready .or. max_tokens <= 0 .or. .not. finite_real32(temperature) .or. &
             temperature < 0.0_real32) return
         call service_tokenizer%encode(prompt_text, prompt_ids)
-        if (.not. allocated(prompt_ids) .or. size(prompt_ids) == 0 .or. &
-            size(prompt_ids) >= service_model%max_context) return
+        if (.not. allocated(prompt_ids)) then
+            write(error_unit, '(a)') 'fortai-native: prompt tokenization produced no buffer'
+            return
+        end if
+        if (size(prompt_ids) == 0) then
+            write(error_unit, '(a)') 'fortai-native: prompt tokenization produced no tokens'
+            return
+        end if
+        if (size(prompt_ids) >= service_model%max_context) then
+            write(error_unit, '(a,i0,a,i0,a)') 'fortai-native: prompt has ', size(prompt_ids), &
+                ' tokens but context is ', service_model%max_context, ' tokens'
+            return
+        end if
         if (temperature > 0.0_real32) allocate(logits(service_model%vocabulary_size))
         random_state = seed
         if (random_state == 0_int64) then
@@ -150,7 +161,10 @@ contains
                     next_token, logit_sum, stat)
                 if (stat%is_ok()) current = next_token
             end if
-            if (.not. stat%is_ok()) return
+            if (.not. stat%is_ok()) then
+                write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
+                return
+            end if
         end do
         allocate(generated_ids(max_tokens))
         generated_count = 0
@@ -168,7 +182,10 @@ contains
                 call service_model%forward_greedy(current, position, next_token, logit_sum, stat)
                 if (stat%is_ok()) current = next_token
             end if
-            if (.not. stat%is_ok()) return
+            if (.not. stat%is_ok()) then
+                write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
+                return
+            end if
         end do
         if (generated_count > 0) then
             block

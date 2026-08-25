@@ -152,13 +152,16 @@ direct single-sequence runner. The production service is FortAI-owned: build
 it with `tools/build_cuda_server.sh` and launch
 `tools/fortai-server --model MODEL.gguf --port 8080`. It loads the model
 through the native Fortran Qwen3.5 runtime, initializes the FortAI CUDA
-backend, and serves `/`, `/health`, `/v1/models`, `/v1/chat/completions`, and
-`/v1/completions`. The root endpoint is a small llama.cpp-style chat UI. The
+backend, and serves `/`, `/health`, `/v1/models`, `/v1/chat/completions`,
+`/v1/completions`, and the OpenAI Responses-compatible `/v1/responses` wire
+API. The root endpoint is a small llama.cpp-style chat UI. The
 server never launches `llama-server` and reports `X-FortAI-Backend: fortai`.
 The native server owns Qwen chat formatting and decoding.  It supports
 `temperature`/`seed`, `stream`, and Qwen thinking controls (`enable_thinking`,
 `reasoning_format`) while exposing reasoning as `reasoning_content`; stop
-tokens are removed from the generated message.  Split two-GPU Q4_K_XL models
+tokens are removed from the generated message. Responses requests accept
+string or message-array `input`, `instructions`, `reasoning.effort`, and
+streaming SSE events. Split two-GPU Q4_K_XL models
 use the deterministic host-boundary CUDA route by default; the resident
 all-device bridge remains an explicit `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1`
 diagnostic opt-in until its model-level determinism gate is closed.  Multimodal

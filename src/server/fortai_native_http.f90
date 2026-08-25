@@ -390,6 +390,38 @@ contains
         json_object_boolean = json_boolean(text(object_value:object_end), key, fallback)
     end function json_object_boolean
 
+    function json_object_string_value(text, object_key, key, fallback) result(value)
+        character(len=*), intent(in) :: text, object_key, key, fallback
+        character(len=:), allocatable :: value
+        type(string_t) :: parsed
+        integer :: object_value, object_end, position, after
+
+        call parsed%set(fallback)
+        object_value = json_key(text, object_key, 1)
+        if (object_value <= 0) then
+            value = parsed%as_character()
+            return
+        end if
+        if (object_value > len(text)) then
+            value = parsed%as_character()
+            return
+        end if
+        if (text(object_value:object_value) /= '{') then
+            value = parsed%as_character()
+            return
+        end if
+        object_end = matching_delimiter(text, object_value, '{', '}')
+        if (object_end == 0) then
+            value = parsed%as_character()
+            return
+        end if
+        position = json_key(text, key, object_value, object_end)
+        if (position > 0) then
+            if (.not. json_string(text, position, parsed, after)) call parsed%set(fallback)
+        end if
+        value = parsed%as_character()
+    end function json_object_string_value
+
     function json_string_value(text, key, fallback) result(value)
         character(len=*), intent(in) :: text, key, fallback
         character(len=:), allocatable :: value
@@ -404,19 +436,20 @@ contains
         value = parsed%as_character()
     end function json_string_value
 
-    logical function parse_messages(text, messages, count)
-        character(len=*), intent(in) :: text
+    logical function parse_message_array(text, array_key, messages, count)
+        character(len=*), intent(in) :: text, array_key
         type(message_t), allocatable, intent(out) :: messages(:)
         integer, intent(out) :: count
         integer :: position, limit, object_end, role_value, content_value, reasoning_value, after
         type(message_t), allocatable :: grown(:)
         type(message_t) :: message
 
-        parse_messages = .false.
+        parse_message_array = .false.
         count = 0
         allocate(messages(0))
-        position = json_key(text, 'messages', 1)
+        position = json_key(text, array_key, 1)
         if (position == 0) return
+        if (position > len(text)) return
         if (text(position:position) /= '[') return
         limit = matching_delimiter(text, position, '[', ']')
         if (limit == 0) return
@@ -425,13 +458,16 @@ contains
             position = skip_space(text, position)
             if (position > limit) exit
             if (text(position:position) == ']') exit
-            if (text(position:position) /= '{' .or. count >= max_messages) return
+            if (text(position:position) /= '{') return
+            if (count >= max_messages) return
             object_end = matching_delimiter(text, position, '{', '}')
-            if (object_end == 0 .or. object_end > limit) return
+            if (object_end == 0) return
+            if (object_end > limit) return
             role_value = json_key(text, 'role', position, object_end)
             content_value = json_key(text, 'content', position, object_end)
             reasoning_value = json_key(text, 'reasoning_content', position, object_end)
-            if (role_value == 0 .or. (content_value == 0 .and. reasoning_value == 0)) return
+            if (role_value == 0) return
+            if (content_value == 0 .and. reasoning_value == 0) return
             if (.not. json_string(text, role_value, message%role, after)) return
             call message%content%clear()
             if (content_value > 0) then
@@ -456,8 +492,65 @@ contains
                 return
             end if
         end do
-        parse_messages = count > 0
+        parse_message_array = count > 0
+    end function parse_message_array
+
+    logical function parse_messages(text, messages, count)
+        character(len=*), intent(in) :: text
+        type(message_t), allocatable, intent(out) :: messages(:)
+        integer, intent(out) :: count
+        parse_messages = parse_message_array(text, 'messages', messages, count)
     end function parse_messages
+
+    logical function parse_response_messages(text, messages, count)
+        character(len=*), intent(in) :: text
+        type(message_t), allocatable, intent(out) :: messages(:)
+        integer, intent(out) :: count
+        type(message_t), allocatable :: input_messages(:), grown(:)
+        type(message_t) :: instruction
+        character(len=:), allocatable :: instructions
+        integer :: position, after, input_count, i
+
+        parse_response_messages = .false.
+        count = 0
+        allocate(messages(0))
+        position = json_key(text, 'input', 1)
+        if (position == 0) return
+        if (position > len(text)) return
+        if (text(position:position) == '[') then
+            if (.not. parse_message_array(text, 'input', input_messages, input_count)) return
+        else if (text(position:position) == '"') then
+            allocate(input_messages(1))
+            call input_messages(1)%role%set('user')
+            if (.not. json_string(text, position, input_messages(1)%content, after)) return
+            call input_messages(1)%reasoning_content%clear()
+            input_count = 1
+        else
+            return
+        end if
+
+        instructions = json_string_value(text, 'instructions', '')
+        if (len(instructions) > 0) then
+            allocate(grown(input_count + 1))
+            call instruction%role%set('system')
+            call instruction%content%set(instructions)
+            call instruction%reasoning_content%clear()
+            grown(1) = instruction
+            if (input_count > 0) grown(2:) = input_messages(:input_count)
+            call move_alloc(grown, messages)
+            count = input_count + 1
+        else
+            deallocate(messages)
+            allocate(messages(input_count))
+            if (input_count > 0) messages = input_messages(:input_count)
+            count = input_count
+        end if
+
+        do i = 1, count
+            if (messages(i)%role%as_character() == 'developer') call messages(i)%role%set('system')
+        end do
+        parse_response_messages = count > 0
+    end function parse_response_messages
 
     function format_chat(messages, count, enable_thinking) result(prompt)
         type(message_t), intent(in) :: messages(:)
@@ -684,6 +777,29 @@ contains
         okay = .true.
     end subroutine parse_http_request
 
+    integer function unix_timestamp()
+        integer, parameter :: days_in_month(12) = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        integer :: calendar(8), year, month, day, leap_days
+
+        call date_and_time(values=calendar)
+        year = calendar(1)
+        month = calendar(2)
+        day = calendar(3)
+        unix_timestamp = 0
+        do while (year > 1970)
+            year = year - 1
+            leap_days = merge(1, 0, mod(year, 4) == 0 .and. (mod(year, 100) /= 0 .or. mod(year, 400) == 0))
+            unix_timestamp = unix_timestamp + 365 + leap_days
+        end do
+        do month = 1, calendar(2) - 1
+            unix_timestamp = unix_timestamp + days_in_month(month)
+            if (month == 2 .and. mod(calendar(1), 4) == 0 .and. &
+                (mod(calendar(1), 100) /= 0 .or. mod(calendar(1), 400) == 0)) unix_timestamp = unix_timestamp + 1
+        end do
+        unix_timestamp = 86400 * (unix_timestamp + day - 1) + 3600 * calendar(5) + &
+            60 * calendar(6) + calendar(7)
+    end function unix_timestamp
+
     subroutine completion_body(model, content, reasoning, tokens, chat, stream, response)
         type(string_t), intent(in) :: model, content, reasoning
         integer, intent(in) :: tokens
@@ -693,7 +809,7 @@ contains
         integer :: clock
 
         call response%clear()
-        call system_clock(count=clock)
+        clock = unix_timestamp()
         model_json = json_escape(model)
         text_json = json_escape(content)
         if (reasoning%length() > 0) reasoning_json = json_escape(reasoning)
@@ -761,6 +877,152 @@ contains
         end if
     end subroutine completion_body
 
+    function response_json(model, content, reasoning, tokens) result(response)
+        type(string_t), intent(in) :: model, content, reasoning
+        integer, intent(in) :: tokens
+        type(string_t) :: response
+        type(string_t) :: model_json, content_json, reasoning_json
+        integer :: clock
+
+        call response%clear()
+        clock = unix_timestamp()
+        model_json = json_escape(model)
+        content_json = json_escape(content)
+        if (reasoning%length() > 0) reasoning_json = json_escape(reasoning)
+        call response%append('{"id":"fortai-native-response","object":"response","created_at":')
+        call response%append_int(clock)
+        call response%append(',"completed_at":')
+        call response%append_int(clock)
+        call response%append(',"status":"completed","model":')
+        call response%append_string(model_json)
+        call response%append(',"output":[')
+        if (reasoning%length() > 0) then
+            call response%append('{"id":"fortai-native-reasoning","type":"reasoning","status":"completed",')
+            call response%append('"summary":[{"type":"summary_text","text":')
+            call response%append_string(reasoning_json)
+            call response%append('}]},')
+        end if
+        call response%append('{"id":"fortai-native-message","type":"message","role":"assistant",')
+        call response%append('"status":"completed","content":[{"type":"output_text","text":')
+        call response%append_string(content_json)
+        call response%append(',"annotations":[]}]}')
+        call response%append('],"input":[],"instructions":null,"usage":{"input_tokens":0,"output_tokens":')
+        call response%append_int(tokens)
+        call response%append(',"total_tokens":')
+        call response%append_int(tokens)
+        call response%append('},"store":false,"fortai_backend":"fortai"}')
+    end function response_json
+
+    subroutine append_sse_event(response, event_name, payload)
+        type(string_t), intent(inout) :: response
+        character(len=*), intent(in) :: event_name
+        type(string_t), intent(in) :: payload
+        call response%append('event: ')
+        call response%append(trim(event_name))
+        call response%append(char(10))
+        call response%append('data: ')
+        call response%append_string(payload)
+        call response%append(char(10))
+        call response%append(char(10))
+    end subroutine append_sse_event
+
+    function response_stream_json(model, content, reasoning, tokens) result(response)
+        type(string_t), intent(in) :: model, content, reasoning
+        integer, intent(in) :: tokens
+        type(string_t) :: response, payload, escaped, final_response
+        integer :: text_index, clock
+
+        call response%clear()
+        clock = unix_timestamp()
+        call payload%set('{"type":"response.created","response":{"id":"fortai-native-response",')
+        call payload%append('"object":"response","created_at":')
+        call payload%append_int(clock)
+        call payload%append(',"status":"in_progress","completed_at":null,"model":')
+        call payload%append_string(json_escape(model))
+        call payload%append(',"output":[],"usage":null}}')
+        call append_sse_event(response, 'response.created', payload)
+        call payload%set('{"type":"response.in_progress","response":{"id":"fortai-native-response",')
+        call payload%append('"object":"response","created_at":')
+        call payload%append_int(clock)
+        call payload%append(',"status":"in_progress","completed_at":null,"model":')
+        call payload%append_string(json_escape(model))
+        call payload%append(',"output":[],"usage":null}}')
+        call append_sse_event(response, 'response.in_progress', payload)
+
+        text_index = 0
+        if (reasoning%length() > 0) then
+            call payload%set('{"type":"response.output_item.added","output_index":0,"item":')
+            call payload%append('{"id":"fortai-native-reasoning","type":"reasoning","status":"in_progress",')
+            call payload%append('"summary":[]}}')
+            call append_sse_event(response, 'response.output_item.added', payload)
+            escaped = json_escape(reasoning)
+            call payload%set('{"type":"response.reasoning_summary_text.delta","item_id":"fortai-native-reasoning",')
+            call payload%append('"output_index":0,"summary_index":0,"delta":')
+            call payload%append_string(escaped)
+            call payload%append('}')
+            call append_sse_event(response, 'response.reasoning_summary_text.delta', payload)
+            call payload%set('{"type":"response.reasoning_summary_part.done","item_id":"fortai-native-reasoning",')
+            call payload%append('"output_index":0,"summary_index":0,"part":{"type":"summary_text","text":')
+            call payload%append_string(escaped)
+            call payload%append('}}')
+            call append_sse_event(response, 'response.reasoning_summary_part.done', payload)
+            call payload%set('{"type":"response.output_item.done","output_index":0,"item":')
+            call payload%append('{"id":"fortai-native-reasoning","type":"reasoning","status":"completed",')
+            call payload%append('"summary":[{"type":"summary_text","text":')
+            call payload%append_string(escaped)
+            call payload%append('}]}}')
+            call append_sse_event(response, 'response.output_item.done', payload)
+            text_index = 1
+        end if
+
+        call payload%set('{"type":"response.output_item.added","output_index":')
+        call payload%append_int(text_index)
+        call payload%append(',"item":{"id":"fortai-native-message","type":"message",')
+        call payload%append('"role":"assistant","status":"in_progress","content":[]}}')
+        call append_sse_event(response, 'response.output_item.added', payload)
+        call payload%set('{"type":"response.content_part.added","item_id":"fortai-native-message",')
+        call payload%append('"output_index":')
+        call payload%append_int(text_index)
+        call payload%append(',"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}')
+        call append_sse_event(response, 'response.content_part.added', payload)
+        escaped = json_escape(content)
+        call payload%set('{"type":"response.output_text.delta","item_id":"fortai-native-message",')
+        call payload%append('"output_index":')
+        call payload%append_int(text_index)
+        call payload%append(',"content_index":0,"delta":')
+        call payload%append_string(escaped)
+        call payload%append('}')
+        call append_sse_event(response, 'response.output_text.delta', payload)
+        call payload%set('{"type":"response.output_text.done","item_id":"fortai-native-message",')
+        call payload%append('"output_index":')
+        call payload%append_int(text_index)
+        call payload%append(',"content_index":0,"text":')
+        call payload%append_string(escaped)
+        call payload%append('}')
+        call append_sse_event(response, 'response.output_text.done', payload)
+        call payload%set('{"type":"response.content_part.done","item_id":"fortai-native-message",')
+        call payload%append('"output_index":')
+        call payload%append_int(text_index)
+        call payload%append(',"content_index":0,"part":{"type":"output_text","text":')
+        call payload%append_string(escaped)
+        call payload%append(',"annotations":[]}}')
+        call append_sse_event(response, 'response.content_part.done', payload)
+        call payload%set('{"type":"response.output_item.done","output_index":')
+        call payload%append_int(text_index)
+        call payload%append(',"item":{"id":"fortai-native-message","type":"message",')
+        call payload%append('"role":"assistant","status":"completed","content":[{"type":"output_text",')
+        call payload%append('"text":')
+        call payload%append_string(escaped)
+        call payload%append(',"annotations":[]}]}}')
+        call append_sse_event(response, 'response.output_item.done', payload)
+
+        final_response = response_json(model, content, reasoning, tokens)
+        call payload%set('{"type":"response.completed","response":')
+        call payload%append_string(final_response)
+        call payload%append('}')
+        call append_sse_event(response, 'response.completed', payload)
+    end function response_stream_json
+
     integer(c_int) function fortai_native_http_handle(request, request_length, model, cuda, response, &
             response_capacity, response_length, status, content_type, content_type_capacity) &
             bind(C, name='fortai_native_http_handle')
@@ -774,9 +1036,9 @@ contains
         integer :: count, max_tokens, tokens, result_code, required
         integer(int64) :: seed
         real(real32) :: temperature
-        logical :: okay, chat, stream, enable_thinking, temperature_valid
+        logical :: okay, chat, responses, stream, enable_thinking, temperature_valid
         character(len=:), allocatable :: path_value
-        character(len=:), allocatable :: reasoning_format
+        character(len=:), allocatable :: reasoning_format, reasoning_effort
 
         response_length = 0_c_int
         status = 500_c_int
@@ -808,14 +1070,23 @@ contains
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
-        if (method%as_character() /= 'POST' .or. (path_value /= '/v1/chat/completions' .and. &
-            path_value /= '/chat/completions' .and. path_value /= '/v1/completions' .and. path_value /= '/completion')) then
+        responses = path_value == '/v1/responses'
+        if (method%as_character() /= 'POST' .or. ((path_value /= '/v1/chat/completions') .and. &
+            (path_value /= '/chat/completions') .and. (path_value /= '/v1/completions') .and. &
+            (path_value /= '/completion') .and. .not. responses)) then
             call error_body(404, 'endpoint not available', result); status = 404_c_int
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         chat = index(path_value, 'chat') > 0
-        max_tokens = json_integer(body%as_character(), 'max_tokens', json_integer(body%as_character(), 'max_completion_tokens', 128))
+        if (responses) then
+            max_tokens = json_integer(body%as_character(), 'max_output_tokens', &
+                json_integer(body%as_character(), 'max_completion_tokens', &
+                json_integer(body%as_character(), 'max_tokens', 128)))
+        else
+            max_tokens = json_integer(body%as_character(), 'max_tokens', &
+                json_integer(body%as_character(), 'max_completion_tokens', 128))
+        end if
         temperature = json_real(body%as_character(), 'temperature', 0.0_real32, temperature_valid)
         if (.not. temperature_valid .or. .not. finite_real32(temperature) .or. temperature < 0.0_real32) then
             call error_body(400, 'temperature must be a finite non-negative number', result); status = 400_c_int
@@ -829,8 +1100,22 @@ contains
         ! chat_template_kwargs, which has precedence in llama.cpp.
         enable_thinking = json_object_boolean(body%as_character(), 'chat_template_kwargs', &
             'enable_thinking', enable_thinking)
+        reasoning_effort = json_object_string_value(body%as_character(), 'reasoning', 'effort', '')
+        select case (trim(reasoning_effort))
+        case ('none', 'off')
+            enable_thinking = .false.
+        case ('minimal', 'low', 'medium', 'high', 'xhigh')
+            enable_thinking = .true.
+        end select
         reasoning_format = json_string_value(body%as_character(), 'reasoning_format', 'auto')
-        if (chat) then
+        if (responses) then
+            if (.not. parse_response_messages(body%as_character(), messages, count)) then
+                call error_body(400, 'input must contain a string or message array', result); status = 400_c_int
+                call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                    content_type, content_type_capacity, fortai_native_http_handle); return
+            end if
+            prompt = format_chat(messages, count, enable_thinking)
+        else if (chat) then
             if (.not. parse_messages(body%as_character(), messages, count)) then
                 call error_body(400, 'messages must contain role/content strings', result); status = 400_c_int
                 call copy_result(result, 'application/json', response, response_capacity, response_length, &
@@ -856,18 +1141,26 @@ contains
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
-        if (chat) then
+        if (responses .or. chat) then
             call split_reasoning(generated%as_character(), enable_thinking, reasoning_format, content, reasoning)
         else
             content = generated
             call reasoning%clear()
         end if
-        call completion_body(model_text, content, reasoning, tokens, chat, stream, result)
+        if (responses) then
+            if (stream) then
+                result = response_stream_json(model_text, content, reasoning, tokens)
+            else
+                result = response_json(model_text, content, reasoning, tokens)
+            end if
+        else
+            call completion_body(model_text, content, reasoning, tokens, chat, stream, result)
+        end if
         status = 200_c_int
         block
             character(len=32) :: mime
             mime = 'application/json'
-            if (chat .and. stream) mime = 'text/event-stream'
+            if ((chat .or. responses) .and. stream) mime = 'text/event-stream'
             call copy_result(result, mime(:len_trim(mime)), response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle)
         end block
