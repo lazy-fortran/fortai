@@ -44,11 +44,11 @@ Fortran decoder rather than being silently ignored. Successful responses
 report native prompt/completion token usage; invalid token budgets fail before
 model allocation.
 
-Split two-GPU Q4_K_XL serving uses the deterministic host-boundary CUDA path by
-default. `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1` enables the resident
-all-device bridge for diagnostics. The bridge attaches the native Q8 consumer
-stream and uses rotating CUDA events for cross-stream hand-off; it is not yet
-the production default because its end-to-end performance/determinism gate is
-still open. `FORTAI_TENSOR_SPLIT=a,b` (also accepted as
+Split two-GPU Q4_K_XL serving uses the deterministic resident CUDA bridge by
+default when flash attention is enabled. Set
+`FORTAI_DISABLE_CUDA_Q4_DEVICE_PIPELINE=1` (or the compatibility spelling
+`FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=0`) to select the host-boundary route.
+The bridge uses an explicit device fence for cross-stream hand-off on hosts
+without CUDA peer access. `FORTAI_TENSOR_SPLIT=a,b` (also accepted as
 `--tensor-split a,b`/`-ts a,b`) controls native Q4 byte placement across the two GPUs;
 fractions are normalized and invalid values fail initialization.

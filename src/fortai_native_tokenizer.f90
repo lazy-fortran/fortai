@@ -287,21 +287,27 @@ contains
         start = 1
         do while (start <= len(text))
             finish = start
-            if (iachar(text(start:start)) == iachar(' ') .and. start < len(text) .and. &
-                ascii_word_byte(iachar(text(start + 1:start + 1)))) finish = finish + 1
-            if (finish <= len(text) .and. ascii_word_byte(iachar(text(finish:finish)))) then
-                do while (finish < len(text) .and. ascii_word_byte(iachar(text(finish + 1:finish + 1))))
+            if (iachar(text(start:start)) == iachar(' ')) then
+                if (start < len(text)) then
+                    if (ascii_word_byte(iachar(text(start + 1:start + 1)))) finish = finish + 1
+                end if
+            end if
+            if (ascii_word_byte(iachar(text(finish:finish)))) then
+                do while (finish < len(text))
+                    if (.not. ascii_word_byte(iachar(text(finish + 1:finish + 1)))) exit
                     finish = finish + 1
                 end do
             else if (iachar(text(start:start)) == iachar(' ') .or. &
                     iachar(text(start:start)) == iachar(new_line('a'))) then
-                do while (finish < len(text) .and. iachar(text(finish + 1:finish + 1)) == iachar(text(start:start)))
+                do while (finish < len(text))
+                    if (iachar(text(finish + 1:finish + 1)) /= iachar(text(start:start))) exit
                     finish = finish + 1
                 end do
             else
-                do while (finish < len(text) .and. .not. ascii_word_byte(iachar(text(finish + 1:finish + 1))) .and. &
-                        iachar(text(finish + 1:finish + 1)) /= iachar(' ') .and. &
-                        iachar(text(finish + 1:finish + 1)) /= iachar(new_line('a')))
+                do while (finish < len(text))
+                    if (ascii_word_byte(iachar(text(finish + 1:finish + 1)))) exit
+                    if (iachar(text(finish + 1:finish + 1)) == iachar(' ')) exit
+                    if (iachar(text(finish + 1:finish + 1)) == iachar(new_line('a'))) exit
                     finish = finish + 1
                 end do
             end if
@@ -316,8 +322,11 @@ contains
         character(len=*), intent(in) :: text
         integer(int32), allocatable, intent(out) :: ids(:)
         integer(int32), allocatable :: work(:)
-        integer :: capacity, count, start, finish, special_end, id
+        integer :: capacity, count, start, finish, relative, special_end, id
+        integer :: marker_length, candidate, marker_position
         character(len=:), allocatable :: special
+        character(len=16), parameter :: inline_specials(6) = [character(len=16) :: &
+            '<think>', '</think>', '<tool_call>', '</tool_call>', '<tool_response>', '</tool_response>']
 
         capacity = max(32, 4 * len(text) + 8)
         allocate(work(capacity))
@@ -328,20 +337,40 @@ contains
         end if
         start = 1
         do while (start <= len(text))
-            finish = index(text(start:), '<|')
-            if (finish == 0) then
+            ! Added-token vocabularies carry Qwen's inline reasoning/tool tags
+            ! as atomic tokens even though they are not delimited by <|...|>.
+            ! Treat them like the existing control tokens; BPE over their
+            ! characters would otherwise add two tokens per tag and change the
+            ! chat prompt (notably making no-thinking requests stop at EOS).
+            relative = index(text(start:), '<|')
+            marker_length = 0
+            do candidate = 1, size(inline_specials)
+                marker_position = index(text(start:), trim(inline_specials(candidate)))
+                if (marker_position > 0 .and. (relative == 0 .or. marker_position < relative)) then
+                    relative = marker_position
+                    marker_length = len_trim(inline_specials(candidate))
+                end if
+            end do
+            if (relative == 0) then
                 call encode_plain(self, text(start:), work, count, capacity)
                 exit
             end if
-            finish = start + finish - 1
+            finish = start + relative - 1
             if (finish > start) call encode_plain(self, text(start:finish - 1), work, count, capacity)
-            special_end = index(text(finish + 2:), '|>')
-            if (special_end == 0) then
-                call encode_plain(self, text(finish:), work, count, capacity)
-                exit
+            if (marker_length > 0) then
+                special_end = finish + marker_length - 1
+            else
+                special_end = 0
+                if (finish + 2 <= len(text)) then
+                    special_end = index(text(finish + 2:), '|>')
+                    if (special_end > 0) special_end = finish + 2 + special_end
+                end if
+                if (special_end == 0) then
+                    call encode_plain(self, text(finish:), work, count, capacity)
+                    exit
+                end if
             end if
-            special_end = finish + 2 + special_end - 1
-            special = text(finish:special_end + 1)
+            special = text(finish:special_end)
             id = lookup_vocabulary(self, special)
             if (id < 0) then
                 call encode_plain(self, special, work, count, capacity)
@@ -351,7 +380,7 @@ contains
                     work(count) = int(id, int32)
                 end if
             end if
-            start = special_end + 2
+            start = special_end + 1
         end do
         if (allocated(ids)) deallocate(ids)
         allocate(ids(count))

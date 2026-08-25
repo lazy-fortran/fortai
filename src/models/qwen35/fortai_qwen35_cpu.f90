@@ -615,29 +615,39 @@ contains
         integer, intent(out) :: second_device
         character(len=8) :: split_value
         character(len=32) :: device_value
-        character(len=8) :: pipeline_value
-        integer :: split_length, device_length, pipeline_length, ios, i
+        character(len=8) :: pipeline_value, disable_pipeline_value
+        integer :: split_length, device_length, pipeline_length, disable_pipeline_length, ios, i
+        logical :: have_q4, resident_pipeline
 
         qwen35_cuda_second_requested = .false.
         second_device = device + 1
         if (.not. allocated(self%file%tensors)) return
-        ! The all-device pipeline keeps its Q8 activations and scratch on the
-        ! primary CUDA context.  Do not place every Q8 weight on the peer GPU
-        ! in that mode; the mixed Q4 bridge still distributes its own tensors,
-        ! while a peer-resident Q8 output would fail the context ownership
-        ! check and require an extra cross-device copy for every matvec.
-        pipeline_value = ''
-        call get_environment_variable('FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE', pipeline_value, &
-            length=pipeline_length)
-        if (pipeline_length > 0) then
-            if (pipeline_value(1:1) == '1') return
-        end if
+        have_q4 = .false.
         do i = 1, size(self%file%tensors)
             if (is_q4_xl_type(self%file%tensors(i)%value_type)) then
-                qwen35_cuda_second_requested = .true.
+                have_q4 = .true.
                 exit
             end if
         end do
+        if (have_q4) then
+            ! The resident mixed-Q4 path keeps Q8 activations, scratch, and
+            ! Q8 weights on the primary context.  Native MTP deliberately
+            ! stays on the host-boundary path, where splitting Q8 weights is
+            ! still useful.  The disable switch and the historical explicit
+            ! `...=0` spelling retain the old host-boundary behavior.
+            resident_pipeline = .not. native_mtp_requested() .and. self%flash_attention_enabled
+            disable_pipeline_value = ''
+            call get_environment_variable('FORTAI_DISABLE_CUDA_Q4_DEVICE_PIPELINE', &
+                disable_pipeline_value, length=disable_pipeline_length)
+            if (disable_pipeline_length > 0 .and. disable_pipeline_value(1:1) == '1') &
+                resident_pipeline = .false.
+            pipeline_value = ''
+            call get_environment_variable('FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE', pipeline_value, &
+                length=pipeline_length)
+            if (pipeline_length > 0 .and. pipeline_value(1:1) /= '1') resident_pipeline = .false.
+            if (resident_pipeline) return
+        end if
+        qwen35_cuda_second_requested = have_q4
         if (.not. qwen35_cuda_second_requested) return
         split_value = ''
         call get_environment_variable('FORTAI_CUDA_Q4_SPLIT', split_value, length=split_length)
@@ -1000,21 +1010,20 @@ contains
     subroutine setup_cuda_device_pipeline(self, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         type(status_t), intent(out) :: stat
-        integer :: i, graph_length, pipeline_length, q4_pipeline_length
+        integer :: i, graph_length, pipeline_length, q4_pipeline_length, q4_disable_length
         integer(c_size_t) :: hidden_bytes, ffn_bytes, qkv_bytes, query_bytes, key_bytes, value_bytes
         integer(c_size_t) :: core_bytes
         character(len=8) :: graph_env
         character(len=8) :: pipeline_env
-        character(len=8) :: q4_pipeline_env
+        character(len=8) :: q4_pipeline_env, q4_disable_env
 
         call stat%clear()
         self%cuda_device_pipeline = .false.
         self%cuda_graph_enabled = .false.
         self%cuda_graph_ready = .false.
         ! Native MTP consumes the target pre-output hidden state on the host
-        ! and shares the host KV implementation for its attention block.  Do
-        ! not mix that stateful hand-off with the opt-in device pipeline until
-        ! its longer-sequence oracle is closed.
+        ! and shares the host KV implementation for its attention block.  Keep
+        ! that stateful hand-off on the host-boundary path.
         if (self%mtp_active) return
         ! Q8_0 K/V caches are now first-class CUDA-resident storage.  The
         ! attention ABI carries the independent K/V flags, so mixed f16/q8
@@ -1034,15 +1043,19 @@ contains
             if (graph_env(1:graph_length) == '1') self%cuda_graph_enabled = .false.
         end if
         if (.not. self%cuda_enabled) return
-        ! Mixed-device Q4_K_XL currently uses GGML-CUDA on a second scheduler
-        ! and peer bridges.  Keep the production resident path deterministic
-        ! by using the verified host-boundary CUDA route unless explicitly
-        ! opting into the diagnostic all-device bridge.
+        ! Mixed-device Q4_K_XL uses GGML-CUDA on a second scheduler and an
+        ! explicit host bridge on hosts without peer access.  The resident
+        ! path is the production default once CUDA flash attention is active;
+        ! retain an opt-out for diagnostics and constrained deployments.
         if (self%cuda_q4_split) then
             q4_pipeline_env = ''
             call get_environment_variable('FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE', &
                 q4_pipeline_env, length=q4_pipeline_length)
-            if (q4_pipeline_length <= 0 .or. q4_pipeline_env(1:1) /= '1') return
+            q4_disable_env = ''
+            call get_environment_variable('FORTAI_DISABLE_CUDA_Q4_DEVICE_PIPELINE', &
+                q4_disable_env, length=q4_disable_length)
+            if (q4_disable_length > 0 .and. q4_disable_env(1:1) == '1') return
+            if (q4_pipeline_length > 0 .and. q4_pipeline_env(1:1) /= '1') return
         end if
         if (.not. allocated(self%layers)) then
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA device pipeline has no layers')
@@ -1973,15 +1986,20 @@ contains
         if (self%file%tensors(tensor_index)%value_type == GGML_TYPE_Q8_0) then
             call cuda_q8_matvec_device_f32(self%cuda, self%cuda_weights(tensor_index), device_input, &
                 input_elements, device_output, output_elements, stat)
-        else if (self%cuda_q4_resident .and. allocated(self%cuda_q4_weights) .and. &
-                c_associated(self%cuda_q4_weights(tensor_index)%handle)) then
+        else if (self%cuda_q4_resident) then
             ! Q4's GGML scheduler has a separate stream.  Complete the Q8
             ! producer before handing its pointer to that backend; the Q4
             ! call synchronizes its own stream before returning.
-            call self%cuda%synchronize(stat)
-            if (.not. stat%is_ok()) return
-            call cuda_q4_matvec_device(self%cuda_q4, self%cuda_q4_weights(tensor_index), device_input, &
-                input_elements, device_output, output_elements, stat)
+            if (allocated(self%cuda_q4_weights)) then
+                if (c_associated(self%cuda_q4_weights(tensor_index)%handle)) then
+                    call self%cuda%synchronize(stat)
+                    if (.not. stat%is_ok()) return
+                    call cuda_q4_matvec_device(self%cuda_q4, self%cuda_q4_weights(tensor_index), device_input, &
+                        input_elements, device_output, output_elements, stat)
+                    return
+                end if
+            end if
+            call stat%set(FORTAI_UNSUPPORTED, 'quantized tensor is not device resident')
         else
             call stat%set(FORTAI_UNSUPPORTED, 'quantized tensor is not device resident')
         end if
@@ -1998,15 +2016,18 @@ contains
         call stat%clear()
         if (is_q4_xl_type(self%file%tensors(first_index)%value_type) .and. &
                 is_q4_xl_type(self%file%tensors(second_index)%value_type) .and. &
-                self%cuda_q4_resident .and. self%cuda_q4_group_enabled .and. allocated(self%cuda_q4_weights) .and. &
-                c_associated(self%cuda_q4_weights(first_index)%handle) .and. &
-                c_associated(self%cuda_q4_weights(second_index)%handle)) then
-            call self%cuda%synchronize(stat)
-            if (.not. stat%is_ok()) return
-            call cuda_q4_matvec_device_pair(self%cuda_q4, self%cuda_q4_weights(first_index), &
-                self%cuda_q4_weights(second_index), device_input, input_elements, first_output, first_elements, &
-                second_output, second_elements, stat)
-            return
+                self%cuda_q4_resident .and. self%cuda_q4_group_enabled) then
+            if (allocated(self%cuda_q4_weights)) then
+                if (c_associated(self%cuda_q4_weights(first_index)%handle) .and. &
+                        c_associated(self%cuda_q4_weights(second_index)%handle)) then
+                    call self%cuda%synchronize(stat)
+                    if (.not. stat%is_ok()) return
+                    call cuda_q4_matvec_device_pair(self%cuda_q4, self%cuda_q4_weights(first_index), &
+                        self%cuda_q4_weights(second_index), device_input, input_elements, first_output, first_elements, &
+                        second_output, second_elements, stat)
+                    return
+                end if
+            end if
         end if
         call cuda_device_matvec(self, first_index, device_input, input_elements, first_output, first_elements, stat)
         if (.not. stat%is_ok()) return
@@ -2026,17 +2047,20 @@ contains
         if (is_q4_xl_type(self%file%tensors(first_index)%value_type) .and. &
                 is_q4_xl_type(self%file%tensors(second_index)%value_type) .and. &
                 is_q4_xl_type(self%file%tensors(third_index)%value_type) .and. self%cuda_q4_resident .and. &
-                self%cuda_q4_group_enabled .and. &
-                allocated(self%cuda_q4_weights) .and. c_associated(self%cuda_q4_weights(first_index)%handle) .and. &
-                c_associated(self%cuda_q4_weights(second_index)%handle) .and. &
-                c_associated(self%cuda_q4_weights(third_index)%handle)) then
-            call self%cuda%synchronize(stat)
-            if (.not. stat%is_ok()) return
-            call cuda_q4_matvec_device_triplet(self%cuda_q4, self%cuda_q4_weights(first_index), &
-                self%cuda_q4_weights(second_index), self%cuda_q4_weights(third_index), device_input, &
-                input_elements, first_output, first_elements, second_output, second_elements, third_output, &
-                third_elements, stat)
-            return
+                self%cuda_q4_group_enabled) then
+            if (allocated(self%cuda_q4_weights)) then
+                if (c_associated(self%cuda_q4_weights(first_index)%handle) .and. &
+                        c_associated(self%cuda_q4_weights(second_index)%handle) .and. &
+                        c_associated(self%cuda_q4_weights(third_index)%handle)) then
+                    call self%cuda%synchronize(stat)
+                    if (.not. stat%is_ok()) return
+                    call cuda_q4_matvec_device_triplet(self%cuda_q4, self%cuda_q4_weights(first_index), &
+                        self%cuda_q4_weights(second_index), self%cuda_q4_weights(third_index), device_input, &
+                        input_elements, first_output, first_elements, second_output, second_elements, third_output, &
+                        third_elements, stat)
+                    return
+                end if
+            end if
         end if
         call cuda_device_matvec(self, first_index, device_input, input_elements, first_output, first_elements, stat)
         if (.not. stat%is_ok()) return
@@ -2057,8 +2081,16 @@ contains
             call cuda_qwen35_embedding_device(self%cuda, self%cuda_weights(self%token_embedding), &
                 int(token_id, c_int64_t), device_output, output_elements, stat)
         else if (self%cuda_q4_resident) then
-            call cuda_q4_embedding_device(self%cuda_q4, self%cuda_q4_weights(self%token_embedding), &
-                int(token_id, c_int64_t), device_output, output_elements, stat)
+            ! GGML's auxiliary get-rows graph can rebind the shared quantized
+            ! weight allocation when it is first materialized.  That leaves
+            ! the resident Q4 embedding result undefined on some CUDA/ggml
+            ! combinations (the first decoded token then collapses to a
+            ! repeated low-id argmax).  Keep this tiny lookup on the verified
+            ! Fortran GGUF path and upload only the resulting hidden vector;
+            ! all subsequent matrix products remain device-resident.
+            call self%file%tensors(self%token_embedding)%get_row(token_id + 1_int64, self%x, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%upload_real(device_output, self%x, stat)
         else
             call stat%set(FORTAI_UNSUPPORTED, 'token embedding is not device resident')
         end if

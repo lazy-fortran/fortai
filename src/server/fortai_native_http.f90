@@ -9,7 +9,8 @@ module fortai_native_http
     use fortai_native_service, only: fortai_native_service_complete_text_sampling, &
         fortai_native_service_default_thinking, fortai_native_service_supports_preserve_thinking, &
         fortai_native_service_supports_reasoning_effort, fortai_native_service_mtp_available, &
-        fortai_native_service_mtp_active, fortai_native_service_external_draft_active
+        fortai_native_service_mtp_active, fortai_native_service_external_draft_active, &
+        fortai_native_service_device_pipeline
     use fortai_string, only: string_t
     implicit none
     private
@@ -2319,6 +2320,8 @@ contains
         if (path_value == '/health' .or. path_value == '/v1/health') then
             call result%append('{"status":"ok","backend":"fortai","engine":"fortai-native-qwen35","cuda":')
             call result%append_logical(cuda /= 0_c_int)
+            call result%append(',"device_pipeline":')
+            call result%append_logical(fortai_native_service_device_pipeline())
             call result%append(',"mtp_available":')
             call result%append_logical(fortai_native_service_mtp_available())
             call result%append(',"mtp_active":')
