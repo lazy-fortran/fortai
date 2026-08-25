@@ -301,7 +301,9 @@ contains
         call self % close()
         self%model_path = trim(path)
         self%max_context = 256_int64
-        if (present(max_context)) self%max_context = max_context
+        if (present(max_context)) then
+            if (max_context > 0_int64) self%max_context = max_context
+        end if
         self%persistent_openmp = .false.
         if ((fast_path_mode() == 1 .or. fast_path_mode() == 3) .and. &
             .not. native_mtp_requested()) then
@@ -372,7 +374,13 @@ contains
             'qwen35.attention.layer_norm_rms_epsilon', 1.0e-6_real32)
         self % rope_base = self % file % meta_real('qwen35.rope.freq_base', 10000000.0_real32)
         self % max_context = 256_int64
-        if (present(max_context)) self % max_context = max_context
+        if (present(max_context)) then
+            if (max_context > 0_int64) then
+                self % max_context = max_context
+            else
+                self % max_context = self % file % meta_int('qwen35.context_length', 256_int64)
+            end if
+        end if
         self%persistent_openmp = .false.
         call enable_persistent_openmp(self)
         self % bos_token = self % file % meta_int('tokenizer.ggml.bos_token_id', 0_int64)

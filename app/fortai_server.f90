@@ -212,7 +212,7 @@ contains
             case ('-c', '--ctx-size')
                 i = i + 1
                 if (i > count) then; okay = .false.; return; end if
-                if (.not. parse_integer(argument_at(i), 128, 2**20, value)) then; okay = .false.; return; end if
+                if (.not. parse_integer(argument_at(i), 0, 2**20, value)) then; okay = .false.; return; end if
                 config%context_size = value
             case ('-t', '--threads')
                 i = i + 1
@@ -363,7 +363,7 @@ contains
         okay = .true.
         call load_text_environment('FORTAI_SERVER_HOST', 'LLAMACPP_HOST', config%host)
         call load_integer_environment('FORTAI_SERVER_PORT', 'LLAMACPP_PORT', 1, 65535, config%port, okay)
-        call load_integer_environment('FORTAI_CONTEXT', 'LLAMACPP_CONTEXT', 128, 2**20, config%context_size, okay)
+        call load_integer_environment('FORTAI_CONTEXT', 'LLAMACPP_CONTEXT', 0, 2**20, config%context_size, okay)
         call load_integer_environment('FORTAI_THREADS', 'LLAMACPP_THREADS', 0, 4096, config%threads, okay)
         call load_integer_environment('FORTAI_GPU_LAYERS', 'LLAMACPP_GPU_LAYERS', 0, 8192, config%gpu_layers, okay)
         call load_integer_environment('FORTAI_MAIN_GPU', 'LLAMACPP_MAIN_GPU', 0, 255, config%main_gpu, okay)

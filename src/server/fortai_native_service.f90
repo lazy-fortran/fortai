@@ -82,7 +82,7 @@ contains
         layers = 0_c_int
         call fortai_native_service_close()
         model_path = c_string(path)
-        if (len_trim(model_path) == 0 .or. context_size <= 0 .or. threads <= 0) return
+        if (len_trim(model_path) == 0 .or. context_size < 0 .or. threads <= 0) return
         call service_model%open(trim(model_path), int(context_size, int64), stat)
         if (.not. stat%is_ok()) then
             write(error_unit, '(a)') 'fortai-native: model open failed: ' // trim(stat%message)
