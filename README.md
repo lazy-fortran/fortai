@@ -171,7 +171,7 @@ service is FortAI-owned: build
 it with `tools/build_cuda_server.sh` and launch
 `tools/fortai-server --model MODEL.gguf --port 8080`. It loads the model
 through the native Fortran Qwen3.5 runtime, initializes the FortAI CUDA
-backend, and serves `/`, `/health`, `/metrics`, `/v1/models`, `/v1/chat/completions`,
+backend, and serves `/`, `/health`, read-only `/props`, `/metrics`, `/v1/models`, `/v1/chat/completions`,
 `/v1/completions`, and the OpenAI Responses-compatible `/v1/responses` wire
 API. The root endpoint is a small llama.cpp-style chat UI. The
 server never launches `llama-server` and reports `X-FortAI-Backend: fortai`.
