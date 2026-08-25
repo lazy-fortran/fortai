@@ -10,7 +10,8 @@ module fortai_native_http
         fortai_native_service_default_thinking, fortai_native_service_supports_preserve_thinking, &
         fortai_native_service_supports_reasoning_effort, fortai_native_service_mtp_available, &
         fortai_native_service_mtp_active, fortai_native_service_external_draft_active, &
-        fortai_native_service_mtp_sidecar_active, fortai_native_service_device_pipeline
+        fortai_native_service_mtp_sidecar_active, fortai_native_service_device_pipeline, &
+        fortai_native_service_context_size
     use fortai_string, only: string_t
     implicit none
     private
@@ -2797,9 +2798,16 @@ contains
 
     subroutine server_settings_json(result)
         type(string_t), intent(inout) :: result
+        character(len=64) :: number
 
         call result%append('{')
         call append_setting(result, 'alias', 'FORTAI_SERVER_ALIAS', 'qwen', .true.)
+        call result%append(',"context":')
+        write(number, '(i0)') fortai_native_service_context_size()
+        call result%append(trim(number))
+        call append_setting(result, 'threads', 'FORTAI_THREADS', '0', .false.)
+        call append_setting(result, 'gpu_layers', 'FORTAI_GPU_LAYERS', '0', .false.)
+        call append_setting(result, 'main_gpu', 'FORTAI_MAIN_GPU', '0', .false.)
         call append_setting(result, 'parallel', 'FORTAI_PARALLEL', '1', .false.)
         call append_setting(result, 'batch', 'FORTAI_BATCH', '2048', .false.)
         call append_setting(result, 'ubatch', 'FORTAI_UBATCH', '512', .false.)

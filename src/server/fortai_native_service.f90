@@ -41,6 +41,7 @@ module fortai_native_service
     public :: fortai_native_service_external_draft_active
     public :: fortai_native_service_mtp_sidecar_active
     public :: fortai_native_service_device_pipeline
+    public :: fortai_native_service_context_size
 
 contains
 
@@ -177,6 +178,11 @@ contains
     logical function fortai_native_service_device_pipeline()
         fortai_native_service_device_pipeline = service_ready .and. service_model%cuda_device_pipeline
     end function fortai_native_service_device_pipeline
+
+    integer(int64) function fortai_native_service_context_size()
+        fortai_native_service_context_size = 0_int64
+        if (service_ready) fortai_native_service_context_size = service_model%max_context
+    end function fortai_native_service_context_size
 
     logical function native_mtp_mode_requested()
         character(len=64) :: value

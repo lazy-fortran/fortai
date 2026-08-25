@@ -278,7 +278,10 @@ contains
         type(server_config_t), intent(in) :: config
         call set_environment('FORTAI_LLAMA_FASTPATH', 'native')
         call set_environment('OMP_NUM_THREADS', int_text(config%threads))
+        call set_environment('FORTAI_THREADS', int_text(config%threads))
+        call set_environment('FORTAI_CONTEXT', int_text(config%context_size))
         call set_environment('FORTAI_GPU_LAYERS', int_text(config%gpu_layers))
+        call set_environment('FORTAI_MAIN_GPU', int_text(config%main_gpu))
         call set_environment('FORTAI_ENABLE_CUDA_GRAPH', '1')
         call set_environment('FORTAI_SERVER_ALIAS', config%alias%as_character())
     end subroutine configure_environment

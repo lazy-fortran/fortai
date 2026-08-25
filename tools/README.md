@@ -17,6 +17,8 @@ The native CLI accepts the production llama.cpp profile controls (`--alias`/
 K/V cache types, batch/ubatch, cache budget/reuse, sampler defaults, reasoning
 budget, mmproj path/offload, `--ui`/`--no-ui`, and `--no-webui`) and mirrors their
 `LLAMA_ARG_*` and legacy `LLAMACPP_*` environment variables into `FORTAI_*`.
+`/health` also reports the effective context, threads, GPU-layer count, and
+main GPU.
 As in llama.cpp, `-c 0` selects the context length stored in the GGUF.
 `/health` reports the effective values. Main Qwen K/V caches support `f16`,
 `f32`, and `q8_0`; native

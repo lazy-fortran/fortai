@@ -219,7 +219,9 @@ also accepts llama.cpp's `-np`, `-fa`, `-fit`, `-sm`, `-mg`, `-md`, `-ctk`,
 `all`/`none` GPU-layer values and `-t -1` automatic-thread spelling, so the
 same production command line can be used on a separate FortAI port while
 llama.cpp remains resident. `-c 0` uses the model's GGUF context length, just
-like llama.cpp. `split-mode
+like llama.cpp. `/health` includes the effective GGUF context size, thread
+count, GPU-layer count, and main GPU alongside the other profile settings.
+`split-mode
 none` keeps all native tensors on `main-gpu`; `layer`, `row`, and `tensor` use
 the native two-device Q4 placement policy.
 Main native K/V caches support `f32`, `f16`, and `q8_0`; q8_0 storage is
