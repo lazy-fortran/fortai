@@ -149,6 +149,10 @@ module fortai_qwen35_cpu
         real(real32), allocatable :: gdn_state(:)
         real(real32), allocatable :: key_cache(:)
         real(real32), allocatable :: value_cache(:)
+        integer(int8), allocatable :: key_cache_q8(:)
+        integer(int8), allocatable :: value_cache_q8(:)
+        real(real32), allocatable :: key_cache_q8_scales(:)
+        real(real32), allocatable :: value_cache_q8_scales(:)
         type(cuda_qwen35_recurrent_t) :: cuda_recurrent
         type(cuda_qwen35_attention_t) :: cuda_attention
     end type qwen35_cpu_layer_t
@@ -201,6 +205,8 @@ module fortai_qwen35_cpu
         real(real32), allocatable :: qkv_download_work(:)
         real(real32), allocatable :: attention_work(:)
         real(real32), allocatable :: scores(:)
+        real(real32), allocatable :: attention_key_work(:)
+        real(real32), allocatable :: attention_value_work(:)
         real(real32), allocatable :: ffn_gate_work(:)
         real(real32), allocatable :: ffn_up_work(:)
         real(real32), allocatable :: conv_work(:)
@@ -215,7 +221,9 @@ module fortai_qwen35_cpu
         integer(int8), allocatable :: quantized_input(:)
         real(real32), allocatable :: quantized_scales(:)
         type(cuda_q8_context_t) :: cuda
+        type(cuda_q8_context_t) :: cuda_second
         type(cuda_q8_weights_t), allocatable :: cuda_weights(:)
+        integer, allocatable :: cuda_weight_device(:)
         type(cuda_q4_context_t) :: cuda_q4
         type(cuda_q4_weights_t), allocatable :: cuda_q4_weights(:)
         type(c_ptr), allocatable :: cuda_attn_norm(:)
@@ -244,6 +252,8 @@ module fortai_qwen35_cpu
         logical :: cuda_graph_ready = .false.
         logical :: cuda_q4_resident = .false.
         logical :: cuda_q4_split = .false.
+        logical :: cuda_q8_split = .false.
+        logical :: cuda_q8_cpu_override = .false.
         logical :: cuda_q4_group_enabled = .true.
         logical :: fast_enabled = .false.
         logical :: fast_gpu = .false.
@@ -256,6 +266,11 @@ module fortai_qwen35_cpu
         logical :: mtp_last_draft_match = .false.
         logical :: persistent_openmp = .false.
         logical :: persistent_openmp_active = .false.
+        logical :: cache_key_q8 = .false.
+        logical :: cache_value_q8 = .false.
+        logical :: flash_attention_enabled = .true.
+        integer(int32) :: cache_type_k = 1_int32
+        integer(int32) :: cache_type_v = 1_int32
     contains
         procedure :: close => qwen35_cpu_close
         procedure :: enable_cuda => qwen35_cpu_enable_cuda
@@ -321,6 +336,10 @@ contains
             'nextn.eh_proj.weight') > 0) then
             mtp_schema = .true.
             self % layer_count = mtp_block
+        end if
+        if (native_mtp_requested()) then
+            call validate_mtp_sidecar(stat)
+            if (.not. stat%is_ok()) return
         end if
         if (native_mtp_requested() .and. .not. mtp_schema) then
             call stat%set(FORTAI_UNSUPPORTED, 'native MTP was requested but the GGUF has no NextN block')
@@ -402,6 +421,10 @@ contains
         call check_tensor_shape(self, self % output, 2, self % hidden_size, &
             self % vocabulary_size, stat)
         if (.not. stat % is_ok()) return
+        call configure_kv_cache(self, stat)
+        if (.not. stat%is_ok()) return
+        call configure_flash_attention(self, stat)
+        if (.not. stat%is_ok()) return
 
         allocate (self % layers(self % layer_count))
         do i = 1, self % layer_count
@@ -419,10 +442,7 @@ contains
                 allocate (self % layers(i) % gdn_state(self % recurrent_head_size * &
                     self % recurrent_head_size * self % recurrent_value_heads))
             else
-                allocate (self % layers(i) % key_cache(self % attention_head_size * &
-                    self % attention_heads_kv * self % max_context))
-                allocate (self % layers(i) % value_cache(self % value_length * &
-                    self % attention_heads_kv * self % max_context))
+                call allocate_attention_cache(self, self%layers(i))
             end if
         end do
 
@@ -437,10 +457,7 @@ contains
             else
                 self%mtp_available = .true.
                 self%mtp_active = native_mtp_requested()
-                allocate(self%mtp_layer%key_cache(self%attention_head_size * &
-                    self%attention_heads_kv * self%max_context))
-                allocate(self%mtp_layer%value_cache(self%value_length * &
-                    self%attention_heads_kv * self%max_context))
+                call allocate_attention_cache(self, self%mtp_layer)
             end if
         end if
 
@@ -457,6 +474,8 @@ contains
         allocate (self % attention_work(max(self % attention_heads * self % value_length, &
             self % recurrent_inner_size)))
         allocate (self % scores(self % max_context))
+        if (self%cache_key_q8) allocate(self%attention_key_work(self%attention_head_size * self%max_context))
+        if (self%cache_value_q8) allocate(self%attention_value_work(self%value_length * self%max_context))
         allocate (self % ffn_gate_work(self % feed_forward_size))
         allocate (self % ffn_up_work(self % feed_forward_size))
         allocate (self % conv_work(self % recurrent_conv_size))
@@ -475,18 +494,158 @@ contains
         call self % reset()
     end subroutine qwen35_cpu_open
 
+    subroutine configure_kv_cache(self, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        character(len=32) :: key_type, value_type
+        integer :: key_length, value_length
+
+        call stat%clear()
+        key_type = 'f16'
+        value_type = 'f16'
+        key_length = 0
+        value_length = 0
+        call get_environment_variable('FORTAI_CACHE_TYPE_K', key_type, length=key_length)
+        if (key_length <= 0) call get_environment_variable('LLAMACPP_CACHE_TYPE_K', key_type, length=key_length)
+        call get_environment_variable('FORTAI_CACHE_TYPE_V', value_type, length=value_length)
+        if (value_length <= 0) call get_environment_variable('LLAMACPP_CACHE_TYPE_V', value_type, length=value_length)
+        if (key_length <= 0) then
+            key_type = 'f16'
+            key_length = 3
+        end if
+        if (value_length <= 0) then
+            value_type = 'f16'
+            value_length = 3
+        end if
+        if (key_length > len(key_type) .or. value_length > len(value_type)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 KV cache type is too long')
+            return
+        end if
+        select case (trim(key_type(:key_length)))
+        case ('f32', 'f16')
+            self%cache_type_k = merge(0_int32, 1_int32, trim(key_type(:key_length)) == 'f32')
+        case ('q8_0')
+            self%cache_type_k = 8_int32
+            self%cache_key_q8 = .true.
+        case default
+            call stat%set(FORTAI_UNSUPPORTED, 'native K cache supports only f32, f16, and q8_0')
+            return
+        end select
+        select case (trim(value_type(:value_length)))
+        case ('f32', 'f16')
+            self%cache_type_v = merge(0_int32, 1_int32, trim(value_type(:value_length)) == 'f32')
+        case ('q8_0')
+            self%cache_type_v = 8_int32
+            self%cache_value_q8 = .true.
+        case default
+            call stat%set(FORTAI_UNSUPPORTED, 'native V cache supports only f32, f16, and q8_0')
+            return
+        end select
+        if ((self%cache_key_q8 .and. mod(self%attention_head_size, 32) /= 0) .or. &
+            (self%cache_value_q8 .and. mod(self%value_length, 32) /= 0)) then
+            call stat%set(FORTAI_UNSUPPORTED, 'native q8_0 KV cache requires 32-element head and value blocks')
+            return
+        end if
+    end subroutine configure_kv_cache
+
+    subroutine configure_flash_attention(self, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+        character(len=16) :: value
+        integer :: length
+
+        call stat%clear()
+        self%flash_attention_enabled = .true.
+        value = ''
+        call get_environment_variable('FORTAI_FLASH_ATTN', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_FLASH_ATTN', value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 flash-attention mode is too long')
+            return
+        end if
+        select case (trim(value(:length)))
+        case ('on', 'true', '1', 'yes', 'auto')
+            self%flash_attention_enabled = .true.
+        case ('off', 'false', '0', 'no')
+            self%flash_attention_enabled = .false.
+        case default
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 flash-attention mode must be on, off, or auto')
+        end select
+    end subroutine configure_flash_attention
+
+    subroutine allocate_attention_cache(self, layer)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        type(qwen35_cpu_layer_t), intent(inout) :: layer
+        integer :: key_blocks, value_blocks, key_row, value_row
+
+        key_blocks = (self%attention_head_size + 31) / 32
+        value_blocks = (self%value_length + 31) / 32
+        key_row = self%attention_head_size + 2 * key_blocks
+        value_row = self%value_length + 2 * value_blocks
+        if (self%cache_key_q8) then
+            allocate(layer%key_cache_q8(key_row * self%attention_heads_kv * self%max_context))
+            allocate(layer%key_cache_q8_scales(key_blocks * self%attention_heads_kv * self%max_context))
+        else
+            allocate(layer%key_cache(self%attention_head_size * self%attention_heads_kv * self%max_context))
+        end if
+        if (self%cache_value_q8) then
+            allocate(layer%value_cache_q8(value_row * self%attention_heads_kv * self%max_context))
+            allocate(layer%value_cache_q8_scales(value_blocks * self%attention_heads_kv * self%max_context))
+        else
+            allocate(layer%value_cache(self%value_length * self%attention_heads_kv * self%max_context))
+        end if
+    end subroutine allocate_attention_cache
+
+    logical function qwen35_cuda_second_requested(self, device, second_device)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: device
+        integer, intent(out) :: second_device
+        character(len=8) :: split_value
+        character(len=32) :: device_value
+        integer :: split_length, device_length, ios, i
+
+        qwen35_cuda_second_requested = .false.
+        second_device = device + 1
+        if (.not. allocated(self%file%tensors)) return
+        do i = 1, size(self%file%tensors)
+            if (is_q4_xl_type(self%file%tensors(i)%value_type)) then
+                qwen35_cuda_second_requested = .true.
+                exit
+            end if
+        end do
+        if (.not. qwen35_cuda_second_requested) return
+        split_value = ''
+        call get_environment_variable('FORTAI_CUDA_Q4_SPLIT', split_value, length=split_length)
+        if (split_length > 0 .and. split_value(1:1) == '0') then
+            qwen35_cuda_second_requested = .false.
+            return
+        end if
+        device_value = ''
+        call get_environment_variable('FORTAI_CUDA_Q4_SECOND_DEVICE', device_value, length=device_length)
+        if (device_length > 0) then
+            read(device_value(:min(device_length, len(device_value))), *, iostat=ios) second_device
+            if (ios /= 0) second_device = device + 1
+        end if
+        if (second_device == device) qwen35_cuda_second_requested = .false.
+    end function qwen35_cuda_second_requested
+
     subroutine qwen35_cpu_enable_cuda(self, device, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer, intent(in) :: device
         type(status_t), intent(out) :: stat
         type(status_t) :: cleanup_stat
-        integer :: i, j, rows, width, q4_device, q4_second_device
+        integer :: i, j, rows, width, q4_device, q4_second_device, q8_second_device
         integer(int64) :: q4_bytes(2)
         logical :: have_q4, q4_split
+        logical :: tensor_split_custom
+        real(real64) :: tensor_split_fraction(2), tensor_split_sum
         character(len=8) :: resident_env
         character(len=8) :: group_env
+        character(len=128) :: tensor_split_env
         integer :: resident_length
         integer :: group_length
+        integer :: tensor_split_length, tensor_split_status
 
         call stat%clear()
         self%cuda_q4_group_enabled = .true.
@@ -522,6 +681,7 @@ contains
                 call self%cuda_weights(i)%destroy(cleanup_stat)
             end do
             deallocate(self%cuda_weights)
+            if (allocated(self%cuda_weight_device)) deallocate(self%cuda_weight_device)
         end if
         if (allocated(self%cuda_q4_weights)) then
             do i = 1, size(self%cuda_q4_weights)
@@ -533,23 +693,46 @@ contains
         self%cuda_enabled = .false.
         self%cuda_q4_resident = .false.
         self%cuda_q4_split = .false.
+        self%cuda_q8_split = .false.
+        self%cuda_q8_cpu_override = .false.
+        call self%cuda_second%destroy(cleanup_stat)
         call self%cuda%destroy(cleanup_stat)
         call self%cuda%create(device, stat)
         if (.not. stat%is_ok()) return
 
+        self%cuda_q8_split = qwen35_cuda_second_requested(self, device, q8_second_device)
+        if (self%cuda_q8_split) then
+            call self%cuda_second%create(q8_second_device, stat)
+            if (.not. stat%is_ok()) then
+                call self%cuda_second%destroy(cleanup_stat)
+                call self%cuda%destroy(cleanup_stat)
+                return
+            end if
+        end if
+
         allocate(self%cuda_weights(size(self%file%tensors)))
+        allocate(self%cuda_weight_device(size(self%file%tensors)))
+        self%cuda_weight_device = 1
         do i = 1, size(self%file%tensors)
             if (self%file%tensors(i)%value_type /= GGML_TYPE_Q8_0) cycle
             if (size(self%file%tensors(i)%shape) /= 2) cycle
             width = int(self%file%tensors(i)%shape(1))
             rows = int(self%file%tensors(i)%shape(2))
-            call self%cuda_weights(i)%upload(self%cuda, self%file%tensors(i)%bytes, &
-                int(size(self%file%tensors(i)%bytes), c_size_t), rows, width, stat)
+            if (self%cuda_q8_split) then
+                self%cuda_weight_device(i) = 2
+                call self%cuda_weights(i)%upload(self%cuda_second, self%file%tensors(i)%bytes, &
+                    int(size(self%file%tensors(i)%bytes), c_size_t), rows, width, stat)
+            else
+                call self%cuda_weights(i)%upload(self%cuda, self%file%tensors(i)%bytes, &
+                    int(size(self%file%tensors(i)%bytes), c_size_t), rows, width, stat)
+            end if
             if (.not. stat%is_ok()) then
                 do j = 1, i - 1
                     call self%cuda_weights(j)%destroy(cleanup_stat)
                 end do
                 deallocate(self%cuda_weights)
+                if (allocated(self%cuda_weight_device)) deallocate(self%cuda_weight_device)
+                call self%cuda_second%destroy(cleanup_stat)
                 call self%cuda%destroy(cleanup_stat)
                 return
             end if
@@ -565,6 +748,8 @@ contains
         if (have_q4) then
             self%cuda_q4_resident = .true.
             q4_split = .true.
+            tensor_split_custom = .false.
+            tensor_split_fraction = 0.5_real64
             resident_env = ''
             call get_environment_variable('FORTAI_CUDA_Q4_SPLIT', resident_env, length=resident_length)
             if (resident_length > 0) then
@@ -581,12 +766,46 @@ contains
             end block
             if (.not. q4_split) q4_second_device = device
             self%cuda_q4_split = q4_split .and. q4_second_device /= device
+            if (self%cuda_q4_split) then
+                tensor_split_env = ''
+                call get_environment_variable('FORTAI_TENSOR_SPLIT', tensor_split_env, &
+                    length=tensor_split_length)
+                if (tensor_split_length > 0) then
+                    tensor_split_fraction = 0.0_real64
+                    tensor_split_status = 0
+                    if (tensor_split_length > len(tensor_split_env)) then
+                        tensor_split_status = 1
+                    else
+                        read(tensor_split_env(1:tensor_split_length), *, iostat=tensor_split_status) &
+                            tensor_split_fraction
+                    end if
+                    tensor_split_sum = sum(tensor_split_fraction)
+                    if (tensor_split_status /= 0 .or. any(tensor_split_fraction < 0.0_real64) .or. &
+                        tensor_split_sum <= 0.0_real64) then
+                        call stat%set(FORTAI_INVALID, &
+                            'FORTAI_TENSOR_SPLIT must contain two non-negative fractions with a positive sum')
+                        call self%cuda_q4%destroy(cleanup_stat)
+                        do j = 1, size(self%cuda_weights)
+                            call self%cuda_weights(j)%destroy(cleanup_stat)
+                        end do
+                        deallocate(self%cuda_weights)
+                        if (allocated(self%cuda_weight_device)) deallocate(self%cuda_weight_device)
+                        call self%cuda_second%destroy(cleanup_stat)
+                        call self%cuda%destroy(cleanup_stat)
+                        return
+                    end if
+                    tensor_split_fraction = tensor_split_fraction / tensor_split_sum
+                    tensor_split_custom = .true.
+                end if
+            end if
             call self%cuda_q4%create(device, q4_second_device, stat)
             if (.not. stat%is_ok()) then
                 do j = 1, size(self%cuda_weights)
                     call self%cuda_weights(j)%destroy(cleanup_stat)
                 end do
                 deallocate(self%cuda_weights)
+                if (allocated(self%cuda_weight_device)) deallocate(self%cuda_weight_device)
+                call self%cuda_second%destroy(cleanup_stat)
                 call self%cuda%destroy(cleanup_stat)
                 return
             end if
@@ -598,6 +817,17 @@ contains
                 if (is_unused_q4_tensor(self, i)) cycle
                 if (.not. q4_split) then
                     q4_device = 0
+                else if (tensor_split_custom .and. tensor_split_fraction(1) <= 0.0_real64) then
+                    q4_device = 1
+                else if (tensor_split_custom .and. tensor_split_fraction(2) <= 0.0_real64) then
+                    q4_device = 0
+                else if (tensor_split_custom) then
+                    if (real(q4_bytes(1), real64) / tensor_split_fraction(1) <= &
+                        real(q4_bytes(2), real64) / tensor_split_fraction(2)) then
+                        q4_device = 0
+                    else
+                        q4_device = 1
+                    end if
                 else
                     q4_device = 1
                     if (q4_bytes(1) <= q4_bytes(2)) q4_device = 0
@@ -617,6 +847,8 @@ contains
                         call self%cuda_weights(j)%destroy(cleanup_stat)
                     end do
                     deallocate(self%cuda_weights)
+                    if (allocated(self%cuda_weight_device)) deallocate(self%cuda_weight_device)
+                    call self%cuda_second%destroy(cleanup_stat)
                     call self%cuda%destroy(cleanup_stat)
                     return
                 end if
@@ -755,6 +987,11 @@ contains
         ! not mix that stateful hand-off with the opt-in device pipeline until
         ! its longer-sequence oracle is closed.
         if (self%mtp_active) return
+        ! Native quantized KV storage is owned by the host flash-attention
+        ! boundary. Keep this path explicit instead of allocating a second
+        ! full-precision device cache.
+        if (self%cache_key_q8 .or. self%cache_value_q8) return
+        if (.not. self%flash_attention_enabled) return
         call get_environment_variable('FORTAI_DISABLE_CUDA_DEVICE_PIPELINE', pipeline_env, length=pipeline_length)
         if (pipeline_length > 0) then
             if (pipeline_env(1:1) == '1') return
@@ -954,6 +1191,7 @@ contains
             end do
             deallocate(self%cuda_weights)
         end if
+        if (allocated(self%cuda_weight_device)) deallocate(self%cuda_weight_device)
         if (allocated(self%cuda_q4_weights)) then
             do i = 1, size(self%cuda_q4_weights)
                 call self%cuda_q4_weights(i)%destroy(cuda_stat)
@@ -961,10 +1199,13 @@ contains
             deallocate(self%cuda_q4_weights)
         end if
         call self%cuda_q4%destroy(cuda_stat)
+        call self%cuda_second%destroy(cuda_stat)
         call self%cuda%destroy(cuda_stat)
         self%cuda_enabled = .false.
         self%cuda_q4_resident = .false.
         self%cuda_q4_split = .false.
+        self%cuda_q8_split = .false.
+        self%cuda_q8_cpu_override = .false.
         call gguf_quant_cache_clear()
 
         if (allocated(self % layers)) then
@@ -977,6 +1218,12 @@ contains
                     deallocate (self % layers(i) % key_cache)
                 if (allocated(self % layers(i) % value_cache)) &
                     deallocate (self % layers(i) % value_cache)
+                if (allocated(self%layers(i)%key_cache_q8)) deallocate(self%layers(i)%key_cache_q8)
+                if (allocated(self%layers(i)%value_cache_q8)) deallocate(self%layers(i)%value_cache_q8)
+                if (allocated(self%layers(i)%key_cache_q8_scales)) &
+                    deallocate(self%layers(i)%key_cache_q8_scales)
+                if (allocated(self%layers(i)%value_cache_q8_scales)) &
+                    deallocate(self%layers(i)%value_cache_q8_scales)
             end do
             deallocate (self % layers)
         end if
@@ -984,6 +1231,10 @@ contains
         if (allocated(self%mtp_layer%gdn_state)) deallocate(self%mtp_layer%gdn_state)
         if (allocated(self%mtp_layer%key_cache)) deallocate(self%mtp_layer%key_cache)
         if (allocated(self%mtp_layer%value_cache)) deallocate(self%mtp_layer%value_cache)
+        if (allocated(self%mtp_layer%key_cache_q8)) deallocate(self%mtp_layer%key_cache_q8)
+        if (allocated(self%mtp_layer%value_cache_q8)) deallocate(self%mtp_layer%value_cache_q8)
+        if (allocated(self%mtp_layer%key_cache_q8_scales)) deallocate(self%mtp_layer%key_cache_q8_scales)
+        if (allocated(self%mtp_layer%value_cache_q8_scales)) deallocate(self%mtp_layer%value_cache_q8_scales)
         if (allocated(self % x)) deallocate (self % x)
         if (allocated(self % residual)) deallocate (self % residual)
         if (allocated(self % normalized)) deallocate (self % normalized)
@@ -996,6 +1247,8 @@ contains
         if (allocated(self % qkv_download_work)) deallocate (self % qkv_download_work)
         if (allocated(self % attention_work)) deallocate (self % attention_work)
         if (allocated(self % scores)) deallocate (self % scores)
+        if (allocated(self%attention_key_work)) deallocate(self%attention_key_work)
+        if (allocated(self%attention_value_work)) deallocate(self%attention_value_work)
         if (allocated(self % ffn_gate_work)) deallocate (self % ffn_gate_work)
         if (allocated(self % ffn_up_work)) deallocate (self % ffn_up_work)
         if (allocated(self % conv_work)) deallocate (self % conv_work)
@@ -1030,6 +1283,11 @@ contains
         self%mtp_output = 0
         self%persistent_openmp = .false.
         self%persistent_openmp_active = .false.
+        self%cache_key_q8 = .false.
+        self%cache_value_q8 = .false.
+        self%flash_attention_enabled = .true.
+        self%cache_type_k = 1_int32
+        self%cache_type_v = 1_int32
     end subroutine qwen35_cpu_close
 
     subroutine qwen35_cpu_reset(self)
@@ -1045,12 +1303,21 @@ contains
                 if (allocated(self % layers(i) % gdn_state)) self % layers(i) % gdn_state = 0.0_real32
                 if (allocated(self % layers(i) % key_cache)) self % layers(i) % key_cache = 0.0_real32
                 if (allocated(self%layers(i)%value_cache)) self%layers(i)%value_cache = 0.0_real32
+                if (allocated(self%layers(i)%key_cache_q8)) self%layers(i)%key_cache_q8 = 0_int8
+                if (allocated(self%layers(i)%value_cache_q8)) self%layers(i)%value_cache_q8 = 0_int8
+                if (allocated(self%layers(i)%key_cache_q8_scales)) self%layers(i)%key_cache_q8_scales = 0.0_real32
+                if (allocated(self%layers(i)%value_cache_q8_scales)) &
+                    self%layers(i)%value_cache_q8_scales = 0.0_real32
                 if (self%cuda_enabled) call self%layers(i)%cuda_recurrent%reset(cuda_stat)
                 if (self%cuda_enabled) call self%layers(i)%cuda_attention%reset(cuda_stat)
             end do
         end if
         if (allocated(self%mtp_layer%key_cache)) self%mtp_layer%key_cache = 0.0_real32
         if (allocated(self%mtp_layer%value_cache)) self%mtp_layer%value_cache = 0.0_real32
+        if (allocated(self%mtp_layer%key_cache_q8)) self%mtp_layer%key_cache_q8 = 0_int8
+        if (allocated(self%mtp_layer%value_cache_q8)) self%mtp_layer%value_cache_q8 = 0_int8
+        if (allocated(self%mtp_layer%key_cache_q8_scales)) self%mtp_layer%key_cache_q8_scales = 0.0_real32
+        if (allocated(self%mtp_layer%value_cache_q8_scales)) self%mtp_layer%value_cache_q8_scales = 0.0_real32
         if (allocated(self%mtp_pending_hidden)) self%mtp_pending_hidden = 0.0_real32
         self%mtp_last_pair_position = -1_int64
         self%mtp_last_target_position = -1_int64
@@ -1128,6 +1395,41 @@ contains
         end if
     end function native_mtp_requested
 
+    subroutine validate_mtp_sidecar(stat)
+        type(status_t), intent(out) :: stat
+        character(len=4096) :: path
+        integer :: length
+        logical :: exists
+
+        call stat%clear()
+        path = ''
+        call get_environment_variable('FORTAI_DRAFT_MODEL', path, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_MODEL_DRAFT', path, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_DRAFT_MODEL', path, length=length)
+        if (length <= 0) return
+        if (length > len(path)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 MTP sidecar path is too long')
+            return
+        end if
+        inquire(file=trim(path(:length)), exist=exists)
+        if (.not. exists) call stat%set(FORTAI_INVALID, 'Qwen3.5 MTP sidecar does not exist: ' // trim(path(:length)))
+    end subroutine validate_mtp_sidecar
+
+    integer function native_mtp_limit()
+        character(len=32) :: value
+        integer :: length, ios, parsed
+
+        native_mtp_limit = 2
+        value = ''
+        call get_environment_variable('FORTAI_SPEC_DRAFT_N_MAX', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_SPEC_DRAFT_N_MAX', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_SPEC_DRAFT_N_MAX', value, length=length)
+        if (length <= 0) return
+        if (length > len(value)) return
+        read(value(:length), *, iostat=ios) parsed
+        if (ios == 0 .and. parsed >= 1 .and. parsed <= 32) native_mtp_limit = parsed
+    end function native_mtp_limit
+
     subroutine qwen35_cpu_forward_greedy(self, token_id, position, next_token, logit_sum, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id, position
@@ -1192,8 +1494,8 @@ contains
             return
         end if
         capacity = min(size(tokens), size(c_tokens))
-        if (.not. self%fast_enabled .and. self%mtp_active .and. capacity >= 2 .and. &
-            position + 1_int64 < self%max_context) then
+        if (.not. self%fast_enabled .and. self%mtp_active .and. native_mtp_limit() >= 2 .and. &
+            capacity >= 2 .and. position + 1_int64 < self%max_context) then
             call self%forward_greedy(token_id, position, tokens(1), logit_sum, stat)
             if (.not. stat%is_ok()) return
             call self%mtp_draft_greedy(tokens(1), position + 1_int64, draft_token, draft_sum, stat)
@@ -1338,6 +1640,18 @@ contains
                         int(size(self%normalized), c_int64_t))
                     call cuda_model_ffn_quantized(self, self%layers(i), size(self%normalized), &
                         self%hidden_work, stat)
+                    if (.not. stat%is_ok()) then
+                        ! Preserve service availability if a CUDA scratch
+                        ! allocation or launch is transiently unavailable.
+                        ! The independent Q8 CPU path remains the oracle.
+                        call model_matvec_pair(self, self%layers(i)%ffn_gate, self%layers(i)%ffn_up, &
+                            self%normalized, self%ffn_gate_work, self%ffn_up_work, stat)
+                        if (stat%is_ok()) then
+                            call silu_product(self%ffn_gate_work, self%ffn_up_work)
+                            call model_matvec(self, self%layers(i)%ffn_down, self%ffn_gate_work, &
+                                self%hidden_work, stat)
+                        end if
+                    end if
                 else
                     call model_matvec_pair(self, self%layers(i)%ffn_gate, self%layers(i)%ffn_up, &
                         self%normalized, self%ffn_gate_work, self%ffn_up_work, stat)
@@ -1400,8 +1714,22 @@ contains
             call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP pair dimensions are invalid')
             return
         end if
-        if (.not. allocated(self%mtp_layer%key_cache) .or. .not. allocated(self%mtp_layer%value_cache)) then
-            call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP KV cache is not allocated')
+        if (self%cache_key_q8) then
+            if (.not. allocated(self%mtp_layer%key_cache_q8)) then
+                call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP K q8 cache is not allocated')
+                return
+            end if
+        else if (.not. allocated(self%mtp_layer%key_cache)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP K cache is not allocated')
+            return
+        end if
+        if (self%cache_value_q8) then
+            if (.not. allocated(self%mtp_layer%value_cache_q8)) then
+                call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP V q8 cache is not allocated')
+                return
+            end if
+        else if (.not. allocated(self%mtp_layer%value_cache)) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP V cache is not allocated')
             return
         end if
 
@@ -1852,7 +2180,8 @@ contains
         ! A state-only recurrent handle is used when one or more projection
         ! matrices are Q4.  It owns the GDN/conv state but has no Q8 weight
         ! bundle, so only the full Q8 handle may enter the host `run` path.
-        if (self%cuda_enabled .and. all_q8_recurrent_weights(self, layer_index) .and. &
+        if (self%cuda_enabled .and. self%cuda_device_pipeline .and. &
+                all_q8_recurrent_weights(self, layer_index) .and. &
                 c_associated(self%layers(layer_index)%cuda_recurrent%handle)) then
             if (mod(size(input), 32) /= 0) then
                 call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA recurrent input is not block aligned')
@@ -1866,26 +2195,40 @@ contains
                 elapsed_ms, stat)
             return
         end if
+        self%cuda_q8_cpu_override = .true.
         if (cuda_recurrent_projection_ready(self, layer)) then
             if (mod(size(input), 32) /= 0) then
                 call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA Q8 input is not block aligned')
+                self%cuda_q8_cpu_override = .false.
                 return
             end if
             call fortai_q8_quantize(input, self%quantized_input, self%quantized_scales, &
                 int(size(input), c_int64_t))
             call cuda_model_matvec_pair_quantized(self, layer%attn_qkv, layer%attn_gate, size(input), &
                 self%qkv_work(1:self%recurrent_conv_size), self%gate_work(1:self%recurrent_inner_size), stat)
-            if (.not. stat%is_ok()) return
+            if (.not. stat%is_ok()) then
+                self%cuda_q8_cpu_override = .false.
+                return
+            end if
             call cuda_model_matvec_pair_quantized(self, layer%ssm_alpha, layer%ssm_beta, size(input), &
                 self%alpha_work, self%beta_work, stat)
-            if (.not. stat%is_ok()) return
+            if (.not. stat%is_ok()) then
+                self%cuda_q8_cpu_override = .false.
+                return
+            end if
         else
             call model_matvec_pair(self, layer%attn_qkv, layer%attn_gate, input, &
                 self%qkv_work(1:self%recurrent_conv_size), self%gate_work(1:self%recurrent_inner_size), stat)
-            if (.not. stat % is_ok()) return
+            if (.not. stat % is_ok()) then
+                self%cuda_q8_cpu_override = .false.
+                return
+            end if
             call model_matvec_pair(self, layer%ssm_alpha, layer%ssm_beta, input, &
                 self%alpha_work, self%beta_work, stat)
-            if (.not. stat % is_ok()) return
+            if (.not. stat % is_ok()) then
+                self%cuda_q8_cpu_override = .false.
+                return
+            end if
         end if
         call fortai_silu(self % gate_work, int(self % recurrent_inner_size, c_int64_t))
 
@@ -1952,6 +2295,7 @@ contains
             end do
         end do
         call model_matvec(self, layer%ssm_out, self%attention_work, self%hidden_work, stat)
+        self%cuda_q8_cpu_override = .false.
     end subroutine forward_recurrent
 
     logical function is_q4_xl_type(value_type)
@@ -2061,6 +2405,7 @@ contains
 
         cuda_recurrent_projection_ready = .false.
         if (.not. self%cuda_enabled) return
+        if (self%cuda_q8_cpu_override) return
         if (.not. allocated(self%file%tensors)) return
         if (layer%attn_qkv <= 0 .or. layer%attn_gate <= 0 .or. layer%ssm_alpha <= 0 .or. &
             layer%ssm_beta <= 0) return
@@ -2086,6 +2431,9 @@ contains
 
         cuda_ffn_ready = .false.
         if (.not. self%cuda_enabled) return
+        if (self%cuda_q8_cpu_override) return
+        if (.not. cuda_host_q8_enabled()) return
+        if (.not. cuda_fused_ffn_host_enabled()) return
         if (.not. allocated(self%cuda_weights)) return
         if (.not. allocated(self%file%tensors)) return
         if (layer%ffn_gate <= 0 .or. layer%ffn_up <= 0 .or. layer%ffn_down <= 0) return
@@ -2113,6 +2461,26 @@ contains
         cuda_ffn_ready = .true.
     end function cuda_ffn_ready
 
+    logical function cuda_host_q8_enabled()
+        character(len=8) :: value
+        integer :: length
+
+        cuda_host_q8_enabled = .true.
+        value = ''
+        call get_environment_variable('FORTAI_CUDA_Q8_HOST', value, length=length)
+        if (length > 0) cuda_host_q8_enabled = value(1:min(length, len(value))) /= '0'
+    end function cuda_host_q8_enabled
+
+    logical function cuda_fused_ffn_host_enabled()
+        character(len=8) :: value
+        integer :: length
+
+        cuda_fused_ffn_host_enabled = .false.
+        value = ''
+        call get_environment_variable('FORTAI_CUDA_Q8_FFN_FUSED', value, length=length)
+        if (length > 0) cuda_fused_ffn_host_enabled = value(1:min(length, len(value))) == '1'
+    end function cuda_fused_ffn_host_enabled
+
     logical function cuda_ffn_device_ready(self, layer)
         class(qwen35_cpu_model_t), intent(in) :: self
         type(qwen35_cpu_layer_t), intent(in) :: layer
@@ -2130,7 +2498,6 @@ contains
         integer(int64), intent(in) :: position
         type(status_t), intent(out) :: stat
         integer :: head, i, kv_head, q_offset, k_offset, v_offset
-        real(real32) :: attention_scale
 
         call stat % clear()
         call model_matvec_triplet(self, layer % attn_q, layer % attn_k, layer % attn_v, &
@@ -2151,19 +2518,12 @@ contains
         call apply_rope(self % k_work, self % attention_heads_kv, self % attention_head_size, &
             position, self % rope_dimension, self % rope_base)
         call self % layers_state_store(layer, position)
-        attention_scale = 1.0_real32 / sqrt(real(self % attention_head_size, real32))
 
         do head = 1, self % attention_heads
             kv_head = (head - 1) / (self % attention_heads / self % attention_heads_kv)
             q_offset = (head - 1) * 2 * self % attention_head_size
             v_offset = (head - 1) * self % value_length
-            call fortai_flash_attention_f16(self % q_work(q_offset + 1:), &
-                layer % key_cache(kv_head * self % attention_head_size + 1:), &
-                layer % value_cache(kv_head * self % value_length + 1:), position + 1_int64, &
-                int(self % attention_head_size * self % attention_heads_kv, c_int64_t), &
-                int(self % value_length * self % attention_heads_kv, c_int64_t), &
-                int(self % attention_head_size, c_int64_t), int(self % value_length, c_int64_t), &
-                attention_scale, self % attention_work(v_offset + 1:))
+            call run_attention(self, layer, head, kv_head, position, q_offset, v_offset)
             do i = 1, self % value_length
                 self % attention_work(v_offset + i) = self % attention_work(v_offset + i) * &
                     sigmoid(self % q_work(q_offset_for_gate(head, self % attention_head_size) + i))
@@ -2171,6 +2531,108 @@ contains
         end do
         call model_matvec(self, layer%attn_out, self%attention_work, self%hidden_work, stat)
     end subroutine forward_attention
+
+    subroutine run_attention(self, layer, head, kv_head, position, q_offset, v_offset)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        type(qwen35_cpu_layer_t), intent(inout) :: layer
+        integer, intent(in) :: head, kv_head, q_offset, v_offset
+        integer(int64), intent(in) :: position
+        integer(c_int64_t) :: key_stride, value_stride
+        real(real32) :: attention_scale
+
+        attention_scale = 1.0_real32 / sqrt(real(self%attention_head_size, real32))
+        if (.not. self%flash_attention_enabled) then
+            call scalar_attention(self, layer, head, kv_head, position, q_offset, v_offset, attention_scale)
+            return
+        end if
+        key_stride = int(self%attention_head_size * self%attention_heads_kv, c_int64_t)
+        value_stride = int(self%value_length * self%attention_heads_kv, c_int64_t)
+        if (self%cache_key_q8) then
+            call dequantize_attention_cache(self, layer, kv_head, position, .true., self%attention_key_work)
+            key_stride = int(self%attention_head_size, c_int64_t)
+        end if
+        if (self%cache_value_q8) then
+            call dequantize_attention_cache(self, layer, kv_head, position, .false., self%attention_value_work)
+            value_stride = int(self%value_length, c_int64_t)
+        end if
+        if (self%cache_key_q8) then
+            if (self%cache_value_q8) then
+                call fortai_flash_attention_f16(self%q_work(q_offset + 1:), self%attention_key_work, &
+                    self%attention_value_work, position + 1_int64, key_stride, value_stride, &
+                    int(self%attention_head_size, c_int64_t), int(self%value_length, c_int64_t), &
+                    attention_scale, self%attention_work(v_offset + 1:))
+            else
+                call fortai_flash_attention_f16(self%q_work(q_offset + 1:), self%attention_key_work, &
+                    layer%value_cache(kv_head * self%value_length + 1:), position + 1_int64, key_stride, &
+                    value_stride, int(self%attention_head_size, c_int64_t), int(self%value_length, c_int64_t), &
+                    attention_scale, self%attention_work(v_offset + 1:))
+            end if
+        else if (self%cache_value_q8) then
+            call fortai_flash_attention_f16(self%q_work(q_offset + 1:), &
+                layer%key_cache(kv_head * self%attention_head_size + 1:), self%attention_value_work, &
+                position + 1_int64, key_stride, value_stride, int(self%attention_head_size, c_int64_t), &
+                int(self%value_length, c_int64_t), attention_scale, self%attention_work(v_offset + 1:))
+        else
+            call fortai_flash_attention_f16(self%q_work(q_offset + 1:), &
+                layer%key_cache(kv_head * self%attention_head_size + 1:), &
+                layer%value_cache(kv_head * self%value_length + 1:), position + 1_int64, key_stride, &
+                value_stride, int(self%attention_head_size, c_int64_t), int(self%value_length, c_int64_t), &
+                attention_scale, self%attention_work(v_offset + 1:))
+        end if
+    end subroutine run_attention
+
+    subroutine scalar_attention(self, layer, head, kv_head, position, q_offset, v_offset, scale)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        type(qwen35_cpu_layer_t), intent(in) :: layer
+        integer, intent(in) :: head, kv_head, q_offset, v_offset
+        integer(int64), intent(in) :: position
+        real(real32), intent(in) :: scale
+        integer :: current_position, i, j, key_index, value_index
+        real(real32) :: dot, maximum, normalizer, weight
+
+        if (self%cache_key_q8) call dequantize_attention_cache(self, layer, kv_head, position, .true., &
+            self%attention_key_work)
+        if (self%cache_value_q8) call dequantize_attention_cache(self, layer, kv_head, position, .false., &
+            self%attention_value_work)
+        maximum = -huge(0.0_real32)
+        do current_position = 0, int(position)
+            dot = 0.0_real32
+            do j = 1, self%attention_head_size
+                if (self%cache_key_q8) then
+                    key_index = current_position * self%attention_head_size + j
+                    dot = dot + self%q_work(q_offset + j) * self%attention_key_work(key_index)
+                else
+                    key_index = current_position * self%attention_head_size * self%attention_heads_kv + &
+                        kv_head * self%attention_head_size + j
+                    dot = dot + self%q_work(q_offset + j) * layer%key_cache(key_index)
+                end if
+            end do
+            self%scores(current_position + 1) = dot * scale
+            maximum = max(maximum, self%scores(current_position + 1))
+        end do
+        normalizer = 0.0_real32
+        do current_position = 0, int(position)
+            self%scores(current_position + 1) = exp(self%scores(current_position + 1) - maximum)
+            normalizer = normalizer + self%scores(current_position + 1)
+        end do
+        self%attention_work(v_offset + 1:v_offset + self%value_length) = 0.0_real32
+        if (normalizer <= 0.0_real32) return
+        do current_position = 0, int(position)
+            weight = self%scores(current_position + 1) / normalizer
+            do i = 1, self%value_length
+                if (self%cache_value_q8) then
+                    value_index = current_position * self%value_length + i
+                    self%attention_work(v_offset + i) = self%attention_work(v_offset + i) + &
+                        weight * self%attention_value_work(value_index)
+                else
+                    value_index = current_position * self%value_length * self%attention_heads_kv + &
+                        kv_head * self%value_length + i
+                    self%attention_work(v_offset + i) = self%attention_work(v_offset + i) + &
+                        weight * layer%value_cache(value_index)
+                end if
+            end do
+        end do
+    end subroutine scalar_attention
 
     subroutine bind_layer(self, layer_number, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
@@ -2421,6 +2883,17 @@ contains
         cuda_q4_single_ready = .true.
     end function cuda_q4_single_ready
 
+    logical function cuda_q8_on_second(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+
+        cuda_q8_on_second = .false.
+        if (.not. self%cuda_q8_split) return
+        if (.not. allocated(self%cuda_weight_device)) return
+        if (tensor_index <= 0 .or. tensor_index > size(self%cuda_weight_device)) return
+        cuda_q8_on_second = self%cuda_weight_device(tensor_index) == 2
+    end function cuda_q8_on_second
+
     logical function cpu_q4_pair_ready(self, first_index, second_index, input)
         class(qwen35_cpu_model_t), intent(in) :: self
         integer, intent(in) :: first_index, second_index
@@ -2528,7 +3001,9 @@ contains
             return
         end if
         if (self % file % tensors(tensor_index) % value_type == GGML_TYPE_Q8_0) then
-            if (self%cuda_enabled .and. size(self%file%tensors(tensor_index)%shape) == 2) then
+        if (self%cuda_enabled .and. cuda_host_q8_enabled() .and. &
+                .not. self%cuda_q8_cpu_override .and. &
+                size(self%file%tensors(tensor_index)%shape) == 2) then
                 if (mod(size(input), 32) /= 0) then
                     call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA Q8 input is not block aligned')
                     return
@@ -2536,6 +3011,10 @@ contains
                 call fortai_q8_quantize(input, self%quantized_input, self%quantized_scales, &
                     int(size(input), c_int64_t))
                 call cuda_model_matvec_quantized(self, tensor_index, size(input), output, stat)
+                if (.not. stat%is_ok()) then
+                    call self%file%tensors(tensor_index)%matvec_q8(input, output, &
+                        self%quantized_input, self%quantized_scales, stat, self%persistent_openmp_active)
+                end if
                 return
             end if
             call self % file % tensors(tensor_index) % matvec_q8(input, output, &
@@ -2581,7 +3060,7 @@ contains
         end if
         if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &
             self%file%tensors(second_index)%value_type == GGML_TYPE_Q8_0) then
-            if (self%cuda_enabled) then
+            if (self%cuda_enabled .and. cuda_host_q8_enabled() .and. .not. self%cuda_q8_cpu_override) then
                 if (size(self%file%tensors(first_index)%shape) == 2) then
                     if (size(self%file%tensors(second_index)%shape) == 2) then
                         if (mod(size(input), 32) /= 0) then
@@ -2592,6 +3071,11 @@ contains
                             int(size(input), c_int64_t))
                         call cuda_model_matvec_pair_quantized(self, first_index, second_index, size(input), &
                             first_output, second_output, stat)
+                        if (.not. stat%is_ok()) then
+                            call self%file%tensors(first_index)%matvec_pair_q8( &
+                                self%file%tensors(second_index), input, first_output, second_output, &
+                                self%quantized_input, self%quantized_scales, stat, self%persistent_openmp_active)
+                        end if
                         return
                     end if
                 end if
@@ -2644,7 +3128,7 @@ contains
         if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &
             self%file%tensors(second_index)%value_type == GGML_TYPE_Q8_0 .and. &
             self%file%tensors(third_index)%value_type == GGML_TYPE_Q8_0) then
-            if (self%cuda_enabled) then
+            if (self%cuda_enabled .and. cuda_host_q8_enabled() .and. .not. self%cuda_q8_cpu_override) then
                 if (size(self%file%tensors(first_index)%shape) == 2) then
                     if (size(self%file%tensors(second_index)%shape) == 2) then
                         if (size(self%file%tensors(third_index)%shape) == 2) then
@@ -2656,6 +3140,12 @@ contains
                                 int(size(input), c_int64_t))
                             call cuda_model_matvec_triplet_quantized(self, first_index, second_index, third_index, &
                                 size(input), first_output, second_output, third_output, stat)
+                            if (.not. stat%is_ok()) then
+                                call self%file%tensors(first_index)%matvec_triplet_q8( &
+                                    self%file%tensors(second_index), self%file%tensors(third_index), input, &
+                                    first_output, second_output, third_output, self%quantized_input, &
+                                    self%quantized_scales, stat, self%persistent_openmp_active)
+                            end if
                             return
                         end if
                     end if
@@ -2702,9 +3192,15 @@ contains
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
             return
         end if
-        call cuda_q8_matvec_host(self%cuda, self%cuda_weights(tensor_index), &
-            self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), &
-            output, int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms, stat)
+        if (cuda_q8_on_second(self, tensor_index)) then
+            call cuda_q8_matvec_host(self%cuda_second, self%cuda_weights(tensor_index), &
+                self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), output, &
+                int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms, stat)
+        else
+            call cuda_q8_matvec_host(self%cuda, self%cuda_weights(tensor_index), &
+                self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), &
+                output, int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms, stat)
+        end if
     end subroutine cuda_model_matvec_quantized
 
     subroutine cuda_model_matvec_pair_quantized(self, first_index, second_index, input_size, &
@@ -2746,11 +3242,25 @@ contains
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
             return
         end if
-        call cuda_q8_matvec_host_pair(self%cuda, self%cuda_weights(first_index), &
-            self%cuda_weights(second_index), self%quantized_input(1:activation_bytes), &
-            int(activation_bytes, c_size_t), first_output, &
-            int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
-            int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), elapsed_ms, stat)
+        if (cuda_q8_on_second(self, first_index) .eqv. cuda_q8_on_second(self, second_index)) then
+            if (cuda_q8_on_second(self, first_index)) then
+                call cuda_q8_matvec_host_pair(self%cuda_second, self%cuda_weights(first_index), &
+                    self%cuda_weights(second_index), self%quantized_input(1:activation_bytes), &
+                    int(activation_bytes, c_size_t), first_output, &
+                    int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
+                    int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), elapsed_ms, stat)
+            else
+                call cuda_q8_matvec_host_pair(self%cuda, self%cuda_weights(first_index), &
+                    self%cuda_weights(second_index), self%quantized_input(1:activation_bytes), &
+                    int(activation_bytes, c_size_t), first_output, &
+                    int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
+                    int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), elapsed_ms, stat)
+            end if
+        else
+            call cuda_model_matvec_quantized(self, first_index, input_size, first_output, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_model_matvec_quantized(self, second_index, input_size, second_output, stat)
+        end if
     end subroutine cuda_model_matvec_pair_quantized
 
     subroutine cuda_model_matvec_triplet_quantized(self, first_index, second_index, third_index, input_size, &
@@ -2798,13 +3308,22 @@ contains
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA matvec dimensions do not agree')
             return
         end if
-        if (size(self%qkv_download_work) >= size(first_output) + size(second_output) + size(third_output)) then
-            call cuda_q8_matvec_host_triplet_contiguous(self%cuda, self%cuda_weights(first_index), &
-                self%cuda_weights(second_index), self%cuda_weights(third_index), &
-                self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), &
-                self%qkv_download_work, &
-                int((size(first_output) + size(second_output) + size(third_output)) * &
-                storage_size(first_output(1)) / 8, c_size_t), elapsed_ms, stat)
+        if (size(self%qkv_download_work) >= size(first_output) + size(second_output) + size(third_output) .and. &
+            cuda_q8_on_second(self, first_index) .eqv. cuda_q8_on_second(self, second_index) .and. &
+            cuda_q8_on_second(self, first_index) .eqv. cuda_q8_on_second(self, third_index)) then
+            if (cuda_q8_on_second(self, first_index)) then
+                call cuda_q8_matvec_host_triplet_contiguous(self%cuda_second, self%cuda_weights(first_index), &
+                    self%cuda_weights(second_index), self%cuda_weights(third_index), &
+                    self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), &
+                    self%qkv_download_work, int((size(first_output) + size(second_output) + size(third_output)) * &
+                    storage_size(first_output(1)) / 8, c_size_t), elapsed_ms, stat)
+            else
+                call cuda_q8_matvec_host_triplet_contiguous(self%cuda, self%cuda_weights(first_index), &
+                    self%cuda_weights(second_index), self%cuda_weights(third_index), &
+                    self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), &
+                    self%qkv_download_work, int((size(first_output) + size(second_output) + size(third_output)) * &
+                    storage_size(first_output(1)) / 8, c_size_t), elapsed_ms, stat)
+            end if
             if (stat%is_ok()) then
                 first_output = self%qkv_download_work(1:size(first_output))
                 second_output = self%qkv_download_work(size(first_output) + 1:size(first_output) + size(second_output))
@@ -2812,12 +3331,11 @@ contains
                     size(first_output) + size(second_output) + size(third_output))
             end if
         else
-            call cuda_q8_matvec_host_triplet(self%cuda, self%cuda_weights(first_index), &
-                self%cuda_weights(second_index), self%cuda_weights(third_index), &
-                self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), first_output, &
-                int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
-                int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), third_output, &
-                int(size(third_output) * storage_size(third_output(1)) / 8, c_size_t), elapsed_ms, stat)
+            call cuda_model_matvec_quantized(self, first_index, input_size, first_output, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_model_matvec_quantized(self, second_index, input_size, second_output, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_model_matvec_quantized(self, third_index, input_size, third_output, stat)
         end if
     end subroutine cuda_model_matvec_triplet_quantized
 
@@ -2851,10 +3369,28 @@ contains
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA FFN dimensions do not agree')
             return
         end if
-        call cuda_q8_ffn_host(self%cuda, self%cuda_weights(layer%ffn_gate), &
-            self%cuda_weights(layer%ffn_up), self%cuda_weights(layer%ffn_down), &
-            self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), output, &
-            int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms, stat)
+        if (cuda_q8_on_second(self, layer%ffn_gate) .eqv. cuda_q8_on_second(self, layer%ffn_up) .and. &
+            cuda_q8_on_second(self, layer%ffn_gate) .eqv. cuda_q8_on_second(self, layer%ffn_down)) then
+            if (cuda_q8_on_second(self, layer%ffn_gate)) then
+                call cuda_q8_ffn_host(self%cuda_second, self%cuda_weights(layer%ffn_gate), &
+                    self%cuda_weights(layer%ffn_up), self%cuda_weights(layer%ffn_down), &
+                    self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), output, &
+                    int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms, stat)
+            else
+                call cuda_q8_ffn_host(self%cuda, self%cuda_weights(layer%ffn_gate), &
+                    self%cuda_weights(layer%ffn_up), self%cuda_weights(layer%ffn_down), &
+                    self%quantized_input(1:activation_bytes), int(activation_bytes, c_size_t), output, &
+                    int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms, stat)
+            end if
+        else
+            call cuda_model_matvec_quantized(self, layer%ffn_gate, input_size, self%ffn_gate_work, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_model_matvec_quantized(self, layer%ffn_up, input_size, self%ffn_up_work, stat)
+            if (.not. stat%is_ok()) return
+            call fortai_silu_product(self%ffn_gate_work, self%ffn_up_work, &
+                int(size(self%ffn_gate_work), c_int64_t))
+            call cuda_model_matvec_quantized(self, layer%ffn_down, size(self%ffn_gate_work), output, stat)
+        end if
     end subroutine cuda_model_ffn_quantized
 
     subroutine rms_norm(input, weights, epsilon, output, stat)
@@ -3034,21 +3570,41 @@ contains
         class(qwen35_cpu_model_t), intent(inout) :: self
         type(qwen35_cpu_layer_t), intent(inout) :: layer
         integer(int64), intent(in) :: position
-        integer :: i, head, offset
+        integer :: i, head, offset, scale_offset, key_row, value_row, key_blocks, value_blocks
 
         do head = 1, self % attention_heads_kv
             offset = int(position) * self % attention_head_size * self % attention_heads_kv + &
                 (head - 1) * self % attention_head_size
-            do i = 1, self % attention_head_size
-                layer%key_cache(offset + i) = gguf_fp16_to_real(fortai_float_to_half( &
-                    self%k_work((head - 1) * self%attention_head_size + i)))
-            end do
+            if (self%cache_key_q8) then
+                key_blocks = (self%attention_head_size + 31) / 32
+                key_row = self%attention_head_size + 2 * key_blocks
+                offset = (int(position) * self%attention_heads_kv + head - 1) * key_row
+                scale_offset = (int(position) * self%attention_heads_kv + head - 1) * key_blocks
+                call fortai_q8_quantize(self%k_work((head - 1) * self%attention_head_size + 1:), &
+                    layer%key_cache_q8(offset + 1:), layer%key_cache_q8_scales(scale_offset + 1:), &
+                    int(self%attention_head_size, c_int64_t))
+            else
+                do i = 1, self % attention_head_size
+                    layer%key_cache(offset + i) = gguf_fp16_to_real(fortai_float_to_half( &
+                        self%k_work((head - 1) * self%attention_head_size + i)))
+                end do
+            end if
             offset = int(position) * self % value_length * self % attention_heads_kv + &
                 (head - 1) * self % value_length
-            do i = 1, self % value_length
-                layer % value_cache(offset + i) = gguf_fp16_to_real(fortai_float_to_half( &
-                    self % v_work((head - 1) * self % value_length + i)))
-            end do
+            if (self%cache_value_q8) then
+                value_blocks = (self%value_length + 31) / 32
+                value_row = self%value_length + 2 * value_blocks
+                offset = (int(position) * self%attention_heads_kv + head - 1) * value_row
+                scale_offset = (int(position) * self%attention_heads_kv + head - 1) * value_blocks
+                call fortai_q8_quantize(self%v_work((head - 1) * self%value_length + 1:), &
+                    layer%value_cache_q8(offset + 1:), layer%value_cache_q8_scales(scale_offset + 1:), &
+                    int(self%value_length, c_int64_t))
+            else
+                do i = 1, self % value_length
+                    layer % value_cache(offset + i) = gguf_fp16_to_real(fortai_float_to_half( &
+                        self % v_work((head - 1) * self % value_length + i)))
+                end do
+            end if
         end do
     end subroutine qwen35_cpu_model_layers_state_store
 
@@ -3058,17 +3614,73 @@ contains
         integer, intent(in) :: head, index
         integer, intent(in) :: position
         logical, intent(in) :: key
-        integer :: offset
+        integer :: offset, blocks, row, scale_offset, qvalue
 
         if (key) then
-            offset = position * self % attention_head_size * self % attention_heads_kv + &
-                head * self % attention_head_size + index
-            qwen35_cpu_model_layers_key_value = layer % key_cache(offset)
+            if (self%cache_key_q8) then
+                blocks = (self%attention_head_size + 31) / 32
+                row = self%attention_head_size + 2 * blocks
+                offset = (position * self%attention_heads_kv + head) * row + 2 + index
+                scale_offset = (position * self%attention_heads_kv + head) * blocks + index / 32 + 1
+                qvalue = int(layer%key_cache_q8(offset))
+                qwen35_cpu_model_layers_key_value = layer%key_cache_q8_scales(scale_offset) * real(qvalue, real32)
+            else
+                offset = position * self % attention_head_size * self % attention_heads_kv + &
+                    head * self % attention_head_size + index
+                qwen35_cpu_model_layers_key_value = layer % key_cache(offset)
+            end if
         else
-            offset = position * self % value_length * self % attention_heads_kv + &
-                head * self % value_length + index
-            qwen35_cpu_model_layers_key_value = layer % value_cache(offset)
+            if (self%cache_value_q8) then
+                blocks = (self%value_length + 31) / 32
+                row = self%value_length + 2 * blocks
+                offset = (position * self%attention_heads_kv + head) * row + 2 + index
+                scale_offset = (position * self%attention_heads_kv + head) * blocks + index / 32 + 1
+                qvalue = int(layer%value_cache_q8(offset))
+                qwen35_cpu_model_layers_key_value = layer%value_cache_q8_scales(scale_offset) * real(qvalue, real32)
+            else
+                offset = position * self % value_length * self % attention_heads_kv + &
+                    head * self % value_length + index
+                qwen35_cpu_model_layers_key_value = layer % value_cache(offset)
+            end if
         end if
     end function qwen35_cpu_model_layers_key_value
+
+    subroutine dequantize_attention_cache(self, layer, head, position, key, output)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        type(qwen35_cpu_layer_t), intent(in) :: layer
+        integer, intent(in) :: head
+        integer(int64), intent(in) :: position
+        logical, intent(in) :: key
+        real(real32), contiguous, intent(out) :: output(:)
+        integer :: width, blocks, row, scale_offset, element_offset
+        integer :: current_position, block, i
+
+        if (key) then
+            width = self%attention_head_size
+            blocks = (width + 31) / 32
+            row = width + 2 * blocks
+        else
+            width = self%value_length
+            blocks = (width + 31) / 32
+            row = width + 2 * blocks
+        end if
+        do current_position = 0, int(position)
+            element_offset = (current_position * self%attention_heads_kv + head) * row + 2
+            scale_offset = (current_position * self%attention_heads_kv + head) * blocks
+            do block = 0, blocks - 1
+                do i = 1, min(32, width - 32 * block)
+                    if (key) then
+                        output(current_position * width + block * 32 + i) = &
+                            layer%key_cache_q8_scales(scale_offset + block + 1) * &
+                            real(layer%key_cache_q8(element_offset + block * 34 + i), real32)
+                    else
+                        output(current_position * width + block * 32 + i) = &
+                            layer%value_cache_q8_scales(scale_offset + block + 1) * &
+                            real(layer%value_cache_q8(element_offset + block * 34 + i), real32)
+                    end if
+                end do
+            end do
+        end do
+    end subroutine dequantize_attention_cache
 
 end module fortai_qwen35_cpu

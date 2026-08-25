@@ -39,9 +39,8 @@ if rg -n '(^|[[:space:]])fpm (run|test|build)' "$root_dir/benchmark" "$root_dir/
     exit 1
 fi
 "$root_dir/benchmark/run_llama_cpp.sh" --dry-run >/dev/null
-forwarded_args=$(FORTAI_LLAMA_SERVER=/bin/echo "$root_dir/tools/fortai-server" --fortai-compat-test 'value with spaces')
-if [[ "$forwarded_args" != "--fortai-compat-test value with spaces" ]]; then
-    echo 'fortai-server did not forward argv unchanged' >&2
+if ! FORTAI_SERVER_BIN=/bin/true "$root_dir/tools/fortai-server" --version; then
+    echo 'fortai-server did not select the native binary' >&2
     exit 1
 fi
 "$root_dir/.provenance/fetch_models.sh" --dry-run >/dev/null

@@ -79,18 +79,16 @@ __global__ void q8_gemv_one_warp(const int8_t *__restrict__ weights,
     if (row >= rows || lane >= 32) return;
     const int8_t *row_weights = weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
     float accumulator = 0.0f;
-    for (int block = lane; block < blocks; block += 32) {
+    if (lane < 8) for (int block = 0; block < blocks; ++block) {
         const int8_t *weight_block = row_weights + block * q8_block_bytes;
         const int8_t *activation_block = activation + block * q8_activation_block_bytes;
         const float scale = block_scale(weight_block) * block_scale(activation_block);
-        int dot = 0;
-#pragma unroll
-        for (int i = 0; i < q8_block_width; i += 4)
-            dot = __dp4a(load_i32(weight_block + 2 + i),
-                load_i32(activation_block + q8_activation_data_offset + i), dot);
+        const int group = lane * 4;
+        const int dot = __dp4a(load_i32(weight_block + 2 + group),
+            load_i32(activation_block + q8_activation_data_offset + group), 0);
         accumulator = fmaf(scale, static_cast<float>(dot), accumulator);
     }
-    for (int offset = 16; offset; offset >>= 1)
+    for (int offset = 4; offset; offset >>= 1)
         accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
     if (lane == 0) output[row] = accumulator;
 }
@@ -366,24 +364,20 @@ __global__ void q8_gemv_silu_product_one_warp(const int8_t *gate_weights,
     const int8_t *up_row = up_weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
     float gate_accumulator = 0.0f;
     float up_accumulator = 0.0f;
-    for (int block = lane; block < blocks; block += 32) {
+    if (lane < 8) for (int block = 0; block < blocks; ++block) {
         const int8_t *gate_block = gate_row + block * q8_block_bytes;
         const int8_t *up_block = up_row + block * q8_block_bytes;
         const int8_t *activation_block = activation + block * q8_activation_block_bytes;
         const float gate_scale = block_scale(gate_block) * block_scale(activation_block);
         const float up_scale = block_scale(up_block) * block_scale(activation_block);
-        int gate_dot = 0;
-        int up_dot = 0;
-#pragma unroll
-        for (int i = 0; i < q8_block_width; i += 4) {
-            const int activation_values = load_i32(activation_block + q8_activation_data_offset + i);
-            gate_dot = __dp4a(load_i32(gate_block + 2 + i), activation_values, gate_dot);
-            up_dot = __dp4a(load_i32(up_block + 2 + i), activation_values, up_dot);
-        }
+        const int group = lane * 4;
+        const int activation_values = load_i32(activation_block + q8_activation_data_offset + group);
+        const int gate_dot = __dp4a(load_i32(gate_block + 2 + group), activation_values, 0);
+        const int up_dot = __dp4a(load_i32(up_block + 2 + group), activation_values, 0);
         gate_accumulator = fmaf(gate_scale, static_cast<float>(gate_dot), gate_accumulator);
         up_accumulator = fmaf(up_scale, static_cast<float>(up_dot), up_accumulator);
     }
-    for (int offset = 16; offset; offset >>= 1) {
+    for (int offset = 4; offset; offset >>= 1) {
         gate_accumulator += __shfl_down_sync(0xffffffffu, gate_accumulator, offset);
         up_accumulator += __shfl_down_sync(0xffffffffu, up_accumulator, offset);
     }

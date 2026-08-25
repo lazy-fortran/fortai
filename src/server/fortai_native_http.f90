@@ -16,6 +16,8 @@ module fortai_native_http
 
     integer, parameter :: max_generation = 32768
     integer, parameter :: max_messages = 256
+    integer(int64), save :: request_count = 0_int64
+    integer(int64), save :: generation_count = 0_int64
 
     type :: message_t
         type(string_t) :: role
@@ -475,7 +477,7 @@ contains
         logical, intent(out) :: valid
         integer :: value
 
-        value = 128
+        value = server_integer_default('FORTAI_MAX_TOKENS', 128)
         valid = .true.
         if (responses) then
             if (json_key(text, 'max_output_tokens', 1) > 0) then
@@ -598,7 +600,7 @@ contains
                     return
                 end if
                 if (text(after:after) == ',' .or. text(after:after) == '}' .or. &
-                        text(after:after) == ']') then
+                    text(after:after) == ']') then
                     json_boolean_checked = .true.
                     return
                 end if
@@ -612,7 +614,7 @@ contains
                     return
                 end if
                 if (text(after:after) == ',' .or. text(after:after) == '}' .or. &
-                        text(after:after) == ']') then
+                    text(after:after) == ']') then
                     json_boolean_checked = .false.
                     return
                 end if
@@ -1011,14 +1013,14 @@ contains
                     ! after the latest user query.  Avoid injecting empty
                     ! historical <think> blocks into those older prompts.
                     if (preserve_thinking .or. has_real_reasoning) then
-                    call prompt%append('<think>')
-                    call prompt%append(char(10))
-                    call append_trimmed_text(prompt, reasoning)
-                    call prompt%append(char(10))
-                    call prompt%append('</think>')
-                    call prompt%append(char(10))
-                    call prompt%append(char(10))
-                    call prompt%append_string(content)
+                        call prompt%append('<think>')
+                        call prompt%append(char(10))
+                        call append_trimmed_text(prompt, reasoning)
+                        call prompt%append(char(10))
+                        call prompt%append('</think>')
+                        call prompt%append(char(10))
+                        call prompt%append(char(10))
+                        call prompt%append_string(content)
                     else
                         call prompt%append_string(content)
                     end if
@@ -1556,7 +1558,7 @@ contains
                 merge(']', '}', text(first:first) == '['))
             raw_json = delimiter == last
         else if (text(first:last) == 'true' .or. text(first:last) == 'false' .or. &
-            text(first:last) == 'null') then
+                text(first:last) == 'null') then
             raw_json = .true.
         else
             raw_json = numeric_literal(text(first:last))
@@ -2075,46 +2077,46 @@ contains
 
         has_message = content%length() > 0 .or. tool_count == 0
         if (has_message) then
-        call payload%set('{"type":"response.output_item.added","output_index":')
-        call payload%append_int(text_index)
-        call payload%append(',"item":{"id":"fortai-native-message","type":"message",')
-        call payload%append('"role":"assistant","status":"in_progress","content":[]}}')
-        call append_sse_event(response, 'response.output_item.added', payload)
-        call payload%set('{"type":"response.content_part.added","item_id":"fortai-native-message",')
-        call payload%append('"output_index":')
-        call payload%append_int(text_index)
-        call payload%append(',"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}')
-        call append_sse_event(response, 'response.content_part.added', payload)
-        escaped = json_escape(content)
-        call payload%set('{"type":"response.output_text.delta","item_id":"fortai-native-message",')
-        call payload%append('"output_index":')
-        call payload%append_int(text_index)
-        call payload%append(',"content_index":0,"delta":')
-        call payload%append_string(escaped)
-        call payload%append('}')
-        call append_sse_event(response, 'response.output_text.delta', payload)
-        call payload%set('{"type":"response.output_text.done","item_id":"fortai-native-message",')
-        call payload%append('"output_index":')
-        call payload%append_int(text_index)
-        call payload%append(',"content_index":0,"text":')
-        call payload%append_string(escaped)
-        call payload%append('}')
-        call append_sse_event(response, 'response.output_text.done', payload)
-        call payload%set('{"type":"response.content_part.done","item_id":"fortai-native-message",')
-        call payload%append('"output_index":')
-        call payload%append_int(text_index)
-        call payload%append(',"content_index":0,"part":{"type":"output_text","text":')
-        call payload%append_string(escaped)
-        call payload%append(',"annotations":[]}}')
-        call append_sse_event(response, 'response.content_part.done', payload)
-        call payload%set('{"type":"response.output_item.done","output_index":')
-        call payload%append_int(text_index)
-        call payload%append(',"item":{"id":"fortai-native-message","type":"message",')
-        call payload%append('"role":"assistant","status":"completed","content":[{"type":"output_text",')
-        call payload%append('"text":')
-        call payload%append_string(escaped)
-        call payload%append(',"annotations":[]}]}}')
-        call append_sse_event(response, 'response.output_item.done', payload)
+            call payload%set('{"type":"response.output_item.added","output_index":')
+            call payload%append_int(text_index)
+            call payload%append(',"item":{"id":"fortai-native-message","type":"message",')
+            call payload%append('"role":"assistant","status":"in_progress","content":[]}}')
+            call append_sse_event(response, 'response.output_item.added', payload)
+            call payload%set('{"type":"response.content_part.added","item_id":"fortai-native-message",')
+            call payload%append('"output_index":')
+            call payload%append_int(text_index)
+            call payload%append(',"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}')
+            call append_sse_event(response, 'response.content_part.added', payload)
+            escaped = json_escape(content)
+            call payload%set('{"type":"response.output_text.delta","item_id":"fortai-native-message",')
+            call payload%append('"output_index":')
+            call payload%append_int(text_index)
+            call payload%append(',"content_index":0,"delta":')
+            call payload%append_string(escaped)
+            call payload%append('}')
+            call append_sse_event(response, 'response.output_text.delta', payload)
+            call payload%set('{"type":"response.output_text.done","item_id":"fortai-native-message",')
+            call payload%append('"output_index":')
+            call payload%append_int(text_index)
+            call payload%append(',"content_index":0,"text":')
+            call payload%append_string(escaped)
+            call payload%append('}')
+            call append_sse_event(response, 'response.output_text.done', payload)
+            call payload%set('{"type":"response.content_part.done","item_id":"fortai-native-message",')
+            call payload%append('"output_index":')
+            call payload%append_int(text_index)
+            call payload%append(',"content_index":0,"part":{"type":"output_text","text":')
+            call payload%append_string(escaped)
+            call payload%append(',"annotations":[]}}')
+            call append_sse_event(response, 'response.content_part.done', payload)
+            call payload%set('{"type":"response.output_item.done","output_index":')
+            call payload%append_int(text_index)
+            call payload%append(',"item":{"id":"fortai-native-message","type":"message",')
+            call payload%append('"role":"assistant","status":"completed","content":[{"type":"output_text",')
+            call payload%append('"text":')
+            call payload%append_string(escaped)
+            call payload%append(',"annotations":[]}]}}')
+            call append_sse_event(response, 'response.output_item.done', payload)
         end if
 
         tool_index = text_index
@@ -2199,11 +2201,14 @@ contains
         logical :: frequency_penalty_valid, top_k_valid, repeat_last_n_valid, sampling_valid
         character(len=:), allocatable :: path_value
         character(len=:), allocatable :: reasoning_format, reasoning_effort
+        integer :: reasoning_budget
 
         response_length = 0_c_int
         status = 500_c_int
+        request_count = request_count + 1_int64
         call request_text%from_c(request, int(request_length))
         call model_text%from_c(model)
+        call server_model_id(model_text)
         call parse_http_request(request_text, method, path, body, okay)
         if (.not. okay) then
             call error_body(400, 'malformed HTTP request', result); status = 400_c_int
@@ -2211,7 +2216,17 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         path_value = path%as_character()
+        if (path_value == '/metrics' .and. method%as_character() /= 'POST') then
+            call metrics_body(result, cuda); status = 200_c_int
+            call copy_result(result, 'text/plain; version=0.0.4', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
         if (path_value == '/' .or. path_value == '/ui' .or. path_value == '/index.html') then
+            if (.not. server_web_ui_enabled()) then
+                call error_body(404, 'web UI is disabled', result); status = 404_c_int
+                call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                    content_type, content_type_capacity, fortai_native_http_handle); return
+            end if
             result = web_ui(); status = 200_c_int
             call copy_result(result, 'text/html; charset=utf-8', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
@@ -2223,11 +2238,14 @@ contains
             call result%append_logical(fortai_native_service_mtp_available())
             call result%append(',"mtp_active":')
             call result%append_logical(fortai_native_service_mtp_active())
-            call result%append(',"service":"fortai-server"}'); call result%append(char(10)); status = 200_c_int
+            call result%append(',"service":"fortai-server","settings":')
+            call server_settings_json(result)
+            call result%append('}'); call result%append(char(10)); status = 200_c_int
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
-        if (path_value == '/v1/models' .and. method%as_character() /= 'POST') then
+        if ((path_value == '/v1/models' .or. index(path_value, '/v1/models/') == 1) .and. &
+            method%as_character() /= 'POST') then
             call result%append('{"object":"list","data":[{"id":'); result = append_json(result, model_text)
             call result%append(',"object":"model","owned_by":"fortai","fortai_backend":"fortai"}]}'); call result%append(char(10))
             status = 200_c_int
@@ -2250,20 +2268,25 @@ contains
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
-        temperature = json_real(body%as_character(), 'temperature', 0.0_real32, temperature_valid)
+        temperature = json_real(body%as_character(), 'temperature', server_real_default('FORTAI_TEMPERATURE', 0.0_real32), &
+            temperature_valid)
         if (.not. temperature_valid .or. .not. finite_real32(temperature) .or. temperature < 0.0_real32) then
             call error_body(400, 'temperature must be a finite non-negative number', result); status = 400_c_int
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
-        seed = json_int64(body%as_character(), 'seed', 0_int64)
-        top_k = json_integer_checked(body%as_character(), 'top_k', 20, top_k_valid)
-        repeat_last_n = json_integer_checked(body%as_character(), 'repeat_last_n', 64, repeat_last_n_valid, -1)
-        top_p = json_real(body%as_character(), 'top_p', 0.95_real32, top_p_valid)
-        min_p = json_real(body%as_character(), 'min_p', 0.0_real32, min_p_valid)
-        repeat_penalty = json_real(body%as_character(), 'repeat_penalty', 1.0_real32, repeat_penalty_valid)
-        presence_penalty = json_real(body%as_character(), 'presence_penalty', 0.0_real32, presence_penalty_valid)
-        frequency_penalty = json_real(body%as_character(), 'frequency_penalty', 0.0_real32, frequency_penalty_valid)
+        seed = json_int64(body%as_character(), 'seed', server_int64_default('FORTAI_SEED', 0_int64))
+        top_k = json_integer_checked(body%as_character(), 'top_k', server_integer_default('FORTAI_TOP_K', 20), top_k_valid)
+        repeat_last_n = json_integer_checked(body%as_character(), 'repeat_last_n', &
+            server_integer_default('FORTAI_REPEAT_LAST_N', 64), repeat_last_n_valid, -1)
+        top_p = json_real(body%as_character(), 'top_p', server_real_default('FORTAI_TOP_P', 0.95_real32), top_p_valid)
+        min_p = json_real(body%as_character(), 'min_p', server_real_default('FORTAI_MIN_P', 0.0_real32), min_p_valid)
+        repeat_penalty = json_real(body%as_character(), 'repeat_penalty', &
+            server_real_default('FORTAI_REPEAT_PENALTY', 1.0_real32), repeat_penalty_valid)
+        presence_penalty = json_real(body%as_character(), 'presence_penalty', &
+            server_real_default('FORTAI_PRESENCE_PENALTY', 0.0_real32), presence_penalty_valid)
+        frequency_penalty = json_real(body%as_character(), 'frequency_penalty', &
+            server_real_default('FORTAI_FREQUENCY_PENALTY', 0.0_real32), frequency_penalty_valid)
         sampling_valid = top_p_valid .and. min_p_valid .and. repeat_penalty_valid .and. &
             presence_penalty_valid .and. frequency_penalty_valid .and. top_k_valid .and. repeat_last_n_valid
         if (.not. sampling_valid .or. top_k < 0 .or. repeat_last_n < -1 .or. top_p <= 0.0_real32 .or. &
@@ -2328,7 +2351,8 @@ contains
         case ('low', 'medium', 'xhigh')
             if (.not. thinking_explicit) enable_thinking = .true.
         end select
-        reasoning_format = json_string_checked(body%as_character(), 'reasoning_format', 'auto', &
+        reasoning_format = json_string_checked(body%as_character(), 'reasoning_format', &
+            server_text_default('FORTAI_REASONING_FORMAT', 'auto'), &
             reasoning_format_valid, reasoning_format_found)
         if (.not. reasoning_format_valid) then
             call error_body(400, 'reasoning_format must be a string', result); status = 400_c_int
@@ -2366,6 +2390,7 @@ contains
         end if
         call reasoning_instruction%clear()
         if (supports_reasoning_effort .and. enable_thinking) then
+            reasoning_budget = server_reasoning_budget()
             if (len_trim(reasoning_effort) == 0) reasoning_effort = 'xhigh'
             select case (trim(reasoning_effort))
             case ('xhigh')
@@ -2376,6 +2401,15 @@ contains
                 call reasoning_instruction%set('Reasoning effort is set to low. Keep your thinking brief and focused, moving '&
                     // 'directly to the conclusion without unnecessary elaboration.')
             end select
+            if (reasoning_budget > 0) then
+                if (reasoning_instruction%length() == 0) then
+                    call reasoning_instruction%set('Keep hidden reasoning within a budget of ' // &
+                        integer_text(reasoning_budget) // ' tokens.')
+                else
+                    call reasoning_instruction%append(' Keep hidden reasoning within a budget of ' // &
+                        integer_text(reasoning_budget) // ' tokens.')
+                end if
+            end if
         end if
         call tools_json%clear()
         if (.not. json_array_value(body%as_character(), 'tools', tools_json)) call tools_json%clear()
@@ -2395,14 +2429,14 @@ contains
             prompt = format_chat(messages, count, enable_thinking, tools_json, reasoning_instruction, preserve_thinking)
         else
             block
-            integer :: prompt_value, after
-            prompt_value = json_key(body%as_character(), 'prompt', 1)
-            if (prompt_value == 0) prompt_value = json_key(body%as_character(), 'content', 1)
-            if (prompt_value == 0 .or. .not. json_string(body%as_character(), prompt_value, prompt, after)) then
-                call error_body(400, 'prompt must be a string', result); status = 400_c_int
-                call copy_result(result, 'application/json', response, response_capacity, response_length, &
-                    content_type, content_type_capacity, fortai_native_http_handle); return
-            end if
+                integer :: prompt_value, after
+                prompt_value = json_key(body%as_character(), 'prompt', 1)
+                if (prompt_value == 0) prompt_value = json_key(body%as_character(), 'content', 1)
+                if (prompt_value == 0 .or. .not. json_string(body%as_character(), prompt_value, prompt, after)) then
+                    call error_body(400, 'prompt must be a string', result); status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle); return
+                end if
             end block
         end if
         result_code = fortai_native_service_complete_text_sampling(prompt%as_character(), max_tokens, temperature, &
@@ -2413,6 +2447,7 @@ contains
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
+        generation_count = generation_count + 1_int64
         if (responses .or. chat) then
             call split_reasoning(generated%as_character(), enable_thinking, reasoning_format, content, reasoning)
             call parse_tool_calls(content%as_character(), clean_content, tool_calls, tool_count)
@@ -2450,6 +2485,217 @@ contains
         escaped = json_escape(value)
         call output%append_string(escaped)
     end function append_json
+
+    integer function server_reasoning_budget()
+        character(len=32) :: value
+        integer :: length, ios, parsed
+
+        server_reasoning_budget = 0
+        value = ''
+        call get_environment_variable('FORTAI_REASONING_BUDGET', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_REASONING_BUDGET', value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        read(value(:length), *, iostat=ios) parsed
+        if (ios == 0 .and. parsed > 0 .and. parsed <= max_generation) server_reasoning_budget = parsed
+    end function server_reasoning_budget
+
+    function integer_text(value) result(text)
+        integer, intent(in) :: value
+        character(len=32) :: text
+        write(text, '(i0)') value
+    end function integer_text
+
+    real(real32) function server_real_default(primary, fallback)
+        character(len=*), intent(in) :: primary
+        real(real32), intent(in) :: fallback
+        character(len=64) :: value
+        integer :: length, ios
+
+        server_real_default = fallback
+        value = ''
+        call get_environment_variable(primary, value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_' // primary(8:), value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        read(value(:length), *, iostat=ios) server_real_default
+        if (ios /= 0) server_real_default = fallback
+    end function server_real_default
+
+    integer function server_integer_default(primary, fallback)
+        character(len=*), intent(in) :: primary
+        integer, intent(in) :: fallback
+        character(len=64) :: value
+        integer :: length, ios
+
+        server_integer_default = fallback
+        value = ''
+        call get_environment_variable(primary, value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_' // primary(8:), value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        read(value(:length), *, iostat=ios) server_integer_default
+        if (ios /= 0) server_integer_default = fallback
+    end function server_integer_default
+
+    integer(int64) function server_int64_default(primary, fallback)
+        character(len=*), intent(in) :: primary
+        integer(int64), intent(in) :: fallback
+        character(len=64) :: value
+        integer :: length, ios
+
+        server_int64_default = fallback
+        value = ''
+        call get_environment_variable(primary, value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_' // primary(8:), value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        read(value(:length), *, iostat=ios) server_int64_default
+        if (ios /= 0) server_int64_default = fallback
+    end function server_int64_default
+
+    function server_text_default(primary, fallback) result(text)
+        character(len=*), intent(in) :: primary, fallback
+        character(len=:), allocatable :: text
+        character(len=4096) :: value
+        integer :: length
+
+        value = ''
+        call get_environment_variable(primary, value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_' // primary(8:), value, length=length)
+        if (length <= 0 .or. length > len(value)) then
+            text = fallback
+        else
+            text = value(:length)
+        end if
+    end function server_text_default
+
+    logical function server_web_ui_enabled()
+        character(len=16) :: value
+        integer :: length
+
+        server_web_ui_enabled = .true.
+        value = ''
+        call get_environment_variable('FORTAI_NO_WEBUI', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_NO_WEBUI', value, length=length)
+        if (length > 0 .and. length <= len(value)) then
+            server_web_ui_enabled = trim(value(:length)) /= '1' .and. trim(value(:length)) /= 'true'
+        end if
+    end function server_web_ui_enabled
+
+    subroutine metrics_body(result, cuda)
+        type(string_t), intent(out) :: result
+        integer(c_int), intent(in) :: cuda
+        character(len=64) :: number
+
+        call result%set('# HELP fortai_requests_total HTTP requests handled by FortAI.' // char(10) // &
+            '# TYPE fortai_requests_total counter' // char(10) // 'fortai_requests_total ')
+        write(number, '(i0)') request_count
+        call result%append(trim(number) // char(10) // '# HELP fortai_generation_requests_total completed generations.' // &
+            char(10) // '# TYPE fortai_generation_requests_total counter' // char(10) // &
+            'fortai_generation_requests_total ')
+        write(number, '(i0)') generation_count
+        call result%append(trim(number) // char(10) // 'fortai_cuda_enabled ')
+        call result%append(merge('1', '0', cuda /= 0_c_int) // char(10))
+    end subroutine metrics_body
+
+    subroutine server_model_id(model)
+        type(string_t), intent(inout) :: model
+        character(len=256) :: alias
+        integer :: alias_length
+
+        alias = ''
+        call get_environment_variable('FORTAI_SERVER_ALIAS', alias, length=alias_length)
+        if (alias_length > 0 .and. alias_length <= len(alias)) call model%set(alias(:alias_length))
+    end subroutine server_model_id
+
+    subroutine server_settings_json(result)
+        type(string_t), intent(inout) :: result
+
+        call result%append('{')
+        call append_setting(result, 'alias', 'FORTAI_SERVER_ALIAS', 'qwen', .true.)
+        call append_setting(result, 'parallel', 'FORTAI_PARALLEL', '1', .false.)
+        call append_setting(result, 'batch', 'FORTAI_BATCH', '2048', .false.)
+        call append_setting(result, 'ubatch', 'FORTAI_UBATCH', '512', .false.)
+        call append_setting(result, 'tensor_split', 'FORTAI_TENSOR_SPLIT', '', .true.)
+        call append_setting(result, 'split_mode', 'FORTAI_SPLIT_MODE', 'layer', .true.)
+        call append_setting(result, 'flash_attn', 'FORTAI_FLASH_ATTN', 'auto', .true.)
+        call append_setting(result, 'cache_type_k', 'FORTAI_CACHE_TYPE_K', 'f16', .true.)
+        call append_setting(result, 'cache_type_v', 'FORTAI_CACHE_TYPE_V', 'f16', .true.)
+        call append_setting(result, 'cache_type_k_draft', 'FORTAI_CACHE_TYPE_K_DRAFT', 'f16', .true.)
+        call append_setting(result, 'cache_type_v_draft', 'FORTAI_CACHE_TYPE_V_DRAFT', 'f16', .true.)
+        call append_setting(result, 'draft_model', 'FORTAI_DRAFT_MODEL', '', .true.)
+        call append_setting(result, 'spec_type', 'FORTAI_SPEC_TYPE', '', .true.)
+        call append_setting(result, 'spec_draft_n_max', 'FORTAI_SPEC_DRAFT_N_MAX', '0', .false.)
+        call append_setting(result, 'reasoning_budget', 'FORTAI_REASONING_BUDGET', '0', .false.)
+        call append_setting(result, 'mmproj', 'FORTAI_MMPROJ', '', .true.)
+        call append_setting(result, 'mmproj_offload', 'FORTAI_MMPROJ_OFFLOAD', 'true', .false.)
+        call append_setting(result, 'fit', 'FORTAI_FIT', 'auto', .true.)
+        call append_setting(result, 'cache_ram', 'FORTAI_CACHE_RAM', '0', .false.)
+        call append_setting(result, 'cache_reuse', 'FORTAI_CACHE_REUSE', '0', .false.)
+        call append_setting(result, 'n_cpu_moe', 'FORTAI_N_CPU_MOE', '0', .false.)
+        call append_setting(result, 'threads_http', 'FORTAI_THREADS_HTTP', '0', .false.)
+        call append_setting(result, 'no_context_shift', 'FORTAI_NO_CONTEXT_SHIFT', 'false', .false.)
+        call append_setting(result, 'metrics', 'FORTAI_METRICS', 'false', .false.)
+        call append_setting(result, 'log_timestamps', 'FORTAI_LOG_TIMESTAMPS', 'false', .false.)
+        call append_setting(result, 'temperature', 'FORTAI_TEMPERATURE', '0', .false.)
+        call append_setting(result, 'top_k', 'FORTAI_TOP_K', '20', .false.)
+        call append_setting(result, 'top_p', 'FORTAI_TOP_P', '0.95', .false.)
+        call append_setting(result, 'min_p', 'FORTAI_MIN_P', '0', .false.)
+        call append_setting(result, 'repeat_penalty', 'FORTAI_REPEAT_PENALTY', '1', .false.)
+        call append_setting(result, 'presence_penalty', 'FORTAI_PRESENCE_PENALTY', '0', .false.)
+        call append_setting(result, 'frequency_penalty', 'FORTAI_FREQUENCY_PENALTY', '0', .false.)
+        call append_setting(result, 'repeat_last_n', 'FORTAI_REPEAT_LAST_N', '64', .false.)
+        call append_setting(result, 'reasoning_format', 'FORTAI_REASONING_FORMAT', 'auto', .true.)
+        call append_setting(result, 'no_webui', 'FORTAI_NO_WEBUI', 'false', .false.)
+        call result%append('}')
+    end subroutine server_settings_json
+
+    subroutine append_setting(result, key, environment, fallback, quoted)
+        type(string_t), intent(inout) :: result
+        character(len=*), intent(in) :: key, environment, fallback
+        logical, intent(in) :: quoted
+        character(len=4096) :: value
+        integer :: length
+        type(string_t) :: escaped, raw
+        character(len=:), allocatable :: existing, scalar
+
+        value = ''
+        call get_environment_variable(environment, value, length=length)
+        if (length <= 0) then
+            value = fallback
+            length = len_trim(fallback)
+        else if (length > len(value)) then
+            value = fallback
+            length = len_trim(fallback)
+        end if
+        existing = result%as_character()
+        if (len(existing) > 0) then
+            if (existing(len(existing):len(existing)) /= '{') call result%append(',')
+        end if
+        call result%append('"' // key // '":')
+        if (quoted) then
+            if (length > 0) then
+                call raw%set(value(:length))
+                escaped = json_escape(raw)
+            else
+                call escaped%set('""')
+            end if
+            call result%append_string(escaped)
+        else
+            if (length <= 0) then
+                scalar = '0'
+            else
+                scalar = trim(value(:length))
+                if (len(scalar) > 0) then
+                    if (scalar(1:1) == '.') then
+                        scalar = '0' // scalar
+                    else if (len(scalar) >= 2) then
+                        if (scalar(1:2) == '-.') scalar = '-0' // scalar(2:)
+                    end if
+                else
+                    scalar = '0'
+                end if
+            end if
+            call result%append(scalar)
+        end if
+    end subroutine append_setting
 
     subroutine copy_result(result, mime, response, capacity, response_length, content_type, &
             content_type_capacity, code)
