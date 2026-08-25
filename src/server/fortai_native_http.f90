@@ -536,6 +536,78 @@ contains
         end if
     end function json_boolean
 
+    logical function json_boolean_checked(text, key, fallback, valid, found)
+        character(len=*), intent(in) :: text, key
+        logical, intent(in) :: fallback
+        logical, intent(out) :: valid, found
+        integer :: position, after
+
+        json_boolean_checked = fallback
+        valid = .true.
+        found = .false.
+        position = json_key(text, key, 1)
+        if (position == 0) return
+        found = .true.
+        position = skip_space(text, position)
+        if (position + 3 <= len(text)) then
+            if (text(position:position + 3) == 'true') then
+                after = skip_space(text, position + 4)
+                if (after > len(text)) then
+                    json_boolean_checked = .true.
+                    return
+                end if
+                if (text(after:after) == ',' .or. text(after:after) == '}' .or. &
+                        text(after:after) == ']') then
+                    json_boolean_checked = .true.
+                    return
+                end if
+            end if
+        end if
+        if (position + 4 <= len(text)) then
+            if (text(position:position + 4) == 'false') then
+                after = skip_space(text, position + 5)
+                if (after > len(text)) then
+                    json_boolean_checked = .false.
+                    return
+                end if
+                if (text(after:after) == ',' .or. text(after:after) == '}' .or. &
+                        text(after:after) == ']') then
+                    json_boolean_checked = .false.
+                    return
+                end if
+            end if
+        end if
+        valid = .false.
+        json_boolean_checked = fallback
+    end function json_boolean_checked
+
+    logical function json_object_boolean_checked(text, object_key, key, fallback, valid, found)
+        character(len=*), intent(in) :: text, object_key, key
+        logical, intent(in) :: fallback
+        logical, intent(out) :: valid, found
+        integer :: object_value, object_end
+
+        json_object_boolean_checked = fallback
+        valid = .true.
+        found = .false.
+        object_value = json_key(text, object_key, 1)
+        if (object_value == 0) return
+        if (object_value > len(text)) then
+            valid = .false.
+            return
+        end if
+        if (text(object_value:object_value) /= '{') then
+            valid = .false.
+            return
+        end if
+        object_end = matching_delimiter(text, object_value, '{', '}')
+        if (object_end == 0) then
+            valid = .false.
+            return
+        end if
+        json_object_boolean_checked = json_boolean_checked(text(object_value:object_end), key, fallback, valid, found)
+    end function json_object_boolean_checked
+
     logical function json_object_boolean(text, object_key, key, fallback)
         character(len=*), intent(in) :: text, object_key, key
         logical, intent(in) :: fallback
@@ -2053,7 +2125,8 @@ contains
         real(real32) :: temperature, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty
         logical :: okay, chat, responses, stream, enable_thinking, preserve_thinking
         logical :: reasoning_effort_valid, supports_reasoning_effort, supports_preserve_thinking
-        logical :: thinking_explicit
+        logical :: thinking_explicit, enable_thinking_valid, nested_thinking_valid, nested_thinking_found
+        logical :: preserve_thinking_valid, preserve_thinking_found
         logical :: temperature_valid, max_tokens_valid
         logical :: top_p_valid, min_p_valid, repeat_penalty_valid, presence_penalty_valid
         logical :: frequency_penalty_valid, top_k_valid, repeat_last_n_valid, sampling_valid
@@ -2130,14 +2203,25 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         stream = json_boolean(body%as_character(), 'stream', .false.)
-        thinking_explicit = json_key(body%as_character(), 'enable_thinking', 1) > 0
-        enable_thinking = json_boolean(body%as_character(), 'enable_thinking', &
-            fortai_native_service_default_thinking())
+        enable_thinking = json_boolean_checked(body%as_character(), 'enable_thinking', &
+            fortai_native_service_default_thinking(), enable_thinking_valid, thinking_explicit)
+        if (.not. enable_thinking_valid) then
+            call error_body(400, 'enable_thinking must be a boolean', result); status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
         ! OpenAI-compatible clients use both a top-level field and the
         ! llama.cpp-compatible chat_template_kwargs object.  Responses uses
         ! reasoning.effort; the latter wins when supplied.
-        enable_thinking = json_object_boolean(body%as_character(), 'chat_template_kwargs', &
-            'enable_thinking', enable_thinking)
+        enable_thinking = json_object_boolean_checked(body%as_character(), 'chat_template_kwargs', &
+            'enable_thinking', enable_thinking, nested_thinking_valid, nested_thinking_found)
+        if (.not. nested_thinking_valid) then
+            call error_body(400, 'chat_template_kwargs.enable_thinking must be a boolean', result)
+            status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        thinking_explicit = thinking_explicit .or. nested_thinking_found
         reasoning_effort = json_string_value(body%as_character(), 'reasoning_effort', '')
         reasoning_effort = json_object_string_value(body%as_character(), 'chat_template_kwargs', &
             'reasoning_effort', reasoning_effort)
@@ -2159,9 +2243,21 @@ contains
         supports_reasoning_effort = fortai_native_service_supports_reasoning_effort()
         supports_preserve_thinking = fortai_native_service_supports_preserve_thinking()
         preserve_thinking = supports_preserve_thinking
-        preserve_thinking = json_boolean(body%as_character(), 'preserve_thinking', preserve_thinking)
-        preserve_thinking = json_object_boolean(body%as_character(), 'chat_template_kwargs', &
-            'preserve_thinking', preserve_thinking)
+        preserve_thinking = json_boolean_checked(body%as_character(), 'preserve_thinking', preserve_thinking, &
+            preserve_thinking_valid, preserve_thinking_found)
+        if (.not. preserve_thinking_valid) then
+            call error_body(400, 'preserve_thinking must be a boolean', result); status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        preserve_thinking = json_object_boolean_checked(body%as_character(), 'chat_template_kwargs', &
+            'preserve_thinking', preserve_thinking, preserve_thinking_valid, preserve_thinking_found)
+        if (.not. preserve_thinking_valid) then
+            call error_body(400, 'chat_template_kwargs.preserve_thinking must be a boolean', result)
+            status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
         call reasoning_instruction%clear()
         if (supports_reasoning_effort .and. enable_thinking) then
             if (len_trim(reasoning_effort) == 0) reasoning_effort = 'xhigh'
