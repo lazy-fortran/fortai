@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# FortAI's production server entrypoint.  Keep the complete llama.cpp CLI and
-# service ABI available by forwarding argv unchanged to the locally installed
-# upstream server.  The native single-sequence runners remain useful for
-# kernel/model experiments, but they are not a replacement for the evolving
-# chat, multimodal, sampler, slot, and speculative-server surface.
-server_path="${FORTAI_LLAMA_SERVER:-${LLAMACPP_SERVER:-${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}}}"
-
-if [[ "$server_path" != */* ]]; then
-    server_path=$(command -v "$server_path" || true)
+# FortAI's native server launcher.  It never execs llama-server: the CUDA
+# binary is preferred, and the Fortran-only binary is retained for explicit
+# CPU diagnostics (`FORTAI_SERVER_BIN=...` can select either one).
+root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+server_path="${FORTAI_SERVER_BIN:-$root_dir/build/cuda/fortai_server}"
+if [[ ! -x "$server_path" ]]; then
+    server_path="$root_dir/build/fo/bin/fortai_server"
 fi
-if [[ -z "$server_path" || ! -x "$server_path" ]]; then
-    echo "FortAI compatibility server not found: ${FORTAI_LLAMA_SERVER:-${LLAMACPP_SERVER:-${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}}}" >&2
+if [[ ! -x "$server_path" ]]; then
+    echo "FortAI native server is not built; run tools/build_cuda_server.sh (CUDA) or fo build (CPU)" >&2
     exit 127
 fi
 

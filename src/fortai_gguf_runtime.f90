@@ -123,6 +123,10 @@ module fortai_gguf_runtime
     integer(int32), parameter :: GGUF_INT64 = 11_int32
     integer(int32), parameter :: GGUF_FLOAT64 = 12_int32
 
+    type, public :: gguf_string_t
+        character(len=:), allocatable :: value
+    end type gguf_string_t
+
     type, public :: gguf_meta_t
         character(len=:), allocatable :: key
         integer(int32) :: value_type = -1_int32
@@ -132,6 +136,7 @@ module fortai_gguf_runtime
         character(len=:), allocatable :: string_value
         integer(int32) :: element_type = -1_int32
         integer(int64), allocatable :: integer_values(:)
+        type(gguf_string_t), allocatable :: string_values(:)
     end type gguf_meta_t
 
     type, public :: gguf_tensor_t
@@ -273,7 +278,7 @@ contains
 
     subroutine gguf_file_close(self)
         class(gguf_file_t), intent(inout) :: self
-        integer :: i
+        integer :: i, j
 
         if (allocated(self%tensors)) then
             do i = 1, size(self%tensors)
@@ -289,6 +294,13 @@ contains
             do i = 1, size(self%metadata)
                 if (allocated(self%metadata(i)%integer_values)) &
                     deallocate (self%metadata(i)%integer_values)
+                if (allocated(self%metadata(i)%string_values)) then
+                    do j = 1, size(self%metadata(i)%string_values)
+                        if (allocated(self%metadata(i)%string_values(j)%value)) &
+                            deallocate (self%metadata(i)%string_values(j)%value)
+                    end do
+                    deallocate (self%metadata(i)%string_values)
+                end if
                 if (allocated(self%metadata(i)%string_value)) &
                     deallocate (self%metadata(i)%string_value)
                 if (allocated(self%metadata(i)%key)) deallocate (self%metadata(i)%key)
@@ -868,6 +880,12 @@ contains
                         else
                             read (unit, iostat=io_status) value%integer_values(i)
                         end if
+                    end do
+                else if (element_type == GGUF_STRING) then
+                    allocate (value%string_values(count))
+                    do i = 1, count
+                        call read_string(unit, value%string_values(i)%value, io_status)
+                        if (io_status /= 0) return
                     end do
                 else
                     do i = 1, count

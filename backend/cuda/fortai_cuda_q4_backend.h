@@ -2,6 +2,7 @@
 #define FORTAI_CUDA_Q4_BACKEND_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include "fortai_cuda_backend.h"
 
 #ifdef __cplusplus
@@ -39,6 +40,27 @@ int fortai_cuda_q4_matvec_host_triplet(fortai_cuda_q4_context *context,
     size_t activation_bytes, float *first_output, size_t first_output_bytes,
     float *second_output, size_t second_output_bytes, float *third_output,
     size_t third_output_bytes, float *elapsed_ms);
+
+/* Execute a quantized matrix-vector product without crossing the host
+ * boundary.  The activation and output pointers must be device pointers on
+ * the same CUDA device as the uploaded weights.  The GGML CUDA kernel remains
+ * the quantization-specific implementation; FortAI owns the surrounding
+ * device pipeline. */
+int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements);
+
+/* Execute up to three projections that consume the same resident activation.
+ * The implementation builds one cached GGML graph per participating device;
+ * remote weights use one peer activation copy for the whole group. */
+int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights * const *weights, const void *device_activation,
+    size_t activation_elements, void * const *device_outputs,
+    const size_t *output_elements, int count);
+
+int fortai_cuda_q4_embedding_device(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *weights, int64_t token_id,
+    void *device_output, size_t output_elements);
 
 #ifdef __cplusplus
 }

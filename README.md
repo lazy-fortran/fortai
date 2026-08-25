@@ -148,15 +148,23 @@ profile. Qwen3.8-style `mtp-*.gguf` heads are handled through llama.cpp's
 resident NextN/MTP context (the target model is loaded once and the MTP head
 shares its hidden-state path); greedy acceptance remains exact. Multimodal
 projector execution and general chat-server orchestration remain outside this
-direct single-sequence runner. For the production service, use
-`tools/fortai-server`: it resolves the configured upstream `llama-server` and
-executes it with every argument unchanged. That keeps the complete current
-llama.cpp CLI/configuration surface (chat templates, multimodal projector,
-flash attention, MTP/speculation, slots, samplers, KV/cache controls, and
-device placement) and upstream performance/memory behavior. Set
-`FORTAI_LLAMA_SERVER`, `LLAMACPP_SERVER`, or `LLAMA_SERVER` to select a binary;
-the wrapper does not choose or bind a port, so the caller's `--port` remains
-authoritative and cannot collide through an implicit default.
+direct single-sequence runner. The production service is FortAI-owned: build
+it with `tools/build_cuda_server.sh` and launch
+`tools/fortai-server --model MODEL.gguf --port 8080`. It loads the model
+through the native Fortran Qwen3.5 runtime, initializes the FortAI CUDA
+backend, and serves `/`, `/health`, `/v1/models`, `/v1/chat/completions`, and
+`/v1/completions`. The root endpoint is a small llama.cpp-style chat UI. The
+server never launches `llama-server` and reports `X-FortAI-Backend: fortai`.
+The native server owns Qwen chat formatting and decoding.  It supports
+`temperature`/`seed`, `stream`, and Qwen thinking controls (`enable_thinking`,
+`reasoning_format`) while exposing reasoning as `reasoning_content`; stop
+tokens are removed from the generated message.  Split two-GPU Q4_K_XL models
+use the deterministic host-boundary CUDA route by default; the resident
+all-device bridge remains an explicit `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1`
+diagnostic opt-in until its model-level determinism gate is closed.  Multimodal
+projector and MTP
+sidecars remain outside this direct single-sequence server rather than being
+silently delegated to another server.
 
 Benchmark results, logs, and perf data stay machine-local under
 `benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts

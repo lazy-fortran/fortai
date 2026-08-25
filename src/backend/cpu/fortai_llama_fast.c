@@ -34,6 +34,11 @@ typedef struct fortai_llama_batch {
 } fortai_llama_batch;
 
 typedef struct {
+    const char *role;
+    const char *content;
+} fortai_llama_chat_message;
+
+typedef struct {
     void *devices;
     const void *tensor_buft_overrides;
     int32_t n_gpu_layers;
@@ -112,6 +117,16 @@ typedef fortai_llama_batch (*fortai_batch_init_fn)(int32_t, int32_t, int32_t);
 typedef void (*fortai_batch_free_fn)(fortai_llama_batch);
 typedef int32_t (*fortai_decode_fn)(fortai_llama_context *, fortai_llama_batch);
 typedef float *(*fortai_logits_fn)(fortai_llama_context *, int32_t);
+typedef int32_t (*fortai_tokenize_fn)(const fortai_llama_vocab *, const char *, int32_t,
+    int32_t *, int32_t, bool, bool);
+typedef int32_t (*fortai_detokenize_fn)(const fortai_llama_vocab *, const int32_t *, int32_t,
+    char *, int32_t, bool, bool);
+typedef int32_t (*fortai_token_piece_fn)(const fortai_llama_vocab *, int32_t, char *, int32_t,
+    int32_t, bool);
+typedef bool (*fortai_vocab_is_eog_fn)(const fortai_llama_vocab *, int32_t);
+typedef const char *(*fortai_model_chat_template_fn)(const fortai_llama_model *, const char *);
+typedef int32_t (*fortai_chat_apply_template_fn)(const char *, const fortai_llama_chat_message *,
+    size_t, bool, char *, int32_t);
 typedef void *(*fortai_memory_fn)(const fortai_llama_context *);
 typedef void (*fortai_memory_clear_fn)(void *, bool);
 typedef bool (*fortai_memory_seq_rm_fn)(void *, int32_t, int32_t, int32_t);
@@ -157,6 +172,12 @@ typedef struct {
     fortai_batch_free_fn batch_free;
     fortai_decode_fn decode;
     fortai_logits_fn logits;
+    fortai_tokenize_fn tokenize;
+    fortai_detokenize_fn detokenize;
+    fortai_token_piece_fn token_piece;
+    fortai_vocab_is_eog_fn vocab_is_eog;
+    fortai_model_chat_template_fn model_chat_template;
+    fortai_chat_apply_template_fn chat_apply_template;
     fortai_memory_fn memory;
     fortai_memory_clear_fn memory_clear;
     fortai_memory_seq_rm_fn memory_seq_rm;
@@ -435,6 +456,12 @@ static void *fortai_open_llama(void) {
     FORTAI_LLAMA_LOAD(batch_free, "llama_batch_free");
     FORTAI_LLAMA_LOAD(decode, "llama_decode");
     FORTAI_LLAMA_LOAD(logits, "llama_get_logits_ith");
+    FORTAI_LLAMA_LOAD(tokenize, "llama_tokenize");
+    FORTAI_LLAMA_LOAD(detokenize, "llama_detokenize");
+    FORTAI_LLAMA_LOAD(token_piece, "llama_token_to_piece");
+    FORTAI_LLAMA_LOAD(vocab_is_eog, "llama_vocab_is_eog");
+    FORTAI_LLAMA_LOAD(model_chat_template, "llama_model_chat_template");
+    FORTAI_LLAMA_LOAD(chat_apply_template, "llama_chat_apply_template");
     FORTAI_LLAMA_LOAD(memory, "llama_get_memory");
     FORTAI_LLAMA_LOAD(memory_clear, "llama_memory_clear");
     FORTAI_LLAMA_LOAD(memory_seq_rm, "llama_memory_seq_rm");
@@ -904,6 +931,60 @@ int fortai_llama_fast_context_decode_speculative(void *opaque, int token, int po
     tokens[accepted] = mismatch;
     *count = accepted + 1;
     return 0;
+}
+
+int fortai_llama_fast_context_tokenize(void *opaque, const char *text, int text_length,
+    int *tokens, int capacity, int add_special, int parse_special) {
+    fortai_llama_handle *handle = (fortai_llama_handle *)opaque;
+    if (handle == NULL || handle->model == NULL || text == NULL || tokens == NULL ||
+        text_length < 0 || capacity <= 0 || handle->api.tokenize == NULL ||
+        handle->api.model_vocab == NULL)
+        return INT32_MIN;
+    const fortai_llama_vocab *vocab = handle->api.model_vocab(handle->model);
+    return handle->api.tokenize(vocab, text, (int32_t)text_length, tokens,
+        (int32_t)capacity, add_special != 0, parse_special != 0);
+}
+
+int fortai_llama_fast_context_detokenize(void *opaque, const int *tokens, int count,
+    char *text, int capacity, int remove_special, int unparse_special) {
+    fortai_llama_handle *handle = (fortai_llama_handle *)opaque;
+    if (handle == NULL || handle->model == NULL || tokens == NULL || count < 0 ||
+        text == NULL || capacity <= 0 || handle->api.detokenize == NULL ||
+        handle->api.model_vocab == NULL)
+        return INT32_MIN;
+    const fortai_llama_vocab *vocab = handle->api.model_vocab(handle->model);
+    return handle->api.detokenize(vocab, tokens, (int32_t)count, text,
+        (int32_t)capacity, remove_special != 0, unparse_special != 0);
+}
+
+int fortai_llama_fast_context_is_eog(void *opaque, int token) {
+    fortai_llama_handle *handle = (fortai_llama_handle *)opaque;
+    if (handle == NULL || handle->model == NULL || handle->api.vocab_is_eog == NULL ||
+        handle->api.model_vocab == NULL)
+        return 0;
+    return handle->api.vocab_is_eog(handle->api.model_vocab(handle->model), token) ? 1 : 0;
+}
+
+int fortai_llama_fast_context_chat_template(void *opaque, const char **roles,
+    const char **contents, int count, int add_assistant, char *text, int capacity) {
+    fortai_llama_handle *handle = (fortai_llama_handle *)opaque;
+    if (handle == NULL || handle->model == NULL || roles == NULL || contents == NULL ||
+        count <= 0 || text == NULL || capacity <= 0 || handle->api.chat_apply_template == NULL)
+        return INT32_MIN;
+    fortai_llama_chat_message *messages = (fortai_llama_chat_message *)calloc(
+        (size_t)count, sizeof(*messages));
+    if (messages == NULL) return INT32_MIN;
+    for (int i = 0; i < count; ++i) {
+        messages[i].role = roles[i];
+        messages[i].content = contents[i];
+    }
+    const char *tmpl = NULL;
+    if (handle->api.model_chat_template != NULL)
+        tmpl = handle->api.model_chat_template(handle->model, NULL);
+    int result = handle->api.chat_apply_template(tmpl, messages, (size_t)count,
+        add_assistant != 0, text, (int32_t)capacity);
+    free(messages);
+    return result;
 }
 
 int fortai_llama_fast_context_reset(void *opaque) {

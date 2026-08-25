@@ -23,6 +23,7 @@ int fortai_cuda_q8_context_create(int device, fortai_cuda_q8_context **context);
 int fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context);
 int fortai_cuda_memory_info(int device, size_t *free_bytes, size_t *total_bytes);
 int fortai_cuda_q8_context_set_position(fortai_cuda_q8_context *context, int position);
+int fortai_cuda_q8_context_synchronize(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_capture_end(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_graph_launch(fortai_cuda_q8_context *context);
@@ -65,6 +66,10 @@ int fortai_cuda_qwen35_add_device(fortai_cuda_q8_context *context,
 int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *context,
     const void *device_input, const void *device_weights, void *device_output,
     size_t elements, float epsilon);
+int fortai_cuda_qwen35_silu_product_device(fortai_cuda_q8_context *context,
+    void *device_gate, const void *device_up, size_t elements);
+int fortai_cuda_qwen35_argmax_device(fortai_cuda_q8_context *context,
+    const void *device_logits, size_t elements, int *host_index);
 
 /* Convenience operation for the first host-controlled integration slice.
  * Weights remain resident across calls; activation and output are transferred
@@ -125,6 +130,12 @@ int fortai_cuda_qwen35_recurrent_create(fortai_cuda_q8_context *context,
     const void *ssm_norm, size_t ssm_norm_bytes, int state_size, int key_heads,
     int value_heads, int head_size, int inner_size, float norm_epsilon,
     fortai_cuda_qwen35_recurrent **layer);
+int fortai_cuda_qwen35_recurrent_create_state(fortai_cuda_q8_context *context,
+    const void *conv_weights, size_t conv_weight_bytes, int conv_size, int conv_kernel,
+    const void *ssm_a, size_t ssm_a_bytes, const void *ssm_dt, size_t ssm_dt_bytes,
+    const void *ssm_norm, size_t ssm_norm_bytes, int state_size, int key_heads,
+    int value_heads, int head_size, int inner_size, float norm_epsilon,
+    fortai_cuda_qwen35_recurrent **layer);
 int fortai_cuda_qwen35_recurrent_destroy(fortai_cuda_qwen35_recurrent *layer);
 int fortai_cuda_qwen35_recurrent_reset(fortai_cuda_qwen35_recurrent *layer);
 int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *layer,
@@ -133,6 +144,11 @@ int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *layer,
 int fortai_cuda_qwen35_recurrent_run_device(fortai_cuda_qwen35_recurrent *layer,
     const void *device_activation, size_t activation_elements,
     void *device_output, size_t output_elements);
+int fortai_cuda_qwen35_recurrent_run_core_device(fortai_cuda_qwen35_recurrent *layer,
+    void *device_qkv, size_t qkv_elements, const void *device_gate,
+    size_t gate_elements, const void *device_alpha, size_t alpha_elements,
+    const void *device_beta, size_t beta_elements, void *device_output,
+    size_t output_elements);
 
 int fortai_cuda_qwen35_attention_create(fortai_cuda_q8_context *context,
     const fortai_cuda_q8_weights *query_weights,
@@ -144,11 +160,20 @@ int fortai_cuda_qwen35_attention_create(fortai_cuda_q8_context *context,
     int heads, int key_value_heads, int head_size, int value_size,
     int max_context, int rope_dimension, float rope_base, float norm_epsilon,
     fortai_cuda_qwen35_attention **layer);
+int fortai_cuda_qwen35_attention_create_state(fortai_cuda_q8_context *context,
+    const void *query_norm, size_t query_norm_bytes, const void *key_norm,
+    size_t key_norm_bytes, int heads, int key_value_heads, int head_size,
+    int value_size, int max_context, int rope_dimension, float rope_base,
+    float norm_epsilon, fortai_cuda_qwen35_attention **layer);
 int fortai_cuda_qwen35_attention_destroy(fortai_cuda_qwen35_attention *layer);
 int fortai_cuda_qwen35_attention_reset(fortai_cuda_qwen35_attention *layer);
 int fortai_cuda_qwen35_attention_run_device(fortai_cuda_qwen35_attention *layer,
     const void *device_activation, size_t activation_elements, int position,
     void *device_output, size_t output_elements);
+int fortai_cuda_qwen35_attention_run_core_device(fortai_cuda_qwen35_attention *layer,
+    const void *device_query, size_t query_elements, const void *device_key,
+    size_t key_elements, const void *device_value, size_t value_elements,
+    int position, void *device_output, size_t output_elements);
 
 const char *fortai_cuda_q8_last_error(const fortai_cuda_q8_context *context);
 

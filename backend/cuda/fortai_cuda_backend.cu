@@ -4,10 +4,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <climits>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <new>
+#include <vector>
 
 namespace {
 
@@ -102,20 +105,19 @@ __global__ void q8_gemv_four_warp(const int8_t *__restrict__ weights,
     if (row >= rows) return;
     const int8_t *row_weights = weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
     float accumulator = 0.0f;
-    constexpr int ints_per_block = q8_block_width / 4;
-    constexpr int lanes_per_block = ints_per_block / 2;
-    constexpr int blocks_per_wave = 128 / lanes_per_block;
-    for (int block = tid / lanes_per_block; block < blocks; block += blocks_per_wave) {
+    /* Four warps cooperate on one row.  Each lane owns complete 32-value
+     * Q8 blocks; this keeps the shuffle reduction within one warp and avoids
+     * mixing the old four-lane subgroups during the final sum. */
+    for (int block = warp * 32 + lane; block < blocks; block += 128) {
         const int8_t *weight_block = row_weights + block * q8_block_bytes;
         const int8_t *activation_block = activation + block * q8_activation_block_bytes;
         const float scale = block_scale(weight_block) * block_scale(activation_block);
-        const int first_int = (tid % lanes_per_block) * 2;
         int dot = 0;
-#pragma unroll 2
-        for (int i = 0; i < 2; ++i) {
-            const int offset = 2 + 4 * (first_int + i);
+#pragma unroll
+        for (int i = 0; i < q8_block_width; i += 4) {
+            const int offset = 2 + i;
             dot = __dp4a(load_i32(weight_block + offset),
-                load_i32(activation_block + q8_activation_data_offset + 4 * (first_int + i)), dot);
+                load_i32(activation_block + q8_activation_data_offset + i), dot);
         }
         accumulator = fmaf(scale, static_cast<float>(dot), accumulator);
     }
@@ -151,133 +153,6 @@ static void launch_q8(fortai_cuda_q8_weights_impl *weights,
     else
         q8_gemv_one_warp<<<weights->rows, 32, 0, stream>>>(weights->device_data,
             activation, weights->rows, weights->blocks, output);
-}
-
-__global__ void q8_gemv_fused4(const int8_t *weights0, int rows0, float *output0,
-    const int8_t *weights1, int rows1, float *output1,
-    const int8_t *weights2, int rows2, float *output2,
-    const int8_t *weights3, int rows3, float *output3,
-    const int8_t *activation, const int blocks) {
-    const int global_row = static_cast<int>(blockIdx.x);
-    const int lane = static_cast<int>(threadIdx.x);
-    const int8_t *weights = nullptr;
-    float *output = nullptr;
-    int row = global_row;
-    if (row < rows0) {
-        weights = weights0;
-        output = output0;
-    } else if ((row -= rows0) < rows1) {
-        weights = weights1;
-        output = output1;
-    } else if ((row -= rows1) < rows2) {
-        weights = weights2;
-        output = output2;
-    } else {
-        row -= rows2;
-        if (row >= rows3) return;
-        weights = weights3;
-        output = output3;
-    }
-    float accumulator = 0.0f;
-    const int8_t *row_weights = weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
-    for (int block = lane; block < blocks; block += 32) {
-        const int8_t *weight_block = row_weights + block * q8_block_bytes;
-        const int8_t *activation_block = activation + block * q8_activation_block_bytes;
-        const float scale = block_scale(weight_block) * block_scale(activation_block);
-        int dot = 0;
-#pragma unroll
-        for (int i = 0; i < q8_block_width; i += 4)
-            dot = __dp4a(load_i32(weight_block + 2 + i),
-                load_i32(activation_block + q8_activation_data_offset + i), dot);
-        accumulator = fmaf(scale, static_cast<float>(dot), accumulator);
-    }
-    for (int offset = 16; offset; offset >>= 1)
-        accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
-    if (lane == 0) output[row] = accumulator;
-}
-
-__global__ void q8_gemv_fused4_four_warp(const int8_t *weights0, int rows0, float *output0,
-    const int8_t *weights1, int rows1, float *output1,
-    const int8_t *weights2, int rows2, float *output2,
-    const int8_t *weights3, int rows3, float *output3,
-    const int8_t *activation, const int blocks) {
-    const int global_row = static_cast<int>(blockIdx.x);
-    const int tid = static_cast<int>(threadIdx.x);
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
-    const int lane_in_group = lane & 3;
-    const int group_leader = lane - lane_in_group;
-    const int8_t *weights = nullptr;
-    float *output = nullptr;
-    int row = global_row;
-    if (row < rows0) {
-        weights = weights0;
-        output = output0;
-    } else if ((row -= rows0) < rows1) {
-        weights = weights1;
-        output = output1;
-    } else if ((row -= rows1) < rows2) {
-        weights = weights2;
-        output = output2;
-    } else {
-        row -= rows2;
-        if (row >= rows3) return;
-        weights = weights3;
-        output = output3;
-    }
-
-    float accumulator = 0.0f;
-    constexpr int ints_per_block = q8_block_width / 4;
-    constexpr int lanes_per_block = ints_per_block / 2;
-    constexpr int blocks_per_wave = 128 / lanes_per_block;
-    const int8_t *row_weights = weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
-    for (int block = tid / lanes_per_block; block < blocks; block += blocks_per_wave) {
-        const int8_t *weight_block = row_weights + block * q8_block_bytes;
-        const int8_t *activation_block = activation + block * q8_activation_block_bytes;
-        float scale = 0.0f;
-        if (lane_in_group == 0)
-            scale = block_scale(weight_block) * block_scale(activation_block);
-        scale = __shfl_sync(0xffffffffu, scale, group_leader);
-        const int first_int = lane_in_group * 2;
-        int dot = 0;
-#pragma unroll 2
-        for (int i = 0; i < 2; ++i) {
-            const int offset = 2 + 4 * (first_int + i);
-            dot = __dp4a(load_i32(weight_block + offset),
-                load_i32(activation_block + q8_activation_data_offset + 4 * (first_int + i)), dot);
-        }
-        accumulator = fmaf(scale, static_cast<float>(dot), accumulator);
-    }
-    for (int offset = 16; offset; offset >>= 1)
-        accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
-    __shared__ float partial[4];
-    if (lane == 0) partial[warp] = accumulator;
-    __syncthreads();
-    if (warp == 0) {
-        accumulator = lane < 4 ? partial[lane] : 0.0f;
-        for (int offset = 2; offset; offset >>= 1)
-            accumulator += __shfl_down_sync(0xffffffffu, accumulator, offset);
-        if (lane == 0) output[row] = accumulator;
-    }
-}
-
-static void launch_q8_fused4(const int8_t *weights0, int rows0, float *output0,
-    const int8_t *weights1, int rows1, float *output1,
-    const int8_t *weights2, int rows2, float *output2,
-    const int8_t *weights3, int rows3, float *output3,
-    const int8_t *activation, int blocks, cudaStream_t stream) {
-    const int rows = rows0 + rows1 + rows2 + rows3;
-    if (blocks == 64 || blocks >= 128) {
-        q8_gemv_fused4_four_warp<<<rows, 128, 0, stream>>>(
-            weights0, rows0, output0, weights1, rows1, output1,
-            weights2, rows2, output2, weights3, rows3, output3,
-            activation, blocks);
-    } else {
-        q8_gemv_fused4<<<rows, 32, 0, stream>>>(
-            weights0, rows0, output0, weights1, rows1, output1,
-            weights2, rows2, output2, weights3, rows3, output3,
-            activation, blocks);
-    }
 }
 
 static cudaError_t ensure_host_matvec_scratch(fortai_cuda_q8_context_impl *context,
@@ -331,20 +206,8 @@ struct host_matvec_request {
 
 static void launch_q8_grouped(const host_matvec_request *requests, int count,
     const int8_t *activation, cudaStream_t stream) {
-    const auto *weights0 = requests[0].weights;
-    const auto *weights1 = count > 1 ? requests[1].weights : nullptr;
-    const auto *weights2 = count > 2 ? requests[2].weights : nullptr;
-    const auto *weights3 = count > 3 ? requests[3].weights : nullptr;
-    const int rows0 = weights0->rows;
-    const int rows1 = weights1 ? weights1->rows : 0;
-    const int rows2 = weights2 ? weights2->rows : 0;
-    const int rows3 = weights3 ? weights3->rows : 0;
-    launch_q8_fused4(
-        weights0->device_data, rows0, requests[0].output,
-        weights1 ? weights1->device_data : nullptr, rows1, count > 1 ? requests[1].output : nullptr,
-        weights2 ? weights2->device_data : nullptr, rows2, count > 2 ? requests[2].output : nullptr,
-        weights3 ? weights3->device_data : nullptr, rows3, count > 3 ? requests[3].output : nullptr,
-        activation, weights0->blocks, stream);
+    for (int i = 0; i < count; ++i)
+        launch_q8(requests[i].weights, activation, requests[i].output, stream);
 }
 
 static int matvec_host_many(fortai_cuda_q8_context_impl *context,
@@ -450,34 +313,21 @@ __global__ void q8_gemv_silu_product_four_warp(const int8_t *gate_weights,
     if (row >= rows) return;
     const int8_t *gate_row = gate_weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
     const int8_t *up_row = up_weights + static_cast<size_t>(row) * blocks * q8_block_bytes;
-    constexpr int ints_per_block = q8_block_width / 4;
-    constexpr int lanes_per_block = ints_per_block / 2;
-    constexpr int blocks_per_wave = 128 / lanes_per_block;
     float gate_accumulator = 0.0f;
     float up_accumulator = 0.0f;
-    for (int block = tid / lanes_per_block; block < blocks; block += blocks_per_wave) {
+    for (int block = warp * 32 + lane; block < blocks; block += 128) {
         const int8_t *gate_block = gate_row + block * q8_block_bytes;
         const int8_t *up_block = up_row + block * q8_block_bytes;
         const int8_t *activation_block = activation + block * q8_activation_block_bytes;
-        float activation_scale = 0.0f;
-        float gate_scale = 0.0f;
-        float up_scale = 0.0f;
-        if ((tid % lanes_per_block) == 0) {
-            activation_scale = block_scale(activation_block);
-            gate_scale = block_scale(gate_block) * activation_scale;
-            up_scale = block_scale(up_block) * activation_scale;
-        }
-        const int group_leader = lane - (lane % lanes_per_block);
-        activation_scale = __shfl_sync(0xffffffffu, activation_scale, group_leader);
-        gate_scale = __shfl_sync(0xffffffffu, gate_scale, group_leader);
-        up_scale = __shfl_sync(0xffffffffu, up_scale, group_leader);
-        const int first_int = (tid % lanes_per_block) * 2;
+        const float activation_scale = block_scale(activation_block);
+        const float gate_scale = block_scale(gate_block) * activation_scale;
+        const float up_scale = block_scale(up_block) * activation_scale;
         int gate_dot = 0;
         int up_dot = 0;
-#pragma unroll 2
-        for (int i = 0; i < 2; ++i) {
-            const int offset = 2 + 4 * (first_int + i);
-            const int activation_values = load_i32(activation_block + q8_activation_data_offset + 4 * (first_int + i));
+#pragma unroll
+        for (int i = 0; i < q8_block_width; i += 4) {
+            const int offset = 2 + i;
+            const int activation_values = load_i32(activation_block + q8_activation_data_offset + i);
             gate_dot = __dp4a(load_i32(gate_block + offset), activation_values, gate_dot);
             up_dot = __dp4a(load_i32(up_block + offset), activation_values, up_dot);
         }
@@ -550,9 +400,8 @@ static void launch_q8_silu_product(fortai_cuda_q8_weights_impl *gate,
         q8_gemv_silu_product_four_warp<<<gate->rows, 128, 0, stream>>>(gate->device_data,
             up->device_data, activation, output, gate->rows, gate->blocks);
     } else {
-        launch_q8_fused4(
-            gate->device_data, gate->rows, output, up->device_data, up->rows, auxiliary,
-            nullptr, 0, nullptr, nullptr, 0, nullptr, activation, gate->blocks, stream);
+        launch_q8(gate, activation, output, stream);
+        launch_q8(up, activation, auxiliary, stream);
         qwen_silu_product<<<(gate->rows + 255) / 256, 256, 0, stream>>>(
             output, auxiliary, gate->rows);
     }
@@ -722,6 +571,36 @@ __global__ void qwen_rms_norm_float(const float *input, const float *weights,
     const float inverse = 1.0f / sqrtf(norm_partial[0] / static_cast<float>(elements) + epsilon);
     for (int index = lane; index < elements; index += blockDim.x)
         output[index] = input[index] * inverse * weights[index];
+}
+
+struct qwen_argmax_pair {
+    float value;
+    int index;
+};
+
+__global__ void qwen_argmax_partials(const float *__restrict__ input, int elements,
+    qwen_argmax_pair *__restrict__ partials) {
+    extern __shared__ qwen_argmax_pair argmax_shared[];
+    const int lane = static_cast<int>(threadIdx.x);
+    qwen_argmax_pair best = {-FLT_MAX, INT_MAX};
+    for (int index = static_cast<int>(blockIdx.x) * blockDim.x + lane;
+         index < elements; index += static_cast<int>(gridDim.x) * blockDim.x) {
+        const float value = input[index];
+        if (value > best.value || (value == best.value && index < best.index))
+            best = {value, index};
+    }
+    argmax_shared[lane] = best;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            const qwen_argmax_pair other = argmax_shared[lane + stride];
+            if (other.value > argmax_shared[lane].value ||
+                (other.value == argmax_shared[lane].value && other.index < argmax_shared[lane].index))
+                argmax_shared[lane] = other;
+        }
+        __syncthreads();
+    }
+    if (lane == 0) partials[blockIdx.x] = argmax_shared[0];
 }
 
 __device__ __forceinline__ void qwen_rope_pair(float *values, int dimension,
@@ -1055,6 +934,14 @@ extern "C" int fortai_cuda_q8_context_set_position(fortai_cuda_q8_context *conte
         fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "set device position", error);
 }
 
+extern "C" int fortai_cuda_q8_context_synchronize(fortai_cuda_q8_context *context) {
+    if (!context) return FORTAI_CUDA_INVALID;
+    cudaSetDevice(context->impl.device);
+    const cudaError_t error = cudaStreamSynchronize(context->impl.stream);
+    return error == cudaSuccess ? FORTAI_CUDA_OK :
+        fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "CUDA context synchronize", error);
+}
+
 extern "C" int fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context) {
     if (!context || context->impl.graph || context->impl.graph_exec) return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);
@@ -1287,6 +1174,19 @@ extern "C" int fortai_cuda_qwen35_add_device(fortai_cuda_q8_context *context,
         fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "device add", error);
 }
 
+extern "C" int fortai_cuda_qwen35_silu_product_device(fortai_cuda_q8_context *context,
+    void *device_gate, const void *device_up, size_t elements) {
+    if (!context || !device_gate || !device_up || elements == 0 ||
+        elements > static_cast<size_t>(INT32_MAX)) return FORTAI_CUDA_INVALID;
+    cudaSetDevice(context->impl.device);
+    qwen_silu_product<<<(static_cast<int>(elements) + 255) / 256, 256,
+        0, context->impl.stream>>>(static_cast<float *>(device_gate),
+        static_cast<const float *>(device_up), static_cast<int>(elements));
+    const cudaError_t error = cudaGetLastError();
+    return error == cudaSuccess ? FORTAI_CUDA_OK :
+        fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "device SiLU product", error);
+}
+
 extern "C" int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *context,
     const void *device_input, const void *device_weights, void *device_output,
     size_t elements, float epsilon) {
@@ -1300,6 +1200,37 @@ extern "C" int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *contex
     const cudaError_t error = cudaGetLastError();
     return error == cudaSuccess ? FORTAI_CUDA_OK :
         fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "device RMS norm", error);
+}
+
+extern "C" int fortai_cuda_qwen35_argmax_device(fortai_cuda_q8_context *context,
+    const void *device_logits, size_t elements, int *host_index) {
+    if (!context || !device_logits || !host_index || elements == 0 ||
+        elements > static_cast<size_t>(INT32_MAX)) return FORTAI_CUDA_INVALID;
+    cudaSetDevice(context->impl.device);
+    const int threads = 256;
+    const int blocks = std::min<int>(static_cast<int>((elements + threads - 1) / threads), 1024);
+    const size_t bytes = static_cast<size_t>(blocks) * sizeof(qwen_argmax_pair);
+    cudaError_t error = ensure_aux_scratch(&context->impl, bytes);
+    if (error == cudaSuccess) {
+        qwen_argmax_partials<<<blocks, threads, threads * sizeof(qwen_argmax_pair),
+            context->impl.stream>>>(static_cast<const float *>(device_logits),
+            static_cast<int>(elements), reinterpret_cast<qwen_argmax_pair *>(context->impl.scratch_aux));
+        error = cudaGetLastError();
+    }
+    std::vector<qwen_argmax_pair> partials(static_cast<size_t>(blocks));
+    if (error == cudaSuccess)
+        error = cudaMemcpyAsync(partials.data(), context->impl.scratch_aux, bytes,
+            cudaMemcpyDeviceToHost, context->impl.stream);
+    if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+    if (error != cudaSuccess)
+        return fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "device argmax", error);
+    qwen_argmax_pair best = {-FLT_MAX, INT_MAX};
+    for (const qwen_argmax_pair candidate : partials) {
+        if (candidate.value > best.value ||
+            (candidate.value == best.value && candidate.index < best.index)) best = candidate;
+    }
+    *host_index = best.index;
+    return FORTAI_CUDA_OK;
 }
 
 extern "C" int fortai_cuda_q8_matvec_host(fortai_cuda_q8_context *context,
@@ -1600,6 +1531,65 @@ invalid:
     return FORTAI_CUDA_INVALID;
 }
 
+extern "C" int fortai_cuda_qwen35_recurrent_create_state(
+    fortai_cuda_q8_context *context, const void *conv_weights, size_t conv_weight_bytes,
+    int conv_size, int conv_kernel, const void *ssm_a, size_t ssm_a_bytes,
+    const void *ssm_dt, size_t ssm_dt_bytes, const void *ssm_norm,
+    size_t ssm_norm_bytes, int state_size, int key_heads, int value_heads,
+    int head_size, int inner_size, float norm_epsilon,
+    fortai_cuda_qwen35_recurrent **layer) {
+    if (!context || !layer || !conv_weights || !ssm_a || !ssm_dt || !ssm_norm ||
+        conv_size <= 0 || conv_kernel < 2 || state_size <= 0 || key_heads <= 0 ||
+        value_heads <= 0 || head_size <= 0 || inner_size <= 0 ||
+        value_heads % key_heads != 0 || value_heads * head_size != inner_size ||
+        norm_epsilon <= 0.0f)
+        return FORTAI_CUDA_INVALID;
+    if (conv_weight_bytes < static_cast<size_t>(conv_size) * conv_kernel * sizeof(float) ||
+        ssm_a_bytes < static_cast<size_t>(value_heads) * sizeof(float) ||
+        ssm_dt_bytes < static_cast<size_t>(value_heads) * sizeof(float) ||
+        ssm_norm_bytes < static_cast<size_t>(head_size) * sizeof(float))
+        return FORTAI_CUDA_INVALID;
+    *layer = nullptr;
+    auto *created = new (std::nothrow) fortai_cuda_qwen35_recurrent;
+    if (!created) return FORTAI_CUDA_RUNTIME_ERROR;
+    created->impl.context = &context->impl;
+    created->impl.conv_size = conv_size;
+    created->impl.conv_kernel = conv_kernel;
+    created->impl.state_size = state_size;
+    created->impl.key_heads = key_heads;
+    created->impl.value_heads = value_heads;
+    created->impl.head_size = head_size;
+    created->impl.inner_size = inner_size;
+    created->impl.norm_epsilon = norm_epsilon;
+    cudaSetDevice(context->impl.device);
+    cudaError_t error = allocate_and_copy_float(&created->impl, &created->impl.conv_weights,
+        conv_weights, static_cast<size_t>(conv_size) * conv_kernel * sizeof(float));
+    if (error == cudaSuccess) error = allocate_and_copy_float(&created->impl, &created->impl.ssm_a,
+        ssm_a, static_cast<size_t>(value_heads) * sizeof(float));
+    if (error == cudaSuccess) error = allocate_and_copy_float(&created->impl, &created->impl.ssm_dt,
+        ssm_dt, static_cast<size_t>(value_heads) * sizeof(float));
+    if (error == cudaSuccess) error = allocate_and_copy_float(&created->impl, &created->impl.ssm_norm,
+        ssm_norm, static_cast<size_t>(head_size) * sizeof(float));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.conv_state),
+        static_cast<size_t>(conv_kernel - 1) * conv_size * sizeof(float));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.gdn_state),
+        static_cast<size_t>(value_heads) * head_size * head_size * sizeof(float));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.gdn_output),
+        static_cast<size_t>(inner_size) * sizeof(float));
+    if (error == cudaSuccess) error = cudaMemsetAsync(created->impl.conv_state, 0,
+        static_cast<size_t>(conv_kernel - 1) * conv_size * sizeof(float), context->impl.stream);
+    if (error == cudaSuccess) error = cudaMemsetAsync(created->impl.gdn_state, 0,
+        static_cast<size_t>(value_heads) * head_size * head_size * sizeof(float), context->impl.stream);
+    if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+    if (error != cudaSuccess) {
+        free_recurrent_device_buffers(&created->impl);
+        delete created;
+        return fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "Qwen recurrent state create", error);
+    }
+    *layer = created;
+    return FORTAI_CUDA_OK;
+}
+
 extern "C" int fortai_cuda_qwen35_recurrent_destroy(fortai_cuda_qwen35_recurrent *layer) {
     if (!layer) return FORTAI_CUDA_OK;
     if (layer->impl.context) {
@@ -1742,14 +1732,14 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_device(
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        launch_q8_fused4(
-            layer->impl.qkv_weights->device_data, layer->impl.qkv_weights->rows,
-            layer->impl.qkv_output, layer->impl.gate_weights->device_data,
-            layer->impl.gate_weights->rows, layer->impl.gate_output,
-            layer->impl.alpha_weights->device_data, layer->impl.alpha_weights->rows,
-            layer->impl.alpha_output, layer->impl.beta_weights->device_data,
-            layer->impl.beta_weights->rows, layer->impl.beta_output,
-            context->scratch_activation, input_blocks, context->stream);
+        launch_q8(layer->impl.qkv_weights, context->scratch_activation,
+            layer->impl.qkv_output, context->stream);
+        launch_q8(layer->impl.gate_weights, context->scratch_activation,
+            layer->impl.gate_output, context->stream);
+        launch_q8(layer->impl.alpha_weights, context->scratch_activation,
+            layer->impl.alpha_output, context->stream);
+        launch_q8(layer->impl.beta_weights, context->scratch_activation,
+            layer->impl.beta_output, context->stream);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
@@ -1794,6 +1784,58 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_device(
     }
     return error == cudaSuccess ? FORTAI_CUDA_OK :
         fail(context, FORTAI_CUDA_RUNTIME_ERROR, "Qwen recurrent device run", error);
+}
+
+extern "C" int fortai_cuda_qwen35_recurrent_run_core_device(
+    fortai_cuda_qwen35_recurrent *layer, void *device_qkv, size_t qkv_elements,
+    const void *device_gate, size_t gate_elements, const void *device_alpha,
+    size_t alpha_elements, const void *device_beta, size_t beta_elements,
+    void *device_output, size_t output_elements) {
+    if (!layer || !layer->impl.context || !device_qkv || !device_gate || !device_alpha ||
+        !device_beta || !device_output)
+        return FORTAI_CUDA_INVALID;
+    auto *context = layer->impl.context;
+    if (qkv_elements != static_cast<size_t>(layer->impl.conv_size) ||
+        gate_elements != static_cast<size_t>(layer->impl.inner_size) ||
+        alpha_elements != static_cast<size_t>(layer->impl.value_heads) ||
+        beta_elements != static_cast<size_t>(layer->impl.value_heads) ||
+        output_elements < static_cast<size_t>(layer->impl.inner_size))
+        return FORTAI_CUDA_INVALID;
+    cudaSetDevice(context->device);
+    cudaError_t error = cudaSuccess;
+    const int blocks = (layer->impl.conv_size + 255) / 256;
+    qwen_recurrent_conv_silu<<<blocks, 256, 0, context->stream>>>(
+        static_cast<float *>(device_qkv), layer->impl.conv_weights, layer->impl.conv_state,
+        layer->impl.conv_size, layer->impl.conv_kernel);
+    error = cudaGetLastError();
+    if (error == cudaSuccess) {
+        const int slices = 2 * layer->impl.key_heads;
+        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(float), context->stream>>>(
+            static_cast<float *>(device_qkv), slices, layer->impl.head_size, layer->impl.norm_epsilon);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        qwen_recurrent_gdn_rows<<<layer->impl.value_heads * layer->impl.head_size,
+            32, sizeof(float), context->stream>>>(static_cast<const float *>(device_qkv),
+            static_cast<const float *>(device_gate), static_cast<const float *>(device_alpha),
+            static_cast<const float *>(device_beta), layer->impl.ssm_a, layer->impl.ssm_dt,
+            layer->impl.gdn_state, layer->impl.gdn_output, layer->impl.state_size,
+            layer->impl.key_heads, layer->impl.value_heads, layer->impl.head_size);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) {
+        qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
+            static_cast<size_t>(layer->impl.head_size) * sizeof(float), context->stream>>>(
+            layer->impl.gdn_output, static_cast<const float *>(device_gate), layer->impl.ssm_norm,
+            layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess)
+        error = cudaMemcpyAsync(device_output, layer->impl.gdn_output,
+            static_cast<size_t>(layer->impl.inner_size) * sizeof(float),
+            cudaMemcpyDeviceToDevice, context->stream);
+    return error == cudaSuccess ? FORTAI_CUDA_OK :
+        fail(context, FORTAI_CUDA_RUNTIME_ERROR, "Qwen recurrent core device", error);
 }
 
 extern "C" int fortai_cuda_qwen35_attention_create(
@@ -1867,6 +1909,54 @@ extern "C" int fortai_cuda_qwen35_attention_create(
         free_attention_device_buffers(&created->impl);
         delete created;
         return fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "Qwen attention create", error);
+    }
+    *layer = created;
+    return FORTAI_CUDA_OK;
+}
+
+extern "C" int fortai_cuda_qwen35_attention_create_state(
+    fortai_cuda_q8_context *context, const void *query_norm, size_t query_norm_bytes,
+    const void *key_norm, size_t key_norm_bytes, int heads, int key_value_heads,
+    int head_size, int value_size, int max_context, int rope_dimension,
+    float rope_base, float norm_epsilon, fortai_cuda_qwen35_attention **layer) {
+    if (!context || !layer || !query_norm || !key_norm || heads <= 0 ||
+        key_value_heads <= 0 || head_size <= 0 || value_size <= 0 || max_context <= 0 ||
+        heads % key_value_heads != 0 || rope_dimension < 0 ||
+        (rope_dimension > 0 && (rope_dimension > head_size || rope_dimension % 2 != 0)) ||
+        rope_base <= 0.0f || norm_epsilon <= 0.0f ||
+        query_norm_bytes < static_cast<size_t>(head_size) * sizeof(float) ||
+        key_norm_bytes < static_cast<size_t>(head_size) * sizeof(float))
+        return FORTAI_CUDA_INVALID;
+    *layer = nullptr;
+    auto *created = new (std::nothrow) fortai_cuda_qwen35_attention;
+    if (!created) return FORTAI_CUDA_RUNTIME_ERROR;
+    created->impl.context = &context->impl;
+    created->impl.heads = heads;
+    created->impl.key_value_heads = key_value_heads;
+    created->impl.head_size = head_size;
+    created->impl.value_size = value_size;
+    created->impl.max_context = max_context;
+    created->impl.rope_dimension = rope_dimension;
+    created->impl.rope_base = rope_base;
+    created->impl.norm_epsilon = norm_epsilon;
+    cudaSetDevice(context->impl.device);
+    cudaError_t error = allocate_and_copy_float_attention(&created->impl,
+        &created->impl.query_norm, query_norm, static_cast<size_t>(head_size) * sizeof(float));
+    if (error == cudaSuccess) error = allocate_and_copy_float_attention(&created->impl,
+        &created->impl.key_norm, key_norm, static_cast<size_t>(head_size) * sizeof(float));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.key_cache),
+        static_cast<size_t>(max_context) * key_value_heads * head_size * sizeof(__half));
+    if (error == cudaSuccess) error = cudaMalloc(reinterpret_cast<void **>(&created->impl.value_cache),
+        static_cast<size_t>(max_context) * key_value_heads * value_size * sizeof(__half));
+    if (error == cudaSuccess) error = cudaMemsetAsync(created->impl.key_cache, 0,
+        static_cast<size_t>(max_context) * key_value_heads * head_size * sizeof(__half), context->impl.stream);
+    if (error == cudaSuccess) error = cudaMemsetAsync(created->impl.value_cache, 0,
+        static_cast<size_t>(max_context) * key_value_heads * value_size * sizeof(__half), context->impl.stream);
+    if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+    if (error != cudaSuccess) {
+        free_attention_device_buffers(&created->impl);
+        delete created;
+        return fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "Qwen attention state create", error);
     }
     *layer = created;
     return FORTAI_CUDA_OK;
@@ -1963,6 +2053,45 @@ extern "C" int fortai_cuda_qwen35_attention_run_device(
     }
     return error == cudaSuccess ? FORTAI_CUDA_OK :
         fail(context, FORTAI_CUDA_RUNTIME_ERROR, "Qwen attention device run", error);
+}
+
+extern "C" int fortai_cuda_qwen35_attention_run_core_device(
+    fortai_cuda_qwen35_attention *layer, const void *device_query,
+    size_t query_elements, const void *device_key, size_t key_elements,
+    const void *device_value, size_t value_elements, int position,
+    void *device_output, size_t output_elements) {
+    if (!layer || !layer->impl.context || !device_query || !device_key || !device_value ||
+        !device_output || position < 0 || position >= layer->impl.max_context)
+        return FORTAI_CUDA_INVALID;
+    auto *context = layer->impl.context;
+    const size_t expected_query = static_cast<size_t>(layer->impl.heads) * 2 * layer->impl.head_size;
+    const size_t expected_key = static_cast<size_t>(layer->impl.key_value_heads) * layer->impl.head_size;
+    const size_t expected_value = static_cast<size_t>(layer->impl.key_value_heads) * layer->impl.value_size;
+    const size_t expected_output = static_cast<size_t>(layer->impl.heads) * layer->impl.value_size;
+    if (query_elements != expected_query || key_elements != expected_key ||
+        value_elements != expected_value || output_elements < expected_output)
+        return FORTAI_CUDA_INVALID;
+    cudaSetDevice(context->device);
+    qwen_attention_prepare<<<layer->impl.heads, 256, 512 * sizeof(double), context->stream>>>(
+        const_cast<float *>(static_cast<const float *>(device_query)),
+        const_cast<float *>(static_cast<const float *>(device_key)),
+        static_cast<const float *>(device_value), layer->impl.query_norm, layer->impl.key_norm,
+        layer->impl.key_cache, layer->impl.value_cache, layer->impl.heads,
+        layer->impl.key_value_heads, layer->impl.head_size, layer->impl.value_size,
+        layer->impl.max_context, context->position, layer->impl.rope_dimension,
+        layer->impl.rope_base, layer->impl.norm_epsilon);
+    cudaError_t error = cudaGetLastError();
+    if (error == cudaSuccess) {
+        qwen_attention_apply<<<layer->impl.heads, 256,
+            static_cast<size_t>(8 + layer->impl.max_context) * sizeof(float), context->stream>>>(
+            static_cast<const float *>(device_query), layer->impl.key_cache,
+            layer->impl.value_cache, static_cast<float *>(device_output), layer->impl.heads,
+            layer->impl.key_value_heads, layer->impl.head_size, layer->impl.value_size,
+            layer->impl.max_context, context->position);
+        error = cudaGetLastError();
+    }
+    return error == cudaSuccess ? FORTAI_CUDA_OK :
+        fail(context, FORTAI_CUDA_RUNTIME_ERROR, "Qwen attention core device", error);
 }
 
 extern "C" const char *fortai_cuda_q8_last_error(
