@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,7 +37,23 @@ typedef struct {
     int cuda;
 } fortai_transport;
 
+typedef struct {
+    const fortai_transport *server;
+    int *fds;
+    size_t capacity;
+    size_t head;
+    size_t tail;
+    size_t count;
+    size_t active;
+    int stopping;
+    pthread_mutex_t mutex;
+    pthread_cond_t available;
+    pthread_cond_t space;
+    pthread_cond_t drained;
+} fortai_request_queue;
+
 static volatile sig_atomic_t fortai_stop;
+static pthread_mutex_t fortai_dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void fortai_signal_handler(int signal_number) {
     (void)signal_number;
@@ -180,6 +197,76 @@ static int fortai_dispatch_request(const fortai_transport *server, int fd, const
     return result;
 }
 
+static int fortai_parse_worker_count(void) {
+    const char *value = getenv("FORTAI_THREADS_HTTP");
+    if (value == NULL || value[0] == '\0' || strcasecmp(value, "0") == 0)
+        value = getenv("FORTAI_PARALLEL");
+    if (value == NULL || value[0] == '\0') return 1;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 1) return 1;
+    if (parsed > 256) parsed = 256;
+    return (int)parsed;
+}
+
+static void fortai_close_client(const fortai_transport *server, int client) {
+    char *request = NULL;
+    size_t request_length = 0;
+    if (fortai_http_read_request(client, &request, &request_length) == 0) {
+        /* The Fortran model has mutable recurrent/KV state.  Keep the
+         * transport genuinely concurrent while serializing only the native
+         * model call until per-sequence state slots are available. */
+        pthread_mutex_lock(&fortai_dispatch_mutex);
+        (void)fortai_dispatch_request(server, client, request, (int)request_length);
+        pthread_mutex_unlock(&fortai_dispatch_mutex);
+        free(request);
+    }
+    shutdown(client, SHUT_RDWR);
+    close(client);
+}
+
+static int fortai_queue_push(fortai_request_queue *queue, int fd) {
+    pthread_mutex_lock(&queue->mutex);
+    while (queue->count == queue->capacity && !queue->stopping && !fortai_stop)
+        pthread_cond_wait(&queue->space, &queue->mutex);
+    if (queue->stopping || fortai_stop) {
+        pthread_mutex_unlock(&queue->mutex);
+        return -1;
+    }
+    queue->fds[queue->tail] = fd;
+    queue->tail = (queue->tail + 1) % queue->capacity;
+    queue->count++;
+    pthread_cond_signal(&queue->available);
+    pthread_mutex_unlock(&queue->mutex);
+    return 0;
+}
+
+static void *fortai_http_worker(void *argument) {
+    fortai_request_queue *queue = (fortai_request_queue *)argument;
+    while (1) {
+        pthread_mutex_lock(&queue->mutex);
+        while (queue->count == 0 && !queue->stopping)
+            pthread_cond_wait(&queue->available, &queue->mutex);
+        if (queue->count == 0 && queue->stopping) {
+            pthread_mutex_unlock(&queue->mutex);
+            return NULL;
+        }
+        int client = queue->fds[queue->head];
+        queue->head = (queue->head + 1) % queue->capacity;
+        queue->count--;
+        queue->active++;
+        pthread_cond_signal(&queue->space);
+        pthread_mutex_unlock(&queue->mutex);
+
+        fortai_close_client(queue->server, client);
+
+        pthread_mutex_lock(&queue->mutex);
+        queue->active--;
+        if (queue->count == 0 && queue->active == 0) pthread_cond_broadcast(&queue->drained);
+        pthread_mutex_unlock(&queue->mutex);
+    }
+}
+
 static int fortai_open_listener(const char *host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -218,26 +305,89 @@ int fortai_server_online_cpus(void) {
 
 int fortai_http_transport_run(const char *host, int port, const char *model, int cuda) {
     fortai_transport server = {model, cuda};
+    fortai_request_queue queue;
+    pthread_t *workers = NULL;
+    int worker_count = fortai_parse_worker_count();
+    int started_workers = 0;
+    int mutex_ready = 0;
+    int available_ready = 0;
+    int space_ready = 0;
+    int drained_ready = 0;
     signal(SIGPIPE, SIG_IGN);
     fortai_stop = 0;
     if (fortai_install_signal_handlers() != 0) return -1;
     const int listener = fortai_open_listener(host, port);
     if (listener < 0) return -1;
+
+    memset(&queue, 0, sizeof(queue));
+    queue.server = &server;
+    queue.capacity = (size_t)worker_count * 4;
+    if (queue.capacity < 16) queue.capacity = 16;
+    queue.fds = (int *)calloc(queue.capacity, sizeof(*queue.fds));
+    workers = (pthread_t *)calloc((size_t)worker_count, sizeof(*workers));
+    if (queue.fds == NULL || workers == NULL) {
+        free(queue.fds);
+        free(workers);
+        close(listener);
+        return -1;
+    }
+    if (pthread_mutex_init(&queue.mutex, NULL) != 0) goto queue_init_failed;
+    mutex_ready = 1;
+    if (pthread_cond_init(&queue.available, NULL) != 0) goto queue_init_failed;
+    available_ready = 1;
+    if (pthread_cond_init(&queue.space, NULL) != 0) goto queue_init_failed;
+    space_ready = 1;
+    if (pthread_cond_init(&queue.drained, NULL) != 0) goto queue_init_failed;
+    drained_ready = 1;
+    for (int i = 0; i < worker_count; ++i) {
+        if (pthread_create(&workers[started_workers], NULL, fortai_http_worker, &queue) != 0) break;
+        started_workers++;
+    }
+    if (started_workers == 0) {
+        pthread_mutex_destroy(&queue.mutex);
+        pthread_cond_destroy(&queue.available);
+        pthread_cond_destroy(&queue.space);
+        pthread_cond_destroy(&queue.drained);
+        free(queue.fds);
+        free(workers);
+        close(listener);
+        return -1;
+    }
     while (!fortai_stop) {
         int client = accept(listener, NULL, NULL);
         if (client < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        char *request = NULL;
-        size_t request_length = 0;
-        if (fortai_http_read_request(client, &request, &request_length) == 0) {
-            (void)fortai_dispatch_request(&server, client, request, (int)request_length);
-            free(request);
+        if (fortai_queue_push(&queue, client) != 0) {
+            shutdown(client, SHUT_RDWR);
+            close(client);
+            break;
         }
-        shutdown(client, SHUT_RDWR);
-        close(client);
     }
     close(listener);
+
+    pthread_mutex_lock(&queue.mutex);
+    queue.stopping = 1;
+    pthread_cond_broadcast(&queue.available);
+    pthread_cond_broadcast(&queue.space);
+    pthread_mutex_unlock(&queue.mutex);
+    for (int i = 0; i < started_workers; ++i) pthread_join(workers[i], NULL);
+    pthread_mutex_destroy(&queue.mutex);
+    pthread_cond_destroy(&queue.available);
+    pthread_cond_destroy(&queue.space);
+    pthread_cond_destroy(&queue.drained);
+    free(queue.fds);
+    free(workers);
     return 0;
+
+queue_init_failed:
+    if (drained_ready) pthread_cond_destroy(&queue.drained);
+    if (space_ready) pthread_cond_destroy(&queue.space);
+    if (available_ready) pthread_cond_destroy(&queue.available);
+    if (mutex_ready) pthread_mutex_destroy(&queue.mutex);
+    free(queue.fds);
+    free(workers);
+    close(listener);
+    return -1;
 }

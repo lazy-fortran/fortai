@@ -19,8 +19,12 @@ budget, mmproj path/offload, and `--no-webui`) and mirrors their
 effective values. Main Qwen K/V caches support `f16`, `f32`, and `q8_0`; native
 CUDA keeps q8_0 K/V resident with mixed f16/q8_0 combinations, while the
 host-controlled/MTP path uses the same quantization layout on the host. The
-native MTP path uses an embedded NextN head and validates an external draft
-path when one is configured.
+native MTP path uses an embedded NextN head. A standalone external draft model
+is loaded and advanced by the native Fortran service for greedy requests; the
+target model remains the correctness oracle.
+The ISO-C socket transport uses a bounded worker queue for `--threads-http`
+and `--parallel`, so multiple connections can be accepted without corrupting
+the mutable recurrent/KV state.
 
 The chat and Responses endpoints read the thinking default from the GGUF chat
 template: `enable_thinking`, `chat_template_kwargs.enable_thinking`, and

@@ -4,13 +4,16 @@ module fortai_native_service
     use fortai_native_tokenizer, only: fortai_native_tokenizer_t
     use fortai_qwen35_cpu, only: qwen35_cpu_model_t
     use fortai_string, only: string_t
-    use fortai_status, only: status_t
+    use fortai_status, only: FORTAI_UNSUPPORTED, status_t
     implicit none
     private
 
     type(qwen35_cpu_model_t), save :: service_model
     type(fortai_native_tokenizer_t), save :: service_tokenizer
+    type(qwen35_cpu_model_t), save :: service_draft_model
+    type(fortai_native_tokenizer_t), save :: service_draft_tokenizer
     logical, save :: service_ready = .false.
+    logical, save :: service_external_draft_active = .false.
 
     type :: sampling_options_t
         integer :: top_k = 20
@@ -33,6 +36,7 @@ module fortai_native_service
     public :: fortai_native_service_supports_preserve_thinking
     public :: fortai_native_service_mtp_available
     public :: fortai_native_service_mtp_active
+    public :: fortai_native_service_external_draft_active
 
 contains
 
@@ -67,6 +71,7 @@ contains
         character(len=:), allocatable :: model_path
         type(status_t) :: stat
         logical :: tokenizer_ok
+        character(len=:), allocatable :: draft_path
 
         fortai_native_service_init = 1_c_int
         vocab = 0_c_int
@@ -85,16 +90,28 @@ contains
             call service_model%close()
             return
         end if
+        draft_path = configured_external_draft_path()
+        call open_external_draft(draft_path, context_size, stat)
+        if (.not. stat%is_ok()) then
+            write(error_unit, '(a)') 'fortai-native: external draft initialization failed: ' // trim(stat%message)
+            call service_tokenizer%close()
+            call service_model%close()
+            return
+        end if
         if (gpu_layers > 0_c_int) then
             call service_model%enable_cuda(int(main_gpu), stat)
             if (.not. stat%is_ok()) then
                 write(error_unit, '(a)') 'fortai-native: CUDA initialization failed: ' // trim(stat%message)
+                call service_draft_tokenizer%close()
+                call service_draft_model%close()
                 call service_tokenizer%close()
                 call service_model%close()
                 return
             end if
             if (require_cuda /= 0_c_int .and. .not. service_model%cuda_enabled) then
                 write(error_unit, '(a)') 'fortai-native: CUDA was requested but no native CUDA pipeline is active'
+                call service_draft_tokenizer%close()
+                call service_draft_model%close()
                 call service_tokenizer%close()
                 call service_model%close()
                 return
@@ -107,9 +124,12 @@ contains
     end function fortai_native_service_init
 
     subroutine fortai_native_service_close() bind(C, name='fortai_native_service_close')
+        call service_draft_tokenizer%close()
+        call service_draft_model%close()
         call service_tokenizer%close()
         call service_model%close()
         service_ready = .false.
+        service_external_draft_active = .false.
     end subroutine fortai_native_service_close
 
     logical function fortai_native_service_default_thinking()
@@ -131,6 +151,85 @@ contains
     logical function fortai_native_service_mtp_active()
         fortai_native_service_mtp_active = service_ready .and. service_model%mtp_active
     end function fortai_native_service_mtp_active
+
+    logical function fortai_native_service_external_draft_active()
+        fortai_native_service_external_draft_active = service_ready .and. service_external_draft_active
+    end function fortai_native_service_external_draft_active
+
+    logical function native_mtp_mode_requested()
+        character(len=64) :: value
+        integer :: length
+
+        native_mtp_mode_requested = .false.
+        value = ''
+        call get_environment_variable('FORTAI_NATIVE_MTP', value, length=length)
+        if (length > 0) then
+            if (trim(value(:min(length, len(value)))) == '1' .or. &
+                trim(value(:min(length, len(value)))) == 'true' .or. &
+                trim(value(:min(length, len(value)))) == 'on') then
+                native_mtp_mode_requested = .true.
+                return
+            end if
+        end if
+        value = ''
+        call get_environment_variable('FORTAI_SPEC_TYPE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_SPEC_TYPE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_SPEC_TYPE', value, length=length)
+        if (length > 0) native_mtp_mode_requested = trim(value(:min(length, len(value)))) == 'draft-mtp'
+    end function native_mtp_mode_requested
+
+    function configured_external_draft_path() result(path)
+        character(len=:), allocatable :: path
+        character(len=4096) :: value
+        integer :: length
+
+        value = ''
+        call get_environment_variable('FORTAI_DRAFT_MODEL', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_MODEL_DRAFT', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_DRAFT_MODEL', value, length=length)
+        if (length <= 0) then
+            allocate(character(len=0) :: path)
+        else if (native_mtp_mode_requested()) then
+            allocate(character(len=0) :: path)
+        else if (index(value(:min(length, len(value))), 'mtp') > 0 .or. &
+                index(value(:min(length, len(value))), 'MTP') > 0) then
+            allocate(character(len=0) :: path)
+        else
+            allocate(character(len=min(length, len(value))) :: path)
+            path = trim(value(:len(path)))
+        end if
+    end function configured_external_draft_path
+
+    subroutine open_external_draft(path, context_size, stat)
+        character(len=*), intent(in) :: path
+        integer(c_int), intent(in) :: context_size
+        type(status_t), intent(out) :: stat
+        logical :: tokenizer_ok
+        character(len=:), allocatable :: draft_error
+
+        call stat%clear()
+        service_external_draft_active = .false.
+        if (len_trim(path) == 0) return
+        call service_draft_model%open(trim(path), int(context_size, int64), stat)
+        if (.not. stat%is_ok()) then
+            draft_error = ''
+            if (allocated(stat%message)) draft_error = stat%message
+            call stat%set(FORTAI_UNSUPPORTED, 'external draft model open failed: ' // trim(draft_error))
+            return
+        end if
+        if (service_draft_model%vocabulary_size /= service_model%vocabulary_size) then
+            call stat%set(FORTAI_UNSUPPORTED, 'external draft vocabulary does not match target model')
+            call service_draft_model%close()
+            return
+        end if
+        call service_draft_tokenizer%open(service_draft_model%file, tokenizer_ok)
+        if (.not. tokenizer_ok) then
+            call stat%set(FORTAI_UNSUPPORTED, 'external draft tokenizer metadata is unavailable')
+            call service_draft_model%close()
+            return
+        end if
+        service_external_draft_active = .true.
+    end subroutine open_external_draft
 
     integer function fortai_native_service_complete_text(prompt_text, max_tokens, output_text, token_count)
         character(len=*), intent(in) :: prompt_text
@@ -174,10 +273,12 @@ contains
         integer(int32), allocatable :: history_counts(:), candidate_indices(:)
         real(real32), allocatable :: logits(:), adjusted_logits(:), candidate_values(:)
         integer(int64) :: current, next_token, position
+        integer(int64) :: draft_next_token
         integer(int64) :: random_state
         integer :: i, generated_count
-        real(real32) :: logit_sum
-        type(status_t) :: stat
+        real(real32) :: logit_sum, draft_logit_sum
+        logical :: use_external_draft
+        type(status_t) :: stat, draft_stat
 
         options%top_k = top_k
         options%top_p = top_p
@@ -234,6 +335,13 @@ contains
             end block
         end if
         call service_model%reset()
+        ! Keep the standalone draft state synchronized with the target.  The
+        ! target remains authoritative because the native hybrid model has no
+        ! multi-token decode ABI yet; this still makes external-draft wiring
+        ! real and deterministic rather than merely accepting the flag.
+        use_external_draft = service_external_draft_active .and. temperature == 0.0_real32 .and. &
+            .not. sampling_penalties_active(options)
+        if (use_external_draft) call service_draft_model%reset()
         current = -1_int64
         do i = 1, size(prompt_ids)
             if (temperature > 0.0_real32) then
@@ -255,6 +363,15 @@ contains
             if (.not. stat%is_ok()) then
                 write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
                 return
+            end if
+            if (use_external_draft) then
+                call service_draft_model%forward_greedy(int(prompt_ids(i), int64), int(i - 1, int64), &
+                    draft_next_token, draft_logit_sum, draft_stat)
+                if (.not. draft_stat%is_ok()) then
+                    write(error_unit, '(a)') 'fortai-native: external draft forward failed: ' // &
+                        trim(draft_stat%message)
+                    return
+                end if
             end if
         end do
         generated_count = 0
@@ -286,6 +403,15 @@ contains
             if (.not. stat%is_ok()) then
                 write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
                 return
+            end if
+            if (use_external_draft) then
+                call service_draft_model%forward_greedy(current, position, draft_next_token, draft_logit_sum, &
+                    draft_stat)
+                if (.not. draft_stat%is_ok()) then
+                    write(error_unit, '(a)') 'fortai-native: external draft forward failed: ' // &
+                        trim(draft_stat%message)
+                    return
+                end if
             end if
         end do
         if (generated_count > 0) then

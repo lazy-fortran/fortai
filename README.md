@@ -186,8 +186,11 @@ use the deterministic host-boundary CUDA route by default; the resident
 all-device bridge remains an explicit `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=1`
 diagnostic opt-in until its model-level determinism gate is closed. Multimodal
 projector paths are accepted and surfaced in `/health`; image-token execution
-is not yet part of the native Qwen runtime. The server never delegates either
-feature to another process.
+is not yet part of the native Qwen runtime. A standalone `--model-draft` is
+loaded and advanced by the native Fortran service for greedy requests, with
+target logits remaining authoritative; `draft-mtp` sidecars use the embedded
+NextN implementation. The server never delegates either feature to another
+process.
 For native split-Q4 placement, `FORTAI_TENSOR_SPLIT=a,b` (or
 `--tensor-split a,b`) supplies normalized non-negative fractions for the two
 visible GPUs; omitted values retain equal-byte balancing, and malformed values
