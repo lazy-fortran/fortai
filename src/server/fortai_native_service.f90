@@ -288,10 +288,12 @@ contains
         real(real32), allocatable :: logits(:), adjusted_logits(:), candidate_values(:)
         integer(int64) :: current, next_token, position
         integer(int64) :: draft_next_token
+        integer(int64) :: speculative_tokens(32)
         integer(int64) :: random_state
-        integer :: i, generated_count
+        integer :: i, j, generated_count, speculative_count
         real(real32) :: logit_sum, draft_logit_sum
-        logical :: use_external_draft
+        logical :: use_external_draft, use_native_mtp
+        logical :: stop_generation
         type(status_t) :: stat, draft_stat
 
         options%top_k = top_k
@@ -355,6 +357,8 @@ contains
         ! real and deterministic rather than merely accepting the flag.
         use_external_draft = service_external_draft_active .and. temperature == 0.0_real32 .and. &
             .not. sampling_penalties_active(options)
+        use_native_mtp = service_model%mtp_active .and. temperature == 0.0_real32 .and. &
+            .not. sampling_penalties_active(options)
         if (use_external_draft) call service_draft_model%reset()
         current = -1_int64
         do i = 1, size(prompt_ids)
@@ -397,7 +401,34 @@ contains
             sampling_history(size(prompt_ids) + generated_count) = int(current, int32)
             if (generated_count == max_tokens) exit
             position = int(size(prompt_ids) + generated_count - 1, int64)
-            if (temperature > 0.0_real32) then
+            if (use_native_mtp .and. max_tokens - generated_count >= 2) then
+                call service_model%forward_greedy_speculative(current, position, speculative_tokens, &
+                    speculative_count, logit_sum, stat)
+                if (.not. stat%is_ok()) then
+                    write(error_unit, '(a)') 'fortai-native: speculative model forward failed: ' // trim(stat%message)
+                    return
+                end if
+                if (speculative_count <= 0 .or. speculative_count > size(speculative_tokens)) then
+                    write(error_unit, '(a)') 'fortai-native: speculative model forward returned no tokens'
+                    return
+                end if
+                stop_generation = .false.
+                ! Keep the final speculative token in CURRENT.  The loop's
+                ! next iteration emits it before asking the model for more;
+                ! this preserves the ordinary one-token state machine while
+                ! allowing the preceding tokens to be emitted immediately.
+                do j = 1, speculative_count - 1
+                    if (service_tokenizer%is_stop(int(speculative_tokens(j), int32))) then
+                        stop_generation = .true.
+                        exit
+                    end if
+                    generated_count = generated_count + 1
+                    generated_ids(generated_count) = int(speculative_tokens(j), int32)
+                    sampling_history(size(prompt_ids) + generated_count) = int(speculative_tokens(j), int32)
+                end do
+                if (stop_generation) exit
+                current = speculative_tokens(speculative_count)
+            else if (temperature > 0.0_real32) then
                 call service_model%forward(current, position, logits, stat)
                 if (stat%is_ok()) current = sample_logits(logits, temperature, random_state, sampling_history, &
                     size(prompt_ids) + generated_count, options, adjusted_logits, history_counts, candidate_indices, &
