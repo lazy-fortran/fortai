@@ -6,7 +6,9 @@ module fortai_native_http
     !! share the same growable string_t implementation as the runtime.
     use, intrinsic :: iso_c_binding, only: c_char, c_int, c_null_char
     use, intrinsic :: iso_fortran_env, only: int32, int64, real32
-    use fortai_native_service, only: fortai_native_service_complete_text_sampling
+    use fortai_native_service, only: fortai_native_service_complete_text_sampling, &
+        fortai_native_service_default_thinking, fortai_native_service_supports_preserve_thinking, &
+        fortai_native_service_supports_reasoning_effort
     use fortai_string, only: string_t
     implicit none
     private
@@ -548,6 +550,31 @@ contains
         json_object_boolean = json_boolean(text(object_value:object_end), key, fallback)
     end function json_object_boolean
 
+    function normalize_reasoning_effort(value, valid) result(normalized)
+        character(len=*), intent(in) :: value
+        logical, intent(out) :: valid
+        character(len=:), allocatable :: normalized
+
+        valid = .true.
+        select case (trim(value))
+        case ('')
+            normalized = ''
+        case ('default')
+            normalized = ''
+        case ('none', 'off')
+            normalized = 'off'
+        case ('minimal', 'low')
+            normalized = 'low'
+        case ('medium')
+            normalized = 'medium'
+        case ('high', 'xhigh', 'max')
+            normalized = 'xhigh'
+        case default
+            normalized = ''
+            valid = .false.
+        end select
+    end function normalize_reasoning_effort
+
     function json_object_string_value(text, object_key, key, fallback) result(value)
         character(len=*), intent(in) :: text, object_key, key, fallback
         character(len=:), allocatable :: value
@@ -727,18 +754,23 @@ contains
         parse_response_messages = count > 0
     end function parse_response_messages
 
-    function format_chat(messages, count, enable_thinking, tools_json) result(prompt)
+    function format_chat(messages, count, enable_thinking, tools_json, reasoning_instruction, &
+            preserve_thinking) result(prompt)
         type(message_t), intent(in) :: messages(:)
         integer, intent(in) :: count
         logical, intent(in) :: enable_thinking
         type(string_t), intent(in) :: tools_json
+        type(string_t), intent(in) :: reasoning_instruction
+        logical, intent(in) :: preserve_thinking
         type(string_t) :: prompt
         integer :: i, start_index, last_user_index
         character(len=:), allocatable :: role, reasoning, raw_content
         type(string_t) :: content, parsed_reasoning
-        logical :: tool_group_open
+        logical :: tool_group_open, has_real_reasoning, has_system_message
 
         call prompt%clear()
+        has_system_message = count > 0
+        if (has_system_message) has_system_message = messages(1)%role%as_character() == 'system'
         last_user_index = 0
         do i = 1, count
             if (messages(i)%role%as_character() == 'user') then
@@ -751,24 +783,42 @@ contains
         if (has_tool_entries(tools_json)) then
             if (count > 0) then
                 if (messages(1)%role%as_character() == 'system') then
-                    call append_tool_system(prompt, tools_json, messages(1)%content, .true.)
+                    call append_tool_system(prompt, tools_json, messages(1)%content, &
+                        has_nonblank_text(messages(1)%content%as_character()), reasoning_instruction)
                     start_index = 2
                 else
                     call content%clear()
-                    call append_tool_system(prompt, tools_json, content, .false.)
+                    call append_tool_system(prompt, tools_json, content, .false., reasoning_instruction)
                 end if
             else
                 call content%clear()
-                call append_tool_system(prompt, tools_json, content, .false.)
+                call append_tool_system(prompt, tools_json, content, .false., reasoning_instruction)
             end if
         else if (count > 0) then
             if (messages(1)%role%as_character() == 'system') then
                 call prompt%append('<|im_start|>system')
                 call prompt%append(char(10))
+                if (reasoning_instruction%length() > 0) then
+                    call append_trimmed_text(prompt, reasoning_instruction%as_character())
+                    if (has_nonblank_text(messages(1)%content%as_character())) then
+                        call prompt%append(char(10))
+                        call prompt%append(char(10))
+                    end if
+                end if
                 call prompt%append_string(messages(1)%content)
                 call prompt%append('<|im_end|>')
                 call prompt%append(char(10))
                 start_index = 2
+            end if
+        end if
+
+        if (.not. has_tool_entries(tools_json) .and. reasoning_instruction%length() > 0) then
+            if (.not. has_system_message) then
+                call prompt%append('<|im_start|>system')
+                call prompt%append(char(10))
+                call append_trimmed_text(prompt, reasoning_instruction%as_character())
+                call prompt%append('<|im_end|>')
+                call prompt%append(char(10))
             end if
         end if
 
@@ -817,9 +867,15 @@ contains
                         reasoning = parsed_reasoning%as_character()
                     end if
                 end if
+                has_real_reasoning = has_nonblank_text(reasoning)
                 ! Qwen3.5 keeps reasoning only for assistant turns after the
                 ! latest real user query (including multi-step tool turns).
-                if (i > last_user_index) then
+                if (preserve_thinking .or. i > last_user_index) then
+                    ! Qwen3.8 preserves the trace in every historical turn;
+                    ! older Qwen templates only need a block for a real trace
+                    ! after the latest user query.  Avoid injecting empty
+                    ! historical <think> blocks into those older prompts.
+                    if (preserve_thinking .or. has_real_reasoning) then
                     call prompt%append('<think>')
                     call prompt%append(char(10))
                     call append_trimmed_text(prompt, reasoning)
@@ -828,6 +884,9 @@ contains
                     call prompt%append(char(10))
                     call prompt%append(char(10))
                     call prompt%append_string(content)
+                    else
+                        call prompt%append_string(content)
+                    end if
                 else
                     call prompt%append_string(content)
                 end if
@@ -910,13 +969,29 @@ contains
         if (first <= last) call output%append(text(first:last))
     end subroutine append_trimmed_text
 
-    subroutine append_tool_system(prompt, tools_json, system_content, has_system_content)
+    logical function has_nonblank_text(text)
+        character(len=*), intent(in) :: text
+        integer :: first, last
+
+        call trim_bounds(text, first, last)
+        has_nonblank_text = first <= last
+    end function has_nonblank_text
+
+    subroutine append_tool_system(prompt, tools_json, system_content, has_system_content, reasoning_instruction)
         type(string_t), intent(inout) :: prompt
         type(string_t), intent(in) :: tools_json, system_content
         logical, intent(in) :: has_system_content
+        type(string_t), intent(in), optional :: reasoning_instruction
 
         call prompt%append('<|im_start|>system')
         call prompt%append(char(10))
+        if (present(reasoning_instruction)) then
+            if (reasoning_instruction%length() > 0) then
+                call append_trimmed_text(prompt, reasoning_instruction%as_character())
+                call prompt%append(char(10))
+                call prompt%append(char(10))
+            end if
+        end if
         call prompt%append('# Tools')
         call prompt%append(char(10))
         call prompt%append(char(10))
@@ -1969,14 +2044,17 @@ contains
         character(kind=c_char), intent(out) :: response(*), content_type(*)
         integer(c_int), intent(out) :: response_length, status
         type(string_t) :: request_text, model_text, method, path, body, result, prompt, generated
-        type(string_t) :: content, reasoning, tools_json, clean_content
+        type(string_t) :: content, reasoning, tools_json, clean_content, reasoning_instruction
         type(message_t), allocatable :: messages(:)
         type(tool_call_t), allocatable :: tool_calls(:)
         integer :: count, max_tokens, prompt_tokens, tokens, result_code, required, tool_count
         integer :: top_k, repeat_last_n
         integer(int64) :: seed
         real(real32) :: temperature, top_p, min_p, repeat_penalty, presence_penalty, frequency_penalty
-        logical :: okay, chat, responses, stream, enable_thinking, temperature_valid, max_tokens_valid
+        logical :: okay, chat, responses, stream, enable_thinking, preserve_thinking
+        logical :: reasoning_effort_valid, supports_reasoning_effort, supports_preserve_thinking
+        logical :: thinking_explicit
+        logical :: temperature_valid, max_tokens_valid
         logical :: top_p_valid, min_p_valid, repeat_penalty_valid, presence_penalty_valid
         logical :: frequency_penalty_valid, top_k_valid, repeat_last_n_valid, sampling_valid
         character(len=:), allocatable :: path_value
@@ -2052,19 +2130,51 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         stream = json_boolean(body%as_character(), 'stream', .false.)
-        enable_thinking = json_boolean(body%as_character(), 'enable_thinking', .true.)
-        ! OpenAI-compatible clients commonly pass this through
-        ! chat_template_kwargs, which has precedence in llama.cpp.
+        thinking_explicit = json_key(body%as_character(), 'enable_thinking', 1) > 0
+        enable_thinking = json_boolean(body%as_character(), 'enable_thinking', &
+            fortai_native_service_default_thinking())
+        ! OpenAI-compatible clients use both a top-level field and the
+        ! llama.cpp-compatible chat_template_kwargs object.  Responses uses
+        ! reasoning.effort; the latter wins when supplied.
         enable_thinking = json_object_boolean(body%as_character(), 'chat_template_kwargs', &
             'enable_thinking', enable_thinking)
-        reasoning_effort = json_object_string_value(body%as_character(), 'reasoning', 'effort', '')
+        reasoning_effort = json_string_value(body%as_character(), 'reasoning_effort', '')
+        reasoning_effort = json_object_string_value(body%as_character(), 'chat_template_kwargs', &
+            'reasoning_effort', reasoning_effort)
+        reasoning_effort = json_object_string_value(body%as_character(), 'reasoning', 'effort', reasoning_effort)
+        reasoning_effort = normalize_reasoning_effort(reasoning_effort, reasoning_effort_valid)
+        if (.not. reasoning_effort_valid) then
+            call error_body(400, 'reasoning_effort must be one of default, minimal, low, medium, high, xhigh, or max', result)
+            status = 400_c_int
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
         select case (trim(reasoning_effort))
-        case ('none', 'off')
+        case ('off')
             enable_thinking = .false.
-        case ('minimal', 'low', 'medium', 'high', 'xhigh')
-            enable_thinking = .true.
+        case ('low', 'medium', 'xhigh')
+            if (.not. thinking_explicit) enable_thinking = .true.
         end select
         reasoning_format = json_string_value(body%as_character(), 'reasoning_format', 'auto')
+        supports_reasoning_effort = fortai_native_service_supports_reasoning_effort()
+        supports_preserve_thinking = fortai_native_service_supports_preserve_thinking()
+        preserve_thinking = supports_preserve_thinking
+        preserve_thinking = json_boolean(body%as_character(), 'preserve_thinking', preserve_thinking)
+        preserve_thinking = json_object_boolean(body%as_character(), 'chat_template_kwargs', &
+            'preserve_thinking', preserve_thinking)
+        call reasoning_instruction%clear()
+        if (supports_reasoning_effort .and. enable_thinking) then
+            if (len_trim(reasoning_effort) == 0) reasoning_effort = 'xhigh'
+            select case (trim(reasoning_effort))
+            case ('xhigh')
+                call reasoning_instruction%set('Reasoning effort is set to xhigh. Please think carefully through the task, '&
+                    // 'validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, '&
+                    // 'and clarity in the final answer.')
+            case ('low')
+                call reasoning_instruction%set('Reasoning effort is set to low. Keep your thinking brief and focused, moving '&
+                    // 'directly to the conclusion without unnecessary elaboration.')
+            end select
+        end if
         call tools_json%clear()
         if (.not. json_array_value(body%as_character(), 'tools', tools_json)) call tools_json%clear()
         if (responses) then
@@ -2073,14 +2183,14 @@ contains
                 call copy_result(result, 'application/json', response, response_capacity, response_length, &
                     content_type, content_type_capacity, fortai_native_http_handle); return
             end if
-            prompt = format_chat(messages, count, enable_thinking, tools_json)
+            prompt = format_chat(messages, count, enable_thinking, tools_json, reasoning_instruction, preserve_thinking)
         else if (chat) then
             if (.not. parse_messages(body%as_character(), messages, count)) then
                 call error_body(400, 'messages must contain role/content strings', result); status = 400_c_int
                 call copy_result(result, 'application/json', response, response_capacity, response_length, &
                     content_type, content_type_capacity, fortai_native_http_handle); return
             end if
-            prompt = format_chat(messages, count, enable_thinking, tools_json)
+            prompt = format_chat(messages, count, enable_thinking, tools_json, reasoning_instruction, preserve_thinking)
         else
             block
             integer :: prompt_value, after

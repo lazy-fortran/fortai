@@ -13,6 +13,12 @@ module fortai_native_tokenizer
         integer(int32) :: bos_token = -1_int32
         integer(int32) :: eos_token = -1_int32
         logical :: add_bos_token = .false.
+        ! Qwen ships both thinking-default and no-thinking-default chat
+        ! templates.  Keep the template policy with the tokenizer rather
+        ! than guessing from the model filename in the HTTP layer.
+        logical :: default_enable_thinking = .true.
+        logical :: supports_reasoning_effort = .false.
+        logical :: supports_preserve_thinking = .false.
         type(piece_t), allocatable :: vocabulary(:)
         type(piece_t), allocatable :: merge_left(:)
         type(piece_t), allocatable :: merge_right(:)
@@ -32,7 +38,7 @@ contains
         type(gguf_file_t), intent(in) :: file
         logical, intent(out) :: stat_ok
         integer :: metadata_index, i, n, max_length, separator
-        character(len=:), allocatable :: merge
+        character(len=:), allocatable :: merge, chat_template
 
         call self%close()
         stat_ok = .false.
@@ -47,8 +53,28 @@ contains
             self%add_bos_token = file%metadata(metadata_index)%value_type == 7 .and. &
                 file%metadata(metadata_index)%logical_value
         end if
+        metadata_index = file%find_meta('tokenizer.chat_template')
+        if (metadata_index > 0) then
+            if (file%metadata(metadata_index)%value_type == 8) then
+                if (allocated(file%metadata(metadata_index)%string_value)) then
+                    chat_template = file%metadata(metadata_index)%string_value
+                    ! Qwen3.5 no-thinking templates test for `is true`;
+                    ! thinking templates test for `is false` (or explicitly
+                    ! allow undefined).
+                    if (index(chat_template, 'enable_thinking is defined and enable_thinking is true') > 0 .and. &
+                        index(chat_template, 'enable_thinking is undefined or enable_thinking is true') == 0) then
+                        self%default_enable_thinking = .false.
+                    else
+                        self%default_enable_thinking = .true.
+                    end if
+                    self%supports_reasoning_effort = index(chat_template, 'reasoning_effort') > 0
+                    self%supports_preserve_thinking = index(chat_template, 'preserve_thinking') > 0
+                end if
+            end if
+        end if
         metadata_index = file%find_meta('tokenizer.ggml.tokens')
-        if (metadata_index == 0 .or. .not. allocated(file%metadata(metadata_index)%string_values)) return
+        if (metadata_index == 0) return
+        if (.not. allocated(file%metadata(metadata_index)%string_values)) return
         n = size(file%metadata(metadata_index)%string_values)
         if (n <= 0) return
         max_length = 1
@@ -62,16 +88,18 @@ contains
         self%vocab_size = int(n, int32)
 
         metadata_index = file%find_meta('tokenizer.ggml.merges')
-        if (metadata_index > 0 .and. allocated(file%metadata(metadata_index)%string_values)) then
-            n = size(file%metadata(metadata_index)%string_values)
-            allocate(self%merge_left(n), self%merge_right(n))
-            do i = 1, n
-                merge = file%metadata(metadata_index)%string_values(i)%value
-                separator = index(merge, ' ')
-                if (separator <= 1 .or. separator >= len(merge)) cycle
-                self%merge_left(i)%text = merge(:separator - 1)
-                self%merge_right(i)%text = merge(separator + 1:)
-            end do
+        if (metadata_index > 0) then
+            if (allocated(file%metadata(metadata_index)%string_values)) then
+                n = size(file%metadata(metadata_index)%string_values)
+                allocate(self%merge_left(n), self%merge_right(n))
+                do i = 1, n
+                    merge = file%metadata(metadata_index)%string_values(i)%value
+                    separator = index(merge, ' ')
+                    if (separator <= 1 .or. separator >= len(merge)) cycle
+                    self%merge_left(i)%text = merge(:separator - 1)
+                    self%merge_right(i)%text = merge(separator + 1:)
+                end do
+            end if
         end if
         stat_ok = allocated(self%vocabulary)
     end subroutine native_tokenizer_open
@@ -96,6 +124,9 @@ contains
         self%bos_token = -1_int32
         self%eos_token = -1_int32
         self%add_bos_token = .false.
+        self%default_enable_thinking = .true.
+        self%supports_reasoning_effort = .false.
+        self%supports_preserve_thinking = .false.
     end subroutine native_tokenizer_close
 
     integer function lookup_vocabulary(self, text)
@@ -263,14 +294,14 @@ contains
                     finish = finish + 1
                 end do
             else if (iachar(text(start:start)) == iachar(' ') .or. &
-                iachar(text(start:start)) == iachar(new_line('a'))) then
+                    iachar(text(start:start)) == iachar(new_line('a'))) then
                 do while (finish < len(text) .and. iachar(text(finish + 1:finish + 1)) == iachar(text(start:start)))
                     finish = finish + 1
                 end do
             else
                 do while (finish < len(text) .and. .not. ascii_word_byte(iachar(text(finish + 1:finish + 1))) .and. &
-                    iachar(text(finish + 1:finish + 1)) /= iachar(' ') .and. &
-                    iachar(text(finish + 1:finish + 1)) /= iachar(new_line('a')))
+                        iachar(text(finish + 1:finish + 1)) /= iachar(' ') .and. &
+                        iachar(text(finish + 1:finish + 1)) /= iachar(new_line('a')))
                     finish = finish + 1
                 end do
             end if

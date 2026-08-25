@@ -28,6 +28,9 @@ module fortai_native_service
     public :: fortai_native_service_complete_text_options
     public :: fortai_native_service_complete_text_sampling
     public :: fortai_native_service_close
+    public :: fortai_native_service_default_thinking
+    public :: fortai_native_service_supports_reasoning_effort
+    public :: fortai_native_service_supports_preserve_thinking
 
 contains
 
@@ -106,6 +109,18 @@ contains
         call service_model%close()
         service_ready = .false.
     end subroutine fortai_native_service_close
+
+    logical function fortai_native_service_default_thinking()
+        fortai_native_service_default_thinking = service_tokenizer%default_enable_thinking
+    end function fortai_native_service_default_thinking
+
+    logical function fortai_native_service_supports_reasoning_effort()
+        fortai_native_service_supports_reasoning_effort = service_tokenizer%supports_reasoning_effort
+    end function fortai_native_service_supports_reasoning_effort
+
+    logical function fortai_native_service_supports_preserve_thinking()
+        fortai_native_service_supports_preserve_thinking = service_tokenizer%supports_preserve_thinking
+    end function fortai_native_service_supports_preserve_thinking
 
     integer function fortai_native_service_complete_text(prompt_text, max_tokens, output_text, token_count)
         character(len=*), intent(in) :: prompt_text

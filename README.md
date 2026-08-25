@@ -165,10 +165,12 @@ tokens are removed from the generated message. Sampling accepts `top_k`,
 applies them before decoding (`repeat_last_n=0` disables repetition penalties;
 `-1` covers the full context). Usage reports native prompt/completion token
 counts, and malformed or unsafe token budgets are rejected before allocation.
-`chat_template_kwargs.enable_thinking`
-and Responses `reasoning.effort` use the same Qwen3.5 prompt switch, including
-the exact empty `<think>` block for hard no-thinking mode. Chat and Responses
-requests also accept OpenAI `tools`; the native formatter emits Qwen3.5's
+`chat_template_kwargs.enable_thinking` and Responses `reasoning.effort` use the
+model's GGUF chat-template default and the exact empty `<think>` block for hard
+no-thinking mode. Qwen3.8 `reasoning_effort` (`low`, `medium`, or `xhigh`) and
+`preserve_thinking` are forwarded into the native prompt, including their
+OpenAI-compatible aliases. Chat and Responses requests also accept OpenAI
+`tools`; the native formatter emits Qwen3.5/Qwen3.8's
 `<tool_call><function=...>` protocol and returns structured function-call
 items (including streaming argument deltas). Responses requests accept string
 or message-array `input`, `instructions`, `reasoning.effort`, and streaming

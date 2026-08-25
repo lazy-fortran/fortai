@@ -11,11 +11,13 @@ compatible `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
 `fo build` builds the CPU diagnostic binary. Set `FORTAI_SERVER_BIN` only when
 selecting an already-built FortAI binary explicitly.
 
-The chat and Responses endpoints share the Qwen3.5 template: `enable_thinking`,
-`chat_template_kwargs.enable_thinking`, and `reasoning.effort` select the hard
-thinking/no-thinking prompt form. OpenAI `tools` are formatted natively and
-Qwen3.5 XML tool calls are returned as structured function-call objects and
-streaming argument events. Sampling parameters (`top_k`, `top_p`, `min_p`,
+The chat and Responses endpoints read the thinking default from the GGUF chat
+template: `enable_thinking`, `chat_template_kwargs.enable_thinking`, and
+`reasoning.effort` select the hard thinking/no-thinking prompt form.
+Qwen3.8's `reasoning_effort` and `preserve_thinking` controls are forwarded to
+the prompt as well. OpenAI `tools` are formatted natively and Qwen3.5/Qwen3.8
+XML tool calls are returned as structured function-call objects and streaming
+argument events. Sampling parameters (`top_k`, `top_p`, `min_p`,
 repeat/presence/frequency penalties, and `seed`) are applied by the native
 Fortran decoder rather than being silently ignored. Successful responses
 report native prompt/completion token usage; invalid token budgets fail before
