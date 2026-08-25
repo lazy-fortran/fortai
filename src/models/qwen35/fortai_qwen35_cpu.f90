@@ -1,7 +1,7 @@
 module fortai_qwen35_cpu
     use, intrinsic :: iso_c_binding, only: c_associated, c_char, c_float, c_int, c_int16_t, c_int64_t, c_int8_t, &
         c_null_char, c_null_ptr, c_ptr, c_size_t
-    use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real32, real64
+    use, intrinsic :: iso_fortran_env, only: error_unit, int8, int32, int64, real32, real64
     use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, &
         cuda_q8_ffn_host, cuda_q8_ffn_device, cuda_q8_matvec_host_pair, &
         cuda_q8_matvec_host_triplet, cuda_q8_matvec_host_triplet_contiguous, cuda_q8_weights_t, &
@@ -632,11 +632,12 @@ contains
         end do
         if (have_q4) then
             ! The resident mixed-Q4 path keeps Q8 activations, scratch, and
-            ! Q8 weights on the primary context.  Native MTP deliberately
-            ! stays on the host-boundary path, where splitting Q8 weights is
-            ! still useful.  The disable switch and the historical explicit
-            ! `...=0` spelling retain the old host-boundary behavior.
-            resident_pipeline = .not. native_mtp_requested() .and. self%flash_attention_enabled
+            ! Q8 weights on the primary context.  Native MTP uses the same
+            ! target pipeline; only its small NextN verification head remains
+            ! host-controlled and consumes the downloaded target hidden state.
+            ! The disable switch and the historical explicit `...=0` spelling
+            ! retain the old host-boundary behavior.
+            resident_pipeline = self%flash_attention_enabled
             disable_pipeline_value = ''
             call get_environment_variable('FORTAI_DISABLE_CUDA_Q4_DEVICE_PIPELINE', &
                 disable_pipeline_value, length=disable_pipeline_length)
@@ -947,7 +948,7 @@ contains
                     int(size(self%file%tensors(self%layers(i)%ssm_norm)%bytes), c_size_t), &
                     self%recurrent_state_size, self%recurrent_key_heads, self%recurrent_value_heads, &
                     self%recurrent_head_size, self%recurrent_inner_size, self%norm_epsilon, stat)
-            else if (cuda_recurrent_device_ready(self, i)) then
+            else
                 call self%layers(i)%cuda_recurrent%create_state(self%cuda, &
                     self%file%tensors(self%layers(i)%ssm_conv)%bytes, &
                     int(size(self%file%tensors(self%layers(i)%ssm_conv)%bytes), c_size_t), &
@@ -960,8 +961,6 @@ contains
                     int(size(self%file%tensors(self%layers(i)%ssm_norm)%bytes), c_size_t), &
                     self%recurrent_state_size, self%recurrent_key_heads, self%recurrent_value_heads, &
                     self%recurrent_head_size, self%recurrent_inner_size, self%norm_epsilon, stat)
-            else
-                cycle
             end if
             if (.not. stat%is_ok()) then
                 do j = 1, size(self%layers)
@@ -978,7 +977,6 @@ contains
         end do
         do i = 1, size(self%layers)
             if (self%layers(i)%recurrent) cycle
-            if (.not. cuda_attention_device_ready(self, i)) cycle
             if (size(self%file%tensors(self%layers(i)%q_norm)%bytes) /= &
                 self%attention_head_size * storage_size(self%x(1)) / 8) cycle
             if (size(self%file%tensors(self%layers(i)%k_norm)%bytes) /= &
@@ -1008,7 +1006,10 @@ contains
         end do
         self%cuda_enabled = .true.
         call setup_cuda_device_pipeline(self, cleanup_stat)
-        if (.not. cleanup_stat%is_ok()) call cleanup_stat%clear()
+        if (.not. cleanup_stat%is_ok()) then
+            write(error_unit, '(a)') 'fortai-native: CUDA device pipeline unavailable: ' // trim(cleanup_stat%message)
+            call cleanup_stat%clear()
+        end if
     end subroutine qwen35_cpu_enable_cuda
 
     logical function cuda_split_mode_none()
@@ -1062,10 +1063,6 @@ contains
         self%cuda_device_pipeline = .false.
         self%cuda_graph_enabled = .false.
         self%cuda_graph_ready = .false.
-        ! Native MTP consumes the target pre-output hidden state on the host
-        ! and shares the host KV implementation for its attention block.  Keep
-        ! that stateful hand-off on the host-boundary path.
-        if (self%mtp_active) return
         ! Q8_0 K/V caches are now first-class CUDA-resident storage.  The
         ! attention ABI carries the independent K/V flags, so mixed f16/q8
         ! configurations use the same resident pipeline without a host
@@ -1109,16 +1106,19 @@ contains
         do i = 1, size(self%layers)
             if (self%layers(i)%recurrent) then
                 if (.not. c_associated(self%layers(i)%cuda_recurrent%handle)) then
+                    write(error_unit, '(a,i0)') 'fortai-native: CUDA recurrent pipeline layer unavailable: ', i
                     call stat%set(FORTAI_UNSUPPORTED, 'CUDA recurrent layer is not device resident')
                     return
                 end if
             else
                 if (.not. c_associated(self%layers(i)%cuda_attention%handle)) then
+                    write(error_unit, '(a,i0)') 'fortai-native: CUDA attention pipeline layer unavailable: ', i
                     call stat%set(FORTAI_UNSUPPORTED, 'CUDA attention layer is not device resident')
                     return
                 end if
             end if
             if (.not. cuda_ffn_device_ready(self, self%layers(i))) then
+                write(error_unit, '(a,i0)') 'fortai-native: CUDA FFN pipeline layer unavailable: ', i
                 call stat%set(FORTAI_UNSUPPORTED, 'CUDA FFN layer is not device resident')
                 return
             end if
@@ -1779,6 +1779,19 @@ contains
             self%cuda_graph_ready = .true.
             call self%cuda%graph_launch(stat)
             if (.not. stat%is_ok()) return
+        end if
+
+        ! Native MTP's NextN head is intentionally host-controlled, but the
+        ! target transformer remains device-resident.  Preserve the final
+        ! target hidden state before returning the CUDA logits so the next
+        ! token's host-side MTP verification can consume it without forcing
+        ! the whole target decode back through the host-boundary path.  This
+        ! download must happen after graph capture has ended.
+        if (self%cuda_device_pipeline .and. self%mtp_active) then
+            call self%cuda%download_real(self%cuda_x, self%x, stat)
+            if (.not. stat%is_ok()) return
+            self%mtp_pending_hidden = self%x
+            self%mtp_last_target_position = position
         end if
 
         if (self%cuda_device_pipeline) then

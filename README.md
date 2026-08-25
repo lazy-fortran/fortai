@@ -15,8 +15,10 @@ CUDA Graph replay is available as an explicit opt-in, but is disabled by
 default on the tested RTX 5060 Ti until it passes the end-to-end gate; Q4
 mixed-quant `UD-Q4_K_XL` tensors are now handled natively through the exact
 GGML CPU decoder and a persistent two-GPU GGML CUDA bridge. Native Qwen3.8
-NextN/MTP is correctness-stable on the host-controlled KV path; the
-workload-specific speed gate remains explicit. A separate
+NextN/MTP is correctness-stable with a CUDA-resident target decode whenever
+the configured KV cache fits; the small NextN verification head consumes an
+explicit hidden-state handoff, with a host-boundary fallback when VRAM is
+insufficient. The workload-specific speed gate remains explicit. A separate
 compatibility smoke remains available as an independent upstream llama.cpp
 oracle.
 
@@ -154,12 +156,13 @@ tensor splitting. The CUDA runner reports `vram_*_bytes` before and after
 loading so the memory delta can be compared with llama.cpp under the same
 profile. Qwen3.8-style embedded NextN/MTP heads are also bound by the native
 Fortran Qwen3.5 runtime. Set `FORTAI_NATIVE_MTP=1` (or
-`FORTAI_SPEC_TYPE=draft-mtp`) to enable the host-controlled MTP KV path; it
-keeps greedy target output exact and disables the device-resident graph until
-hidden-state export is available. The resident llama.cpp adapter remains the
-reference path for true batched speculative throughput. FortAI accepts and
-validates the configured external draft path, while native speculative
-execution currently consumes the model's embedded NextN head. The production
+`FORTAI_SPEC_TYPE=draft-mtp`) to enable the native MTP path; it keeps greedy
+target output exact and uses the CUDA-resident target pipeline whenever the
+KV allocation fits, with a host-controlled NextN verification handoff. The
+resident llama.cpp adapter remains the reference path for true batched
+speculative throughput. FortAI accepts and validates the configured external
+draft path, while native speculative execution consumes the model's embedded
+NextN head when a matching MTP sidecar is supplied. The production
 service is FortAI-owned: build
 it with `tools/build_cuda_server.sh` and launch
 `tools/fortai-server --model MODEL.gguf --port 8080`. It loads the model
@@ -192,8 +195,8 @@ primary CUDA context while Q4 tensors are split across the configured GPUs,
 avoiding invalid cross-context matvecs. Set
 `FORTAI_DISABLE_CUDA_Q4_DEVICE_PIPELINE=1` (or the compatibility spelling
 `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=0`) to select the host-boundary route.
-Native `draft-mtp` intentionally uses the host-boundary route because its
-hidden-state handoff is host-controlled.
+Native `draft-mtp` keeps only the NextN verification head on the host; the
+target decode remains resident when the configured context fits in VRAM.
 Multimodal
 projector paths are accepted and surfaced in `/health`; image-token execution
 is not yet part of the native Qwen runtime. A standalone `--model-draft` is
@@ -213,8 +216,9 @@ the native two-device Q4 placement policy.
 Main native K/V caches support `f32`, `f16`, and `q8_0`; q8_0 storage is
 quantized with llama-compatible FP16 scales and is validated against the
 independent CUDA/CPU trace oracle. With native CUDA selected, q8_0 K/V stays
-device-resident, including full-context streaming softmax; the host cache is
-retained only for the host-controlled/MTP path.
+device-resident, including full-context streaming softmax, whenever the
+resident allocation fits; the host cache is retained for the host-boundary
+fallback and the MTP verification head.
 
 Benchmark results, logs, and perf data stay machine-local under
 `benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts

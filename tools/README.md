@@ -19,10 +19,12 @@ budget, mmproj path/offload, and `--no-webui`) and mirrors their
 `LLAMA_ARG_*` and legacy `LLAMACPP_*` environment variables into `FORTAI_*`.
 `/health` reports the effective values. Main Qwen K/V caches support `f16`,
 `f32`, and `q8_0`; native
-CUDA keeps q8_0 K/V resident with mixed f16/q8_0 combinations, while the
-host-controlled/MTP path uses the same quantization layout on the host. The
-native MTP path uses the embedded NextN head and its two-token greedy
-speculative step; the target model remains the correctness oracle. A standalone
+CUDA keeps q8_0 K/V resident with mixed f16/q8_0 combinations whenever the
+requested context fits, while the host-boundary fallback uses the same
+quantization layout on the host. The native MTP path uses the embedded NextN
+head and its two-token greedy speculative step; its target decode remains
+CUDA-resident when possible and the target model remains the correctness
+oracle. A standalone
 external draft model is loaded and advanced by the native Fortran service for
 greedy requests when it is a real transformer draft (MTP sidecars are bound to
 the target's NextN path).
