@@ -82,7 +82,8 @@ struct fortai_cuda_q4_context {
     void *bridge_output[2] = {nullptr, nullptr};
     size_t bridge_activation_bytes[2] = {0, 0};
     size_t bridge_output_bytes[2] = {0, 0};
-    std::vector<unsigned char> host_bridge;
+    void *host_bridge = nullptr;
+    size_t host_bridge_bytes = 0;
     std::vector<fortai_cuda_q4_group_plan> group_plans;
 };
 
@@ -257,6 +258,7 @@ int fortai_cuda_q4_context_destroy(fortai_cuda_q4_context * context) {
         cudaFree(context->bridge_activation[i]);
         cudaFree(context->bridge_output[i]);
     }
+    cudaFreeHost(context->host_bridge);
     if (context->devices[0] != nullptr) ggml_backend_free(context->devices[0]);
     if (context->devices[1] != nullptr && context->devices[1] != context->devices[0])
         ggml_backend_free(context->devices[1]);
@@ -538,12 +540,18 @@ static int fortai_cuda_q4_copy_between_devices(fortai_cuda_q4_context *context,
             return FORTAI_CUDA_RUNTIME_ERROR;
         return FORTAI_CUDA_OK;
     }
-    if (context->host_bridge.size() < bytes) context->host_bridge.resize(bytes);
+    if (context->host_bridge_bytes < bytes) {
+        cudaFreeHost(context->host_bridge);
+        context->host_bridge = nullptr;
+        if (cudaHostAlloc(&context->host_bridge, bytes, cudaHostAllocPortable) != cudaSuccess)
+            return FORTAI_CUDA_RUNTIME_ERROR;
+        context->host_bridge_bytes = bytes;
+    }
     if (cudaSetDevice(source_device) != cudaSuccess ||
-        cudaMemcpy(context->host_bridge.data(), source, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+        cudaMemcpy(context->host_bridge, source, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
         return FORTAI_CUDA_RUNTIME_ERROR;
     if (cudaSetDevice(destination_device) != cudaSuccess ||
-        cudaMemcpy(destination, context->host_bridge.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+        cudaMemcpy(destination, context->host_bridge, bytes, cudaMemcpyHostToDevice) != cudaSuccess)
         return FORTAI_CUDA_RUNTIME_ERROR;
     return FORTAI_CUDA_OK;
 }
@@ -748,6 +756,112 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
             }
         }
     }
+    return FORTAI_CUDA_OK;
+}
+
+int fortai_cuda_q4_matvec_device_group_remote_output(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights * const *weights, const void *device_activation,
+    size_t activation_elements, void * const *device_outputs,
+    const size_t *output_elements, int count) {
+    if (context == nullptr || weights == nullptr || device_activation == nullptr ||
+        device_outputs == nullptr || output_elements == nullptr || count < 1 || count > 3 ||
+        activation_elements == 0 || context->device_ids[0] == context->device_ids[1])
+        return FORTAI_CUDA_INVALID;
+
+    const int primary_device = context->device_ids[0];
+    const int remote_device = context->device_ids[1];
+    const size_t activation_bytes = activation_elements * sizeof(float);
+    for (int i = 0; i < count; ++i) {
+        if (weights[i] == nullptr || weights[i]->owner != context ||
+            weights[i]->device != remote_device || device_outputs[i] == nullptr ||
+            output_elements[i] < static_cast<size_t>(weights[i]->output->ne[0]) ||
+            activation_elements != static_cast<size_t>(weights[i]->activation->ne[0]))
+            return FORTAI_CUDA_INVALID;
+    }
+
+    /* The input is produced by FortAI's primary stream.  Complete that
+     * stream before the unavoidable host staging copy, then leave the
+     * projection output on the remote device for the attention core. */
+    if (fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    if (context->consumer_stream[0] != nullptr &&
+        (cudaSetDevice(primary_device) != cudaSuccess ||
+         cudaStreamSynchronize(context->consumer_stream[0]) != cudaSuccess))
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    int code = fortai_cuda_q4_ensure_bridge(context, 1, activation_bytes, 0);
+    if (code != FORTAI_CUDA_OK) return code;
+    if (fortai_cuda_q4_copy_between_devices(context, context->bridge_activation[1], remote_device,
+            device_activation, primary_device, activation_bytes) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+
+    int members[3] = {0, 1, 2};
+    fortai_cuda_q4_group_plan *plan =
+        fortai_cuda_q4_find_device_group_plan(context, weights, members, count);
+    if (plan == nullptr) return FORTAI_CUDA_RUNTIME_ERROR;
+    void *saved_activation[3] = {nullptr, nullptr, nullptr};
+    void *saved_output[3] = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < count; ++i) {
+        saved_activation[i] = weights[i]->activation->data;
+        saved_output[i] = weights[i]->output->data;
+        weights[i]->activation->data = context->bridge_activation[1];
+        weights[i]->output->data = device_outputs[i];
+    }
+    enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
+    if (status == GGML_STATUS_SUCCESS) {
+        /* When the Q8 consumer stream is attached, publish a device-side
+         * event instead of blocking the host on every remote attention/FFN
+         * group.  The following second-device kernel waits on that event;
+         * retain the synchronous fallback for standalone callers. */
+        if (context->consumer_stream[1] != nullptr) {
+            if (fortai_cuda_q4_publish_output(context, plan->backend, remote_device) != FORTAI_CUDA_OK)
+                status = GGML_STATUS_FAILED;
+        } else {
+            ggml_backend_synchronize(plan->backend);
+        }
+    }
+    for (int i = 0; i < count; ++i) {
+        weights[i]->activation->data = saved_activation[i];
+        weights[i]->output->data = saved_output[i];
+    }
+    return status == GGML_STATUS_SUCCESS ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
+}
+
+int fortai_cuda_q4_matvec_device_remote_input(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements) {
+    if (context == nullptr || weights == nullptr || weights->owner != context ||
+        device_activation == nullptr || device_output == nullptr || activation_elements == 0 ||
+        context->device_ids[0] == context->device_ids[1] ||
+        weights->device != context->device_ids[1] ||
+        output_elements < static_cast<size_t>(weights->output->ne[0]) ||
+        activation_elements != static_cast<size_t>(weights->activation->ne[0]))
+        return FORTAI_CUDA_INVALID;
+
+    const int primary_device = context->device_ids[0];
+    const int remote_device = context->device_ids[1];
+    const size_t activation_bytes = activation_elements * sizeof(float);
+    const size_t output_bytes = static_cast<size_t>(weights->output->ne[0]) * sizeof(float);
+
+    /* The attention core and this Q4 graph use different stream owners.  The
+     * attached second-device consumer stream turns the dependency into a
+     * device-side event wait; no host download of the attention work is
+     * needed before launching the projection. */
+    if (fortai_cuda_q4_prepare_input(context, remote_device) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    int code = fortai_cuda_q4_ensure_bridge(context, 1, activation_bytes, output_bytes);
+    if (code != FORTAI_CUDA_OK) return code;
+    void *saved_activation = weights->activation->data;
+    void *saved_output = weights->output->data;
+    weights->activation->data = const_cast<void *>(device_activation);
+    weights->output->data = context->bridge_output[1];
+    enum ggml_status status = ggml_backend_graph_compute_async(weights->backend, weights->graph);
+    if (status == GGML_STATUS_SUCCESS) ggml_backend_synchronize(weights->backend);
+    weights->activation->data = saved_activation;
+    weights->output->data = saved_output;
+    if (status != GGML_STATUS_SUCCESS) return FORTAI_CUDA_RUNTIME_ERROR;
+    if (fortai_cuda_q4_copy_between_devices(context, device_output, primary_device,
+            context->bridge_output[1], remote_device, output_bytes) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
     return FORTAI_CUDA_OK;
 }
 

@@ -667,21 +667,31 @@ __global__ void qwen_add_float(const float *left, const float *right, float *out
 
 __global__ void qwen_rms_norm_float(const float *input, const float *weights,
     float *output, int elements, float epsilon) {
-    extern __shared__ double norm_partial[];
+    /* The hidden width is normally 8k--32k.  A double shared-memory tree
+     * made every RMS norm a serialized ~12 us kernel on Ada; a warp shuffle
+     * reduction keeps the same one-block launch but uses the hardware's
+     * native FP32 path, matching llama.cpp's RMS implementation. */
+    __shared__ float norm_partial[8];
     const int lane = static_cast<int>(threadIdx.x);
-    double sum = 0.0;
+    const int warp = lane >> 5;
+    const int lane_in_warp = lane & 31;
+    float sum = 0.0f;
     for (int index = lane; index < elements; index += blockDim.x) {
-        const double value = static_cast<double>(input[index]);
-        sum += value * value;
+        const float value = input[index];
+        sum = fmaf(value, value, sum);
     }
-    norm_partial[lane] = sum;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane_in_warp == 0) norm_partial[warp] = sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) norm_partial[lane] += norm_partial[lane + stride];
-        __syncthreads();
+    if (warp == 0) {
+        sum = lane_in_warp < 8 ? norm_partial[lane_in_warp] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane_in_warp == 0) norm_partial[0] = sum;
     }
-    const float inverse = static_cast<float>(1.0 / sqrt(
-        norm_partial[0] / static_cast<double>(elements) + static_cast<double>(epsilon)));
+    __syncthreads();
+    const float inverse = 1.0f / sqrtf(norm_partial[0] / static_cast<float>(elements) + epsilon);
     for (int index = lane; index < elements; index += blockDim.x)
         output[index] = input[index] * inverse * weights[index];
 }
@@ -1452,7 +1462,7 @@ extern "C" int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *contex
         elements > static_cast<size_t>(INT32_MAX) || epsilon <= 0.0f)
         return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);
-    qwen_rms_norm_float<<<1, 256, 256 * sizeof(double), context->impl.stream>>>(
+    qwen_rms_norm_float<<<1, 256, 0, context->impl.stream>>>(
         static_cast<const float *>(device_input), static_cast<const float *>(device_weights),
         static_cast<float *>(device_output), static_cast<int>(elements), epsilon);
     const cudaError_t error = cudaGetLastError();

@@ -176,6 +176,11 @@ module fortai_gguf_runtime
         integer(int64) :: byte_count = 0_int64
         integer(int8), pointer, contiguous :: bytes(:) => null()
         logical :: bytes_mapped = .false.
+        ! True when bytes point into a different GGUF mapping (for example an
+        ! MTP sidecar rebound into the main model).  Such a tensor is safe to
+        ! nullify on close, but its file-offset must not be evicted through the
+        ! owning GGUF file.
+        logical :: bytes_mapped_external = .false.
         real(real32), allocatable :: decoded_values(:)
     contains
         procedure :: dot => gguf_tensor_dot
@@ -354,6 +359,7 @@ contains
         end if
         do i = 1, int(self%tensor_count)
             self%tensors(i)%bytes_mapped = .false.
+            self%tensors(i)%bytes_mapped_external = .false.
             tensor_offset_c = int(self%data_start + self%tensors(i)%file_offset, c_size_t)
             if (self%mapped .and. self%tensors(i)%byte_count <= int(huge(0), int64)) then
                 tensor_slice = fortai_gguf_mmap_slice(self%mapped_base, tensor_offset_c, &
@@ -393,6 +399,7 @@ contains
                     end if
                 end if
                 self%tensors(i)%bytes_mapped = .false.
+                self%tensors(i)%bytes_mapped_external = .false.
                 if (allocated(self%tensors(i)%decoded_values)) &
                     deallocate (self%tensors(i)%decoded_values)
                 if (allocated(self%tensors(i)%shape)) deallocate (self%tensors(i)%shape)
@@ -438,7 +445,8 @@ contains
         keep = 0
         if (present(keep_index)) keep = keep_index
         do i = 1, size(self%tensors)
-            if (i == keep .or. .not. self%tensors(i)%bytes_mapped) cycle
+            if (i == keep .or. .not. self%tensors(i)%bytes_mapped .or. &
+                self%tensors(i)%bytes_mapped_external) cycle
             tensor_offset = int(self%data_start + self%tensors(i)%file_offset, c_size_t)
             code = fortai_gguf_mmap_evict(self%mapped_base, tensor_offset, &
                 int(self%tensors(i)%byte_count, c_size_t), self%mapped_size)

@@ -136,6 +136,32 @@ int FORTAI_WEAK fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *conte
     return unavailable();
 }
 
+int FORTAI_WEAK fortai_cuda_q4_matvec_device_group_remote_output(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights * const *weights, const void *device_activation,
+    size_t activation_elements, void * const *device_outputs,
+    const size_t *output_elements, int count) {
+    (void)context;
+    (void)weights;
+    (void)device_activation;
+    (void)activation_elements;
+    (void)device_outputs;
+    (void)output_elements;
+    (void)count;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q4_matvec_device_remote_input(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements) {
+    (void)context;
+    (void)weights;
+    (void)device_activation;
+    (void)activation_elements;
+    (void)device_output;
+    (void)output_elements;
+    return unavailable();
+}
+
 int FORTAI_WEAK fortai_cuda_q4_embedding_device(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights *weights, int64_t token_id,
     void *device_output, size_t output_elements) {

@@ -13,15 +13,26 @@ module fortai_native_tokenizer
         integer(int32) :: bos_token = -1_int32
         integer(int32) :: eos_token = -1_int32
         logical :: add_bos_token = .false.
+        logical :: qwen35_pretokenizer = .false.
         ! Qwen ships both thinking-default and no-thinking-default chat
         ! templates.  Keep the template policy with the tokenizer rather
         ! than guessing from the model filename in the HTTP layer.
         logical :: default_enable_thinking = .true.
         logical :: supports_reasoning_effort = .false.
         logical :: supports_preserve_thinking = .false.
-        type(piece_t), allocatable :: vocabulary(:)
-        type(piece_t), allocatable :: merge_left(:)
-        type(piece_t), allocatable :: merge_right(:)
+        ! GGUF vocabularies are large (Qwen3.8 has ~248k entries).  Keeping
+        ! every piece as a separately allocated deferred-length character
+        ! object makes startup allocator-bound and needlessly fragments RSS.
+        ! Store the immutable text in compact contiguous blobs instead.
+        character(len=:), allocatable :: vocabulary_blob
+        integer(int32), allocatable :: vocabulary_offset(:)
+        integer(int32), allocatable :: vocabulary_length(:)
+        character(len=:), allocatable :: merge_left_blob
+        character(len=:), allocatable :: merge_right_blob
+        integer(int32), allocatable :: merge_left_offset(:)
+        integer(int32), allocatable :: merge_left_length(:)
+        integer(int32), allocatable :: merge_right_offset(:)
+        integer(int32), allocatable :: merge_right_length(:)
     contains
         procedure :: close => native_tokenizer_close
         procedure :: open => native_tokenizer_open
@@ -37,13 +48,22 @@ contains
         class(fortai_native_tokenizer_t), intent(inout) :: self
         type(gguf_file_t), intent(in) :: file
         logical, intent(out) :: stat_ok
-        integer :: metadata_index, i, n, max_length, separator
-        character(len=:), allocatable :: merge, chat_template
+        integer :: metadata_index, i, n, separator, length
+        integer(int64) :: total_length, total_left_length, total_right_length, position
+        character(len=:), allocatable :: chat_template
 
         call self%close()
         stat_ok = .false.
         self%bos_token = int(file%meta_int('tokenizer.ggml.bos_token_id', -1_int64), int32)
         self%eos_token = int(file%meta_int('tokenizer.ggml.eos_token_id', -1_int64), int32)
+        metadata_index = file%find_meta('tokenizer.ggml.pre')
+        if (metadata_index > 0) then
+            if (file%metadata(metadata_index)%value_type == 8) then
+                if (allocated(file%metadata(metadata_index)%string_value)) then
+                    self%qwen35_pretokenizer = trim(file%metadata(metadata_index)%string_value) == 'qwen35'
+                end if
+            end if
+        end if
         ! GGUF does not require BOS on every encoded string.  In particular,
         ! Qwen3.5's tokenizer omits tokenizer.ggml.add_bos_token and llama.cpp
         ! therefore starts a chat prompt directly with <|im_start|>.  Treat a
@@ -77,13 +97,20 @@ contains
         if (.not. allocated(file%metadata(metadata_index)%string_values)) return
         n = size(file%metadata(metadata_index)%string_values)
         if (n <= 0) return
-        max_length = 1
+        total_length = 0_int64
         do i = 1, n
-            max_length = max(max_length, len(file%metadata(metadata_index)%string_values(i)%value))
+            total_length = total_length + len(file%metadata(metadata_index)%string_values(i)%value)
         end do
-        allocate(self%vocabulary(n))
+        allocate(character(len=max(1_int64, total_length)) :: self%vocabulary_blob)
+        allocate(self%vocabulary_offset(n), self%vocabulary_length(n))
+        position = 1_int64
         do i = 1, n
-            self%vocabulary(i)%text = file%metadata(metadata_index)%string_values(i)%value
+            length = len(file%metadata(metadata_index)%string_values(i)%value)
+            self%vocabulary_offset(i) = int(position, int32)
+            self%vocabulary_length(i) = int(length, int32)
+            if (length > 0) self%vocabulary_blob(position:position + length - 1) = &
+                file%metadata(metadata_index)%string_values(i)%value
+            position = position + length
         end do
         self%vocab_size = int(n, int32)
 
@@ -91,39 +118,62 @@ contains
         if (metadata_index > 0) then
             if (allocated(file%metadata(metadata_index)%string_values)) then
                 n = size(file%metadata(metadata_index)%string_values)
-                allocate(self%merge_left(n), self%merge_right(n))
+                total_left_length = 0_int64
+                total_right_length = 0_int64
                 do i = 1, n
-                    merge = file%metadata(metadata_index)%string_values(i)%value
-                    separator = index(merge, ' ')
-                    if (separator <= 1 .or. separator >= len(merge)) cycle
-                    self%merge_left(i)%text = merge(:separator - 1)
-                    self%merge_right(i)%text = merge(separator + 1:)
+                    separator = index(file%metadata(metadata_index)%string_values(i)%value, ' ')
+                    if (separator <= 1 .or. separator >= len(file%metadata(metadata_index)%string_values(i)%value)) cycle
+                    total_left_length = total_left_length + separator - 1
+                    total_right_length = total_right_length + &
+                        len(file%metadata(metadata_index)%string_values(i)%value) - separator
+                end do
+                allocate(character(len=max(1_int64, total_left_length)) :: self%merge_left_blob)
+                allocate(character(len=max(1_int64, total_right_length)) :: self%merge_right_blob)
+                allocate(self%merge_left_offset(n), self%merge_left_length(n), &
+                    self%merge_right_offset(n), self%merge_right_length(n))
+                self%merge_left_offset = 0_int32
+                self%merge_left_length = 0_int32
+                self%merge_right_offset = 0_int32
+                self%merge_right_length = 0_int32
+                position = 1_int64
+                total_right_length = 1_int64
+                do i = 1, n
+                    separator = index(file%metadata(metadata_index)%string_values(i)%value, ' ')
+                    if (separator <= 1 .or. separator >= len(file%metadata(metadata_index)%string_values(i)%value)) cycle
+                    length = separator - 1
+                    self%merge_left_offset(i) = int(position, int32)
+                    self%merge_left_length(i) = int(length, int32)
+                    self%merge_left_blob(position:position + length - 1) = &
+                        file%metadata(metadata_index)%string_values(i)%value(:length)
+                    position = position + length
+                    length = len(file%metadata(metadata_index)%string_values(i)%value) - separator
+                    self%merge_right_offset(i) = int(total_right_length, int32)
+                    self%merge_right_length(i) = int(length, int32)
+                    self%merge_right_blob(total_right_length:total_right_length + length - 1) = &
+                        file%metadata(metadata_index)%string_values(i)%value(separator + 1:)
+                    total_right_length = total_right_length + length
                 end do
             end if
         end if
-        stat_ok = allocated(self%vocabulary)
+        stat_ok = allocated(self%vocabulary_offset)
     end subroutine native_tokenizer_open
 
     subroutine native_tokenizer_close(self)
         class(fortai_native_tokenizer_t), intent(inout) :: self
-        integer :: i
-        if (allocated(self%vocabulary)) then
-            do i = 1, size(self%vocabulary)
-                if (allocated(self%vocabulary(i)%text)) deallocate(self%vocabulary(i)%text)
-            end do
-            deallocate(self%vocabulary)
-        end if
-        if (allocated(self%merge_left)) then
-            do i = 1, size(self%merge_left)
-                if (allocated(self%merge_left(i)%text)) deallocate(self%merge_left(i)%text)
-                if (allocated(self%merge_right(i)%text)) deallocate(self%merge_right(i)%text)
-            end do
-            deallocate(self%merge_left, self%merge_right)
-        end if
+        if (allocated(self%vocabulary_blob)) deallocate(self%vocabulary_blob)
+        if (allocated(self%vocabulary_offset)) deallocate(self%vocabulary_offset)
+        if (allocated(self%vocabulary_length)) deallocate(self%vocabulary_length)
+        if (allocated(self%merge_left_blob)) deallocate(self%merge_left_blob)
+        if (allocated(self%merge_right_blob)) deallocate(self%merge_right_blob)
+        if (allocated(self%merge_left_offset)) deallocate(self%merge_left_offset)
+        if (allocated(self%merge_left_length)) deallocate(self%merge_left_length)
+        if (allocated(self%merge_right_offset)) deallocate(self%merge_right_offset)
+        if (allocated(self%merge_right_length)) deallocate(self%merge_right_length)
         self%vocab_size = 0_int32
         self%bos_token = -1_int32
         self%eos_token = -1_int32
         self%add_bos_token = .false.
+        self%qwen35_pretokenizer = .false.
         self%default_enable_thinking = .true.
         self%supports_reasoning_effort = .false.
         self%supports_preserve_thinking = .false.
@@ -134,13 +184,16 @@ contains
         character(len=*), intent(in) :: text
         integer :: i
         lookup_vocabulary = -1
-        if (.not. allocated(self%vocabulary)) return
-        do i = 1, size(self%vocabulary)
-            if (allocated(self%vocabulary(i)%text)) then
-                if (self%vocabulary(i)%text == text) then
-                    lookup_vocabulary = i - 1
-                    return
-                end if
+        if (.not. allocated(self%vocabulary_offset)) return
+        do i = 1, size(self%vocabulary_offset)
+            if (self%vocabulary_length(i) /= len(text)) cycle
+            if (len(text) == 0) then
+                lookup_vocabulary = i - 1
+                return
+            else if (self%vocabulary_blob(self%vocabulary_offset(i): &
+                    self%vocabulary_offset(i) + self%vocabulary_length(i) - 1) == text) then
+                lookup_vocabulary = i - 1
+                return
             end if
         end do
     end function lookup_vocabulary
@@ -150,10 +203,18 @@ contains
         character(len=*), intent(in) :: left, right
         integer :: i
         lookup_merge = huge(0)
-        if (.not. allocated(self%merge_left)) return
-        do i = 1, size(self%merge_left)
-            if (.not. allocated(self%merge_left(i)%text)) cycle
-            if (self%merge_left(i)%text == left .and. self%merge_right(i)%text == right) then
+        if (.not. allocated(self%merge_left_offset)) return
+        do i = 1, size(self%merge_left_offset)
+            if (self%merge_left_length(i) /= len(left) .or. self%merge_right_length(i) /= len(right)) cycle
+            if (len(left) > 0) then
+                if (self%merge_left_blob(self%merge_left_offset(i): &
+                    self%merge_left_offset(i) + self%merge_left_length(i) - 1) /= left) cycle
+            end if
+            if (len(right) > 0) then
+                if (self%merge_right_blob(self%merge_right_offset(i): &
+                    self%merge_right_offset(i) + self%merge_right_length(i) - 1) /= right) cycle
+            end if
+            if (self%merge_left_length(i) == len(left) .and. self%merge_right_length(i) == len(right)) then
                 lookup_merge = i
                 return
             end if
@@ -284,6 +345,11 @@ contains
         integer, intent(inout) :: count, capacity
         integer :: start, finish, n, value
         character(len=:), allocatable :: piece
+
+        if (self%qwen35_pretokenizer) then
+            call encode_plain_qwen35(self, text, output, count, capacity)
+            return
+        end if
         start = 1
         do while (start <= len(text))
             finish = start
@@ -316,6 +382,273 @@ contains
             start = finish + 1
         end do
     end subroutine encode_plain
+
+    subroutine encode_plain_qwen35(self, text, output, count, capacity)
+        class(fortai_native_tokenizer_t), intent(in) :: self
+        character(len=*), intent(in) :: text
+        integer(int32), intent(inout) :: output(:)
+        integer, intent(inout) :: count, capacity
+        integer :: position, cursor, finish, width, codepoint
+        integer :: next_width, next_codepoint, contraction_length
+        integer :: scan_width, scan_codepoint
+        logical :: prefix_word, prefix_punctuation
+
+        ! This is the Qwen3.5 GPT-2 pre-tokenizer expressed as a small UTF-8
+        ! scanner.  In particular, its optional leading character before a
+        ! word includes tabs and punctuation ("\twith" is one pre-token), and
+        ! numbers are split one Unicode code point at a time.  BPE itself is
+        ! still performed by encode_piece, so the scanner only determines the
+        ! merge boundaries.
+        position = 1
+        do while (position <= len(text))
+            call utf8_decode(text, position, codepoint, width)
+            finish = position + width - 1
+            prefix_word = .false.
+            prefix_punctuation = .false.
+            if (qwen35_is_optional_prefix(codepoint)) then
+                cursor = position + width
+                if (cursor <= len(text)) then
+                    call utf8_decode(text, cursor, next_codepoint, next_width)
+                    if (qwen35_is_word(next_codepoint)) then
+                        prefix_word = .true.
+                    else if (codepoint == iachar(' ') .and. .not. qwen35_is_whitespace(next_codepoint) .and. &
+                            .not. qwen35_is_number(next_codepoint)) then
+                        prefix_punctuation = .true.
+                    end if
+                end if
+            end if
+            contraction_length = qwen35_contraction_length(text, position)
+            if (contraction_length > 0) then
+                finish = position + contraction_length - 1
+            else if (qwen35_is_number(codepoint)) then
+                continue
+            else if (qwen35_is_word(codepoint)) then
+                cursor = position + width
+                do while (cursor <= len(text))
+                    call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                    if (.not. qwen35_is_word(scan_codepoint)) exit
+                    finish = cursor + scan_width - 1
+                    cursor = finish + 1
+                end do
+            else if (prefix_word) then
+                cursor = position + width
+                call utf8_decode(text, cursor, next_codepoint, next_width)
+                finish = cursor + next_width - 1
+                cursor = finish + 1
+                do while (cursor <= len(text))
+                    call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                    if (.not. qwen35_is_word(scan_codepoint)) exit
+                    finish = cursor + scan_width - 1
+                    cursor = finish + 1
+                end do
+            else if (prefix_punctuation) then
+                cursor = position + width
+                finish = cursor - 1
+                do while (cursor <= len(text))
+                    call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                    if (qwen35_is_whitespace(scan_codepoint) .or. qwen35_is_word(scan_codepoint) .or. &
+                        qwen35_is_number(scan_codepoint)) exit
+                    finish = cursor + scan_width - 1
+                    cursor = finish + 1
+                end do
+                if (cursor <= len(text)) then
+                    call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                    if (qwen35_is_newline(scan_codepoint)) finish = cursor + scan_width - 1
+                end if
+            else if (qwen35_is_whitespace(codepoint)) then
+                if (qwen35_is_newline(codepoint)) then
+                    cursor = position + width
+                    do while (cursor <= len(text))
+                        call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                        if (.not. qwen35_is_newline(scan_codepoint)) exit
+                        finish = cursor + scan_width - 1
+                        cursor = finish + 1
+                    end do
+                else
+                    cursor = position
+                    do while (cursor <= len(text))
+                        call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                        if (.not. qwen35_is_whitespace(scan_codepoint)) exit
+                        if (qwen35_is_newline(scan_codepoint)) then
+                            finish = cursor + scan_width - 1
+                            cursor = finish + 1
+                            do while (cursor <= len(text))
+                                call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                                if (.not. qwen35_is_newline(scan_codepoint)) exit
+                                finish = cursor + scan_width - 1
+                                cursor = finish + 1
+                            end do
+                            exit
+                        end if
+                        finish = cursor + scan_width - 1
+                        cursor = finish + 1
+                    end do
+                end if
+            else
+                ! Optional ASCII space before a punctuation run.
+                cursor = position
+                if (codepoint == iachar(' ')) then
+                    cursor = position + width
+                    if (cursor <= len(text)) then
+                        call utf8_decode(text, cursor, next_codepoint, next_width)
+                        if (qwen35_is_whitespace(next_codepoint) .or. qwen35_is_word(next_codepoint) .or. &
+                            qwen35_is_number(next_codepoint)) then
+                            cursor = position
+                        end if
+                    end if
+                end if
+                if (cursor > position) then
+                    finish = cursor - 1
+                end if
+                do while (cursor <= len(text))
+                    call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                    if (qwen35_is_whitespace(scan_codepoint) .or. qwen35_is_word(scan_codepoint) .or. &
+                        qwen35_is_number(scan_codepoint)) exit
+                    finish = cursor + scan_width - 1
+                    cursor = finish + 1
+                end do
+                if (cursor <= len(text)) then
+                    call utf8_decode(text, cursor, scan_codepoint, scan_width)
+                    if (qwen35_is_newline(scan_codepoint) .or. scan_codepoint == iachar('/')) then
+                        finish = cursor + scan_width - 1
+                    end if
+                end if
+            end if
+            call encode_piece(self, text(position:finish), output, count, capacity)
+            position = finish + 1
+        end do
+    end subroutine encode_plain_qwen35
+
+    integer function qwen35_contraction_length(text, position)
+        character(len=*), intent(in) :: text
+        integer, intent(in) :: position
+        integer :: first, second
+
+        qwen35_contraction_length = 0
+        if (position > len(text)) return
+        if (iachar(text(position:position)) /= iachar("'")) return
+        if (position + 1 > len(text)) return
+        first = qwen35_lower_ascii(iachar(text(position + 1:position + 1)))
+        if (first == iachar('s') .or. first == iachar('t') .or. first == iachar('m') .or. &
+            first == iachar('d')) then
+            qwen35_contraction_length = 2
+            return
+        end if
+        if (first == iachar('r') .or. first == iachar('v') .or. first == iachar('l')) then
+            if (position + 2 > len(text)) return
+            second = qwen35_lower_ascii(iachar(text(position + 2:position + 2)))
+            if ((first == iachar('r') .or. first == iachar('v')) .and. second == iachar('e')) then
+                qwen35_contraction_length = 3
+            else if (first == iachar('l') .and. second == iachar('l')) then
+                qwen35_contraction_length = 3
+            end if
+        end if
+    end function qwen35_contraction_length
+
+    integer function qwen35_lower_ascii(value)
+        integer, intent(in) :: value
+        qwen35_lower_ascii = value
+        if (value >= iachar('A') .and. value <= iachar('Z')) qwen35_lower_ascii = value + 32
+    end function qwen35_lower_ascii
+
+    logical function qwen35_is_number(codepoint)
+        integer, intent(in) :: codepoint
+
+        qwen35_is_number = (codepoint >= int(z'30') .and. codepoint <= int(z'39')) .or. &
+            (codepoint >= int(z'0660') .and. codepoint <= int(z'0669')) .or. &
+            (codepoint >= int(z'06f0') .and. codepoint <= int(z'06f9')) .or. &
+            (codepoint >= int(z'0966') .and. codepoint <= int(z'096f')) .or. &
+            (codepoint >= int(z'09e6') .and. codepoint <= int(z'09ef')) .or. &
+            (codepoint >= int(z'0a66') .and. codepoint <= int(z'0a6f')) .or. &
+            (codepoint >= int(z'0ae6') .and. codepoint <= int(z'0aef')) .or. &
+            (codepoint >= int(z'0b66') .and. codepoint <= int(z'0b6f')) .or. &
+            (codepoint >= int(z'0be6') .and. codepoint <= int(z'0bef')) .or. &
+            (codepoint >= int(z'0c66') .and. codepoint <= int(z'0c6f')) .or. &
+            (codepoint >= int(z'0ce6') .and. codepoint <= int(z'0cef')) .or. &
+            (codepoint >= int(z'0d66') .and. codepoint <= int(z'0d6f')) .or. &
+            (codepoint >= int(z'0e50') .and. codepoint <= int(z'0e59')) .or. &
+            (codepoint >= int(z'0ed0') .and. codepoint <= int(z'0ed9')) .or. &
+            (codepoint >= int(z'0f20') .and. codepoint <= int(z'0f29')) .or. &
+            (codepoint >= int(z'1040') .and. codepoint <= int(z'1049')) .or. &
+            (codepoint >= int(z'17e0') .and. codepoint <= int(z'17e9')) .or. &
+            (codepoint >= int(z'1810') .and. codepoint <= int(z'1819')) .or. &
+            (codepoint >= int(z'ff10') .and. codepoint <= int(z'ff19'))
+    end function qwen35_is_number
+
+    logical function qwen35_is_mark(codepoint)
+        integer, intent(in) :: codepoint
+
+        qwen35_is_mark = (codepoint >= int(z'0300') .and. codepoint <= int(z'036f')) .or. &
+            (codepoint >= int(z'0483') .and. codepoint <= int(z'0489')) .or. &
+            (codepoint >= int(z'0591') .and. codepoint <= int(z'05bd')) .or. &
+            (codepoint >= int(z'0610') .and. codepoint <= int(z'061a')) .or. &
+            (codepoint >= int(z'064b') .and. codepoint <= int(z'065f')) .or. &
+            (codepoint >= int(z'0900') .and. codepoint <= int(z'0903')) .or. &
+            (codepoint >= int(z'093a') .and. codepoint <= int(z'094f')) .or. &
+            (codepoint >= int(z'0981') .and. codepoint <= int(z'0983')) .or. &
+            (codepoint >= int(z'09bc') .and. codepoint <= int(z'09cd')) .or. &
+            (codepoint >= int(z'0a01') .and. codepoint <= int(z'0a03')) .or. &
+            (codepoint >= int(z'0abc') .and. codepoint <= int(z'0acd')) .or. &
+            (codepoint >= int(z'0b01') .and. codepoint <= int(z'0b03')) .or. &
+            (codepoint >= int(z'0b3c') .and. codepoint <= int(z'0bcd')) .or. &
+            (codepoint >= int(z'0c00') .and. codepoint <= int(z'0c04')) .or. &
+            (codepoint >= int(z'0c3e') .and. codepoint <= int(z'0c4d')) .or. &
+            (codepoint >= int(z'0d3b') .and. codepoint <= int(z'0d4d')) .or. &
+            (codepoint >= int(z'0e31') .and. codepoint <= int(z'0e4d')) .or. &
+            (codepoint >= int(z'0f18') .and. codepoint <= int(z'0f39'))
+    end function qwen35_is_mark
+
+    logical function qwen35_is_letter(codepoint)
+        integer, intent(in) :: codepoint
+
+        qwen35_is_letter = (codepoint >= int(z'41') .and. codepoint <= int(z'5a')) .or. &
+            (codepoint >= int(z'61') .and. codepoint <= int(z'7a')) .or. &
+            (codepoint >= int(z'00c0') .and. codepoint <= int(z'02af')) .or. &
+            (codepoint >= int(z'0370') .and. codepoint <= int(z'052f')) .or. &
+            (codepoint >= int(z'0531') .and. codepoint <= int(z'058f')) .or. &
+            (codepoint >= int(z'0590') .and. codepoint <= int(z'06ff')) .or. &
+            (codepoint >= int(z'0700') .and. codepoint <= int(z'074f')) .or. &
+            (codepoint >= int(z'0780') .and. codepoint <= int(z'07bf')) .or. &
+            (codepoint >= int(z'0900') .and. codepoint <= int(z'0d7f')) .or. &
+            (codepoint >= int(z'0e80') .and. codepoint <= int(z'0eff')) .or. &
+            (codepoint >= int(z'1000') .and. codepoint <= int(z'1fff')) .or. &
+            (codepoint >= int(z'2e80') .and. codepoint <= int(z'9fff')) .or. &
+            (codepoint >= int(z'ac00') .and. codepoint <= int(z'd7af')) .or. &
+            (codepoint >= int(z'f900') .and. codepoint <= int(z'faff')) .or. &
+            (codepoint >= int(z'ff21') .and. codepoint <= int(z'ff5a')) .or. &
+            (codepoint >= int(z'20000') .and. codepoint <= int(z'2ffff'))
+    end function qwen35_is_letter
+
+    logical function qwen35_is_word(codepoint)
+        integer, intent(in) :: codepoint
+
+        qwen35_is_word = .false.
+        if (qwen35_is_number(codepoint)) return
+        qwen35_is_word = qwen35_is_letter(codepoint) .or. qwen35_is_mark(codepoint)
+    end function qwen35_is_word
+
+    logical function qwen35_is_newline(codepoint)
+        integer, intent(in) :: codepoint
+        qwen35_is_newline = codepoint == 10 .or. codepoint == 13
+    end function qwen35_is_newline
+
+    logical function qwen35_is_whitespace(codepoint)
+        integer, intent(in) :: codepoint
+
+        qwen35_is_whitespace = codepoint == 9 .or. codepoint == 10 .or. codepoint == 11 .or. &
+            codepoint == 12 .or. codepoint == 13 .or. codepoint == 32 .or. &
+            codepoint == int(z'0085') .or. codepoint == int(z'00a0') .or. &
+            (codepoint >= int(z'2000') .and. codepoint <= int(z'200a')) .or. &
+            codepoint == int(z'2028') .or. codepoint == int(z'2029') .or. codepoint == int(z'202f') .or. &
+            codepoint == int(z'205f') .or. codepoint == int(z'3000')
+    end function qwen35_is_whitespace
+
+    logical function qwen35_is_optional_prefix(codepoint)
+        integer, intent(in) :: codepoint
+
+        qwen35_is_optional_prefix = .not. qwen35_is_newline(codepoint) .and. &
+            .not. qwen35_is_number(codepoint) .and. .not. qwen35_is_word(codepoint)
+    end function qwen35_is_optional_prefix
 
     subroutine native_tokenizer_encode(self, text, ids)
         class(fortai_native_tokenizer_t), intent(in) :: self
@@ -392,47 +725,143 @@ contains
         class(fortai_native_tokenizer_t), intent(in) :: self
         integer(int32), intent(in) :: ids(:)
         character(len=:), allocatable, intent(out) :: text
-        integer :: i, j, codepoint, width, byte_value, total
+        integer :: i, j, k, codepoint, width, byte_value, total, output_total
+        integer :: valid_width, output_position
         character(len=:), allocatable :: piece
+        character(len=:), allocatable :: raw, encoded
         total = 0
         do i = 1, size(ids)
             if (ids(i) < 0 .or. ids(i) >= self%vocab_size) cycle
-            piece = self%vocabulary(ids(i) + 1)%text
+            if (self%vocabulary_length(ids(i) + 1) == 0) then
+                piece = ''
+            else
+                piece = self%vocabulary_blob(self%vocabulary_offset(ids(i) + 1): &
+                    self%vocabulary_offset(ids(i) + 1) + self%vocabulary_length(ids(i) + 1) - 1)
+            end if
             j = 1
             do while (j <= len(piece))
                 call utf8_decode(piece, j, codepoint, width)
-                if (codepoint >= 256 .and. codepoint < 512) then
-                    byte_value = codepoint - 256
-                else if (codepoint <= 255) then
-                    byte_value = codepoint
-                else
-                    byte_value = 32
-                end if
-                total = total + 1
+                total = total + decoded_codepoint_width(codepoint)
                 j = j + width
             end do
         end do
-        allocate(character(len=total) :: text)
+        allocate(character(len=total) :: raw)
         total = 0
         do i = 1, size(ids)
             if (ids(i) < 0 .or. ids(i) >= self%vocab_size) cycle
-            piece = self%vocabulary(ids(i) + 1)%text
+            if (self%vocabulary_length(ids(i) + 1) == 0) then
+                piece = ''
+            else
+                piece = self%vocabulary_blob(self%vocabulary_offset(ids(i) + 1): &
+                    self%vocabulary_offset(ids(i) + 1) + self%vocabulary_length(ids(i) + 1) - 1)
+            end if
             j = 1
             do while (j <= len(piece))
                 call utf8_decode(piece, j, codepoint, width)
                 if (codepoint >= 256 .and. codepoint < 512) then
                     byte_value = codepoint - 256
+                    total = total + 1
+                    raw(total:total) = achar(byte_value)
                 else if (codepoint <= 255) then
                     byte_value = codepoint
+                    total = total + 1
+                    raw(total:total) = achar(byte_value)
                 else
-                    byte_value = 32
+                    encoded = utf8_encode(codepoint)
+                    do k = 1, len(encoded)
+                        total = total + 1
+                        raw(total:total) = encoded(k:k)
+                    end do
                 end if
-                total = total + 1
-                text(total:total) = achar(byte_value)
                 j = j + width
             end do
+        end do
+        output_total = 0
+        j = 1
+        do while (j <= total)
+            valid_width = valid_utf8_width(raw, j)
+            if (valid_width > 0) then
+                output_total = output_total + valid_width
+                j = j + valid_width
+            else
+                output_total = output_total + 3
+                j = j + 1
+            end if
+        end do
+        allocate(character(len=output_total) :: text)
+        output_position = 1
+        j = 1
+        do while (j <= total)
+            valid_width = valid_utf8_width(raw, j)
+            if (valid_width > 0) then
+                text(output_position:output_position + valid_width - 1) = raw(j:j + valid_width - 1)
+                output_position = output_position + valid_width
+                j = j + valid_width
+            else
+                text(output_position:output_position + 2) = achar(int(z'ef')) // achar(int(z'bf')) // achar(int(z'bd'))
+                output_position = output_position + 3
+                j = j + 1
+            end if
         end do
     end subroutine native_tokenizer_decode
+
+    integer function decoded_codepoint_width(codepoint)
+        integer, intent(in) :: codepoint
+
+        if (codepoint <= 511) then
+            decoded_codepoint_width = 1
+        else if (codepoint <= int(z'7ff')) then
+            decoded_codepoint_width = 2
+        else if (codepoint <= int(z'ffff')) then
+            decoded_codepoint_width = 3
+        else
+            decoded_codepoint_width = 4
+        end if
+    end function decoded_codepoint_width
+
+    integer function valid_utf8_width(text, position)
+        character(len=*), intent(in) :: text
+        integer, intent(in) :: position
+        integer :: first, second, third, fourth, codepoint
+
+        valid_utf8_width = 0
+        if (position > len(text)) return
+        first = iachar(text(position:position))
+        if (first < int(z'80')) then
+            valid_utf8_width = 1
+            return
+        end if
+        if (first >= int(z'c2') .and. first <= int(z'df')) then
+            if (position + 1 > len(text)) return
+            second = iachar(text(position + 1:position + 1))
+            if (second >= int(z'80') .and. second <= int(z'bf')) valid_utf8_width = 2
+            return
+        end if
+        if (first >= int(z'e0') .and. first <= int(z'ef')) then
+            if (position + 2 > len(text)) return
+            second = iachar(text(position + 1:position + 1))
+            third = iachar(text(position + 2:position + 2))
+            if (second < int(z'80') .or. second > int(z'bf')) return
+            if (third < int(z'80') .or. third > int(z'bf')) return
+            codepoint = iand(first, 15) * 4096 + iand(second, 63) * 64 + iand(third, 63)
+            if (codepoint < int(z'800') .or. (codepoint >= int(z'd800') .and. codepoint <= int(z'dfff'))) return
+            valid_utf8_width = 3
+            return
+        end if
+        if (first >= int(z'f0') .and. first <= int(z'f4')) then
+            if (position + 3 > len(text)) return
+            second = iachar(text(position + 1:position + 1))
+            third = iachar(text(position + 2:position + 2))
+            fourth = iachar(text(position + 3:position + 3))
+            if (second < int(z'80') .or. second > int(z'bf')) return
+            if (third < int(z'80') .or. third > int(z'bf')) return
+            if (fourth < int(z'80') .or. fourth > int(z'bf')) return
+            codepoint = iand(first, 7) * 262144 + iand(second, 63) * 4096 + &
+                iand(third, 63) * 64 + iand(fourth, 63)
+            if (codepoint < int(z'10000') .or. codepoint > int(z'10ffff')) return
+            valid_utf8_width = 4
+        end if
+    end function valid_utf8_width
 
     subroutine utf8_decode(text, start, codepoint, width)
         character(len=*), intent(in) :: text
@@ -469,11 +898,16 @@ contains
         native_tokenizer_is_stop = token == self%eos_token
         if (native_tokenizer_is_stop) return
         index = int(token) + 1
-        if (index < 1 .or. .not. allocated(self%vocabulary)) return
-        if (index > size(self%vocabulary)) return
-        if (.not. allocated(self%vocabulary(index)%text)) return
-        native_tokenizer_is_stop = self%vocabulary(index)%text == '<|im_end|>' .or. &
-            self%vocabulary(index)%text == '<|endoftext|>'
+        if (index < 1 .or. .not. allocated(self%vocabulary_offset)) return
+        if (index > size(self%vocabulary_offset)) return
+        if (self%vocabulary_length(index) == len('<|im_end|>')) then
+            native_tokenizer_is_stop = self%vocabulary_blob(self%vocabulary_offset(index): &
+                self%vocabulary_offset(index) + self%vocabulary_length(index) - 1) == '<|im_end|>'
+        end if
+        if (.not. native_tokenizer_is_stop .and. self%vocabulary_length(index) == len('<|endoftext|>')) then
+            native_tokenizer_is_stop = self%vocabulary_blob(self%vocabulary_offset(index): &
+                self%vocabulary_offset(index) + self%vocabulary_length(index) - 1) == '<|endoftext|>'
+        end if
     end function native_tokenizer_is_stop
 
 end module fortai_native_tokenizer

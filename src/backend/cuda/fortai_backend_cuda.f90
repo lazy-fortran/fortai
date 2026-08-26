@@ -95,6 +95,8 @@ module fortai_backend_cuda
     public :: cuda_q4_matvec_device
     public :: cuda_q4_matvec_device_pair
     public :: cuda_q4_matvec_device_triplet
+    public :: cuda_q4_matvec_device_group_remote_output
+    public :: cuda_q4_matvec_device_remote_input
     public :: cuda_q4_embedding_device
     public :: cuda_memory_info
 
@@ -283,6 +285,24 @@ module fortai_backend_cuda
             integer(c_int), value :: count
             integer(c_int) :: code
         end function c_q4_matvec_device_group
+
+        function c_q4_matvec_device_group_remote_output(context, weights, device_activation, activation_elements, &
+                device_outputs, output_elements, count) &
+                bind(C, name='fortai_cuda_q4_matvec_device_group_remote_output') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, device_activation, device_outputs, output_elements
+            integer(c_size_t), value :: activation_elements
+            integer(c_int), value :: count
+            integer(c_int) :: code
+        end function c_q4_matvec_device_group_remote_output
+
+        function c_q4_matvec_device_remote_input(context, weights, device_activation, activation_elements, &
+                device_output, output_elements) bind(C, name='fortai_cuda_q4_matvec_device_remote_input') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, device_activation, device_output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int) :: code
+        end function c_q4_matvec_device_remote_input
 
         function c_q4_embedding_device(context, weights, token_id, device_output, output_elements) &
                 bind(C, name='fortai_cuda_q4_embedding_device') result(code)
@@ -913,6 +933,72 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA Q4 resident triplet matvec failed')
     end subroutine cuda_q4_matvec_device_triplet
+
+    subroutine cuda_q4_matvec_device_group_remote_output(context, first_weights, second_weights, third_weights, &
+            count, device_activation, activation_elements, first_output, first_output_elements, second_output, &
+            second_output_elements, third_output, third_output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: first_weights, second_weights, third_weights
+        integer, intent(in) :: count
+        type(c_ptr), intent(in) :: device_activation, first_output, second_output, third_output
+        integer(c_size_t), intent(in) :: activation_elements, first_output_elements, second_output_elements, &
+            third_output_elements
+        type(status_t), intent(out) :: stat
+        type(c_ptr), target :: handles(3), outputs(3)
+        integer(c_size_t), target :: sizes(3)
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (count < 1 .or. count > 3) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 remote-output group size')
+            return
+        end if
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(device_activation) .or. .not. c_associated(first_output)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 remote-output arguments')
+            return
+        end if
+        handles = [first_weights%handle, second_weights%handle, third_weights%handle]
+        outputs = [first_output, second_output, third_output]
+        sizes = [first_output_elements, second_output_elements, third_output_elements]
+        if (count >= 2) then
+            if (.not. c_associated(second_weights%handle) .or. .not. c_associated(second_output)) then
+                call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 remote-output pair arguments')
+                return
+            end if
+        end if
+        if (count >= 3) then
+            if (.not. c_associated(third_weights%handle) .or. .not. c_associated(third_output)) then
+                call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 remote-output triplet arguments')
+                return
+            end if
+        end if
+        code = c_q4_matvec_device_group_remote_output(context%handle, c_loc(handles), device_activation, &
+            activation_elements, c_loc(outputs), c_loc(sizes), int(count, c_int))
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 resident remote-output group failed')
+    end subroutine cuda_q4_matvec_device_group_remote_output
+
+    subroutine cuda_q4_matvec_device_remote_input(context, weights, device_activation, activation_elements, &
+            device_output, output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: weights
+        type(c_ptr), intent(in) :: device_activation, device_output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
+            .not. c_associated(device_activation) .or. .not. c_associated(device_output)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 remote-input arguments')
+            return
+        end if
+        code = c_q4_matvec_device_remote_input(context%handle, weights%handle, device_activation, &
+            activation_elements, device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 resident remote-input matvec failed')
+    end subroutine cuda_q4_matvec_device_remote_input
 
     subroutine cuda_q4_embedding_device(context, weights, token_id, device_output, output_elements, stat)
         class(cuda_q4_context_t), intent(in) :: context

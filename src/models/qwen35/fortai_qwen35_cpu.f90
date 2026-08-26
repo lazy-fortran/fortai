@@ -10,7 +10,8 @@ module fortai_qwen35_cpu
     use fortai_backend_cuda, only: cuda_qwen35_silu_product_device
     use fortai_backend_cuda, only: cuda_q4_context_t, cuda_q4_weights_t, cuda_q4_matvec_host, &
         cuda_q4_matvec_host_pair, cuda_q4_matvec_host_triplet, cuda_q4_matvec_device, &
-        cuda_q4_matvec_device_pair, cuda_q4_matvec_device_triplet, cuda_q4_embedding_device
+        cuda_q4_matvec_device_pair, cuda_q4_matvec_device_triplet, cuda_q4_matvec_device_group_remote_output, &
+        cuda_q4_matvec_device_remote_input, cuda_q4_embedding_device
     use fortai_backend_cuda, only: cuda_qwen35_attention_t, cuda_qwen35_recurrent_t
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, &
         GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, gguf_file_t, &
@@ -246,6 +247,8 @@ module fortai_qwen35_cpu
         type(c_ptr) :: cuda_beta_device = c_null_ptr
         type(c_ptr) :: cuda_ffn_gate_device = c_null_ptr
         type(c_ptr) :: cuda_ffn_up_device = c_null_ptr
+        type(c_ptr) :: cuda_ffn_gate_device_second = c_null_ptr
+        type(c_ptr) :: cuda_ffn_up_device_second = c_null_ptr
         type(c_ptr) :: cuda_attention_q_device = c_null_ptr
         type(c_ptr) :: cuda_attention_k_device = c_null_ptr
         type(c_ptr) :: cuda_attention_v_device = c_null_ptr
@@ -459,8 +462,6 @@ contains
                     self % recurrent_conv_size))
                 allocate (self % layers(i) % gdn_state(self % recurrent_head_size * &
                     self % recurrent_head_size * self % recurrent_value_heads))
-            else
-                call allocate_attention_cache(self, self%layers(i))
             end if
         end do
 
@@ -475,7 +476,6 @@ contains
             else
                 self%mtp_available = .true.
                 self%mtp_active = native_mtp_requested()
-                call allocate_attention_cache(self, self%mtp_layer)
             end if
         end if
 
@@ -684,10 +684,13 @@ contains
         type(status_t), intent(out) :: stat
         type(status_t) :: cleanup_stat
         integer :: i, j, rows, width, q4_device, q4_second_device, q8_second_device
+        integer :: q4_layer_number, q4_split_layer_count
         integer(int64) :: q4_bytes(2)
-        logical :: have_q4, q4_split, second_context_requested, attention_created
+        logical :: have_q4, q4_split, layer_split_mode, second_context_requested, attention_created
         logical :: tensor_split_custom
         real(real64) :: tensor_split_fraction(2), tensor_split_sum
+        real(real64) :: q4_layer_position
+        integer, allocatable :: q4_tensor_layer(:)
         character(len=8) :: resident_env
         character(len=8) :: group_env
         character(len=128) :: tensor_split_env
@@ -718,11 +721,6 @@ contains
         if (.not. allocated(self%file%tensors)) then
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA model is not open')
             return
-        end if
-        if (allocated(self%layers)) then
-            do i = 1, size(self%layers)
-                if (.not. self%layers(i)%recurrent) call allocate_attention_cache(self, self%layers(i))
-            end do
         end if
         if (allocated(self%cuda_weights)) then
             call cuda_device_pipeline_cleanup(self, cleanup_stat)
@@ -871,12 +869,43 @@ contains
             allocate(self%cuda_q4_weights(size(self%file%tensors)))
             allocate(self%cuda_q4_weight_device(size(self%file%tensors)))
             self%cuda_q4_weight_device = 1
+            layer_split_mode = cuda_split_mode_layer()
+            q4_split_layer_count = max(1, int(self%layer_count) + 1)
+            if (layer_split_mode .and. q4_split) then
+                allocate(q4_tensor_layer(size(self%file%tensors)))
+                q4_tensor_layer = 0
+                do i = 1, size(self%file%tensors)
+                    if (.not. is_q4_xl_type(self%file%tensors(i)%value_type)) cycle
+                    if (size(self%file%tensors(i)%shape) /= 2) cycle
+                    if (is_unused_q4_tensor(self, i)) cycle
+                    if (is_host_lookup_q4_tensor(self, i)) cycle
+                    q4_tensor_layer(i) = q4_layer_for_tensor(self, i)
+                end do
+            end if
             q4_bytes = 0_int64
             do i = 1, size(self%file%tensors)
                 if (.not. is_q4_xl_type(self%file%tensors(i)%value_type)) cycle
                 if (size(self%file%tensors(i)%shape) /= 2) cycle
                 if (is_unused_q4_tensor(self, i)) cycle
-                if (.not. q4_split) then
+                if (is_host_lookup_q4_tensor(self, i)) cycle
+                q4_layer_number = 0
+                if (layer_split_mode .and. q4_split) q4_layer_number = q4_tensor_layer(i)
+                if (q4_layer_number > 0) then
+                    ! Match llama.cpp's layer split: tensor_split is a
+                    ! normalized cumulative boundary over layer_count + 1
+                    ! entries (the final entry is the output layer).  All
+                    ! tensors belonging to a layer stay together, which is
+                    ! essential for the Q/K/V grouped path on non-peer GPUs.
+                    q4_layer_position = real(q4_layer_number - 1, real64) / &
+                        real(q4_split_layer_count, real64)
+                    q4_device = 1
+                    if (q4_layer_position < tensor_split_fraction(1)) q4_device = 0
+                else if (layer_split_mode .and. q4_split .and. i == self%output) then
+                    q4_layer_position = real(self%layer_count, real64) / &
+                        real(q4_split_layer_count, real64)
+                    q4_device = 1
+                    if (q4_layer_position < tensor_split_fraction(1)) q4_device = 0
+                else if (.not. q4_split) then
                     q4_device = 0
                 else if (tensor_split_custom .and. tensor_split_fraction(1) <= 0.0_real64) then
                     q4_device = 1
@@ -900,6 +929,9 @@ contains
                     rows, width, q4_device, stat)
                 self%cuda_q4_weight_device(i) = q4_device + 1
                 if (.not. stat%is_ok()) then
+                    write(error_unit, '(a,i0,a,i0,a,i0,a)') 'fortai-native: Q4 upload failed at tensor ', i, &
+                        ' (device slot ', q4_device, ', bytes ', size(self%file%tensors(i)%bytes), '): ' // &
+                        trim(self%file%tensors(i)%name)
                     do j = 1, size(self%cuda_q4_weights)
                         call self%cuda_q4_weights(j)%destroy(cleanup_stat)
                     end do
@@ -918,6 +950,7 @@ contains
                 q4_bytes(q4_device + 1) = q4_bytes(q4_device + 1) + &
                     int(size(self%file%tensors(i)%bytes), int64)
             end do
+            if (allocated(q4_tensor_layer)) deallocate(q4_tensor_layer)
             call self%cuda_q4%synchronize(stat)
             if (.not. stat%is_ok()) then
                 do j = 1, size(self%cuda_q4_weights)
@@ -950,6 +983,24 @@ contains
                 call self%cuda_q4%destroy(cleanup_stat)
                 call self%cuda%destroy(cleanup_stat)
                 return
+            end if
+            if (c_associated(self%cuda_second%handle)) then
+                call self%cuda_q4%set_consumer_stream(1, self%cuda_second%stream(), stat)
+                if (.not. stat%is_ok()) then
+                    do j = 1, size(self%cuda_q4_weights)
+                        call self%cuda_q4_weights(j)%destroy(cleanup_stat)
+                    end do
+                    deallocate(self%cuda_q4_weights)
+                    deallocate(self%cuda_q4_weight_device)
+                    do j = 1, size(self%cuda_weights)
+                        call self%cuda_weights(j)%destroy(cleanup_stat)
+                    end do
+                    deallocate(self%cuda_weights)
+                    call self%cuda_q4%destroy(cleanup_stat)
+                    call self%cuda_second%destroy(cleanup_stat)
+                    call self%cuda%destroy(cleanup_stat)
+                    return
+                end if
             end if
         end if
         allocate(self%cuda_attention_on_second_layer(size(self%layers)))
@@ -1092,6 +1143,22 @@ contains
         cuda_split_mode_none = trim(value(:length)) == 'none'
     end function cuda_split_mode_none
 
+    logical function cuda_split_mode_layer()
+        character(len=32) :: value
+        integer :: length
+
+        ! llama.cpp defaults to layer placement when no split mode is
+        ! specified.  Keep that default here as well; tensor/row remain
+        ! explicit opt-ins for their corresponding placement policies.
+        cuda_split_mode_layer = .true.
+        value = ''
+        call get_environment_variable('FORTAI_SPLIT_MODE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_SPLIT_MODE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_SPLIT_MODE', value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        cuda_split_mode_layer = trim(value(:length)) == 'layer'
+    end function cuda_split_mode_layer
+
     subroutine validate_cuda_split_mode(stat)
         type(status_t), intent(out) :: stat
         character(len=32) :: value
@@ -1170,7 +1237,9 @@ contains
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA device pipeline has no layers')
             return
         end if
-        if (.not. cuda_quantized_device_ready(self, self%token_embedding)) then
+        if (.not. cuda_quantized_device_ready(self, self%token_embedding) .and. &
+            .not. (is_q4_xl_type(self%file%tensors(self%token_embedding)%value_type) .and. &
+            is_host_lookup_q4_tensor(self, self%token_embedding))) then
             call stat%set(FORTAI_UNSUPPORTED, 'CUDA token embedding is not device resident')
             return
         end if
@@ -1275,6 +1344,14 @@ contains
             call self%cuda_second%allocate_buffer(value_bytes, self%cuda_attention_v_device_second, stat)
             if (.not. stat%is_ok()) return
             call self%cuda_second%allocate_buffer(core_bytes, self%cuda_attention_work_device_second, stat)
+            if (.not. stat%is_ok()) return
+            ! Keep a second-device FFN gate/up pair for layers whose Q4
+            ! projections are entirely remote.  This avoids copying two
+            ! intermediate vectors to GPU0 merely to apply SiLU before the
+            ! remote down projection.
+            call self%cuda_second%allocate_buffer(ffn_bytes, self%cuda_ffn_gate_device_second, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda_second%allocate_buffer(ffn_bytes, self%cuda_ffn_up_device_second, stat)
             if (.not. stat%is_ok()) return
         end if
         call self%cuda%allocate_buffer(hidden_bytes, self%cuda_output_norm, stat)
@@ -1383,6 +1460,10 @@ contains
             call self%cuda_second%free_buffer(self%cuda_attention_v_device_second, stat)
         if (c_associated(self%cuda_attention_work_device_second)) &
             call self%cuda_second%free_buffer(self%cuda_attention_work_device_second, stat)
+        if (c_associated(self%cuda_ffn_gate_device_second)) &
+            call self%cuda_second%free_buffer(self%cuda_ffn_gate_device_second, stat)
+        if (c_associated(self%cuda_ffn_up_device_second)) &
+            call self%cuda_second%free_buffer(self%cuda_ffn_up_device_second, stat)
         self%cuda_attention_q_device = c_null_ptr
         self%cuda_attention_k_device = c_null_ptr
         self%cuda_attention_v_device = c_null_ptr
@@ -1391,6 +1472,8 @@ contains
         self%cuda_attention_k_device_second = c_null_ptr
         self%cuda_attention_v_device_second = c_null_ptr
         self%cuda_attention_work_device_second = c_null_ptr
+        self%cuda_ffn_gate_device_second = c_null_ptr
+        self%cuda_ffn_up_device_second = c_null_ptr
         if (c_associated(self%cuda_output_norm)) call self%cuda%free_buffer(self%cuda_output_norm, stat)
         if (c_associated(self%cuda_logits)) call self%cuda%free_buffer(self%cuda_logits, stat)
     end subroutine cuda_device_pipeline_cleanup
@@ -1809,7 +1892,7 @@ contains
         end if
         if (self%fast_enabled) then
             if (fortai_llama_fast_context_decode(self%fast_handle, int(token_id, c_int), &
-                    int(position, c_int), logits, int(size(logits), c_size_t)) /= 0_c_int) then
+                int(position, c_int), logits, int(size(logits), c_size_t)) /= 0_c_int) then
                 call stat%set(FORTAI_UNSUPPORTED, 'llama.cpp fast path decode failed')
             end if
             return
@@ -1972,6 +2055,7 @@ contains
             call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP pair dimensions are invalid')
             return
         end if
+        call allocate_attention_cache(self, self%mtp_layer)
         if (self%cache_key_q8) then
             if (.not. allocated(self%mtp_layer%key_cache_q8)) then
                 call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP K q8 cache is not allocated')
@@ -2209,11 +2293,11 @@ contains
 
         call stat%clear()
         if (is_q4_xl_type(self%file%tensors(first_index)%value_type) .and. &
-                is_q4_xl_type(self%file%tensors(second_index)%value_type) .and. &
-                self%cuda_q4_resident .and. self%cuda_q4_group_enabled) then
+            is_q4_xl_type(self%file%tensors(second_index)%value_type) .and. &
+            self%cuda_q4_resident .and. self%cuda_q4_group_enabled) then
             if (allocated(self%cuda_q4_weights)) then
                 if (c_associated(self%cuda_q4_weights(first_index)%handle) .and. &
-                        c_associated(self%cuda_q4_weights(second_index)%handle)) then
+                    c_associated(self%cuda_q4_weights(second_index)%handle)) then
                     call cuda_q4_matvec_device_pair(self%cuda_q4, self%cuda_q4_weights(first_index), &
                         self%cuda_q4_weights(second_index), device_input, input_elements, first_output, first_elements, &
                         second_output, second_elements, stat)
@@ -2237,13 +2321,13 @@ contains
 
         call stat%clear()
         if (is_q4_xl_type(self%file%tensors(first_index)%value_type) .and. &
-                is_q4_xl_type(self%file%tensors(second_index)%value_type) .and. &
-                is_q4_xl_type(self%file%tensors(third_index)%value_type) .and. self%cuda_q4_resident .and. &
-                self%cuda_q4_group_enabled) then
+            is_q4_xl_type(self%file%tensors(second_index)%value_type) .and. &
+            is_q4_xl_type(self%file%tensors(third_index)%value_type) .and. self%cuda_q4_resident .and. &
+            self%cuda_q4_group_enabled) then
             if (allocated(self%cuda_q4_weights)) then
                 if (c_associated(self%cuda_q4_weights(first_index)%handle) .and. &
-                        c_associated(self%cuda_q4_weights(second_index)%handle) .and. &
-                        c_associated(self%cuda_q4_weights(third_index)%handle)) then
+                    c_associated(self%cuda_q4_weights(second_index)%handle) .and. &
+                    c_associated(self%cuda_q4_weights(third_index)%handle)) then
                     call cuda_q4_matvec_device_triplet(self%cuda_q4, self%cuda_q4_weights(first_index), &
                         self%cuda_q4_weights(second_index), self%cuda_q4_weights(third_index), device_input, &
                         input_elements, first_output, first_elements, second_output, second_elements, third_output, &
@@ -2295,6 +2379,30 @@ contains
         call stat%clear()
         hidden_elements = int(size(self%x), c_size_t)
         ffn_elements = int(self%feed_forward_size, c_size_t)
+        if (self%cuda_q4_resident .and. self%cuda_q4_split .and. self%cuda_q4_group_enabled .and. &
+            c_associated(self%cuda_second%handle) .and. cuda_q4_on_second(self, self%layers(layer_index)%ffn_gate) .and. &
+            cuda_q4_on_second(self, self%layers(layer_index)%ffn_up) .and. &
+            cuda_q4_on_second(self, self%layers(layer_index)%ffn_down) .and. &
+            c_associated(self%cuda_ffn_gate_device_second) .and. c_associated(self%cuda_ffn_up_device_second)) then
+            ! Keep a remote Q4 FFN entirely on the second device.  The
+            ! grouped gate/up call performs one activation bridge; SiLU and
+            ! the down projection then stay remote until the final hidden
+            ! vector is copied back to the primary stream.
+            call cuda_q4_matvec_device_group_remote_output(self%cuda_q4, &
+                self%cuda_q4_weights(self%layers(layer_index)%ffn_gate), &
+                self%cuda_q4_weights(self%layers(layer_index)%ffn_up), &
+                self%cuda_q4_weights(self%layers(layer_index)%ffn_down), 2, self%cuda_normalized, hidden_elements, &
+                self%cuda_ffn_gate_device_second, ffn_elements, self%cuda_ffn_up_device_second, ffn_elements, &
+                c_null_ptr, 0_c_size_t, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_qwen35_silu_product_device(self%cuda_second, self%cuda_ffn_gate_device_second, &
+                self%cuda_ffn_up_device_second, ffn_elements, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_q4_matvec_device_remote_input(self%cuda_q4, &
+                self%cuda_q4_weights(self%layers(layer_index)%ffn_down), &
+                self%cuda_ffn_gate_device_second, ffn_elements, self%cuda_hidden, hidden_elements, stat)
+            return
+        end if
         if (cuda_ffn_ready(self, self%layers(layer_index))) then
             call cuda_q8_ffn_device(self%cuda, self%cuda_weights(self%layers(layer_index)%ffn_gate), &
                 self%cuda_weights(self%layers(layer_index)%ffn_up), &
@@ -2405,15 +2513,31 @@ contains
             call self%layers(layer_index)%cuda_attention%run_device(self%cuda_normalized, hidden_elements, &
                 int(position), self%cuda_hidden, hidden_elements, stat)
         else
-            call cuda_device_matvec_triplet(self, self%layers(layer_index)%attn_q, &
-                self%layers(layer_index)%attn_k, self%layers(layer_index)%attn_v, self%cuda_normalized, hidden_elements, &
-                self%cuda_attention_q_device, int(2 * self%attention_heads * self%attention_head_size, c_size_t), &
-                self%cuda_attention_k_device, int(self%attention_heads_kv * self%attention_head_size, c_size_t), &
-                self%cuda_attention_v_device, int(self%attention_heads_kv * self%value_length, c_size_t), stat)
+            if (on_second .and. self%cuda_q4_group_enabled .and. &
+                cuda_q4_triplet_on_second(self, self%layers(layer_index)%attn_q, &
+                self%layers(layer_index)%attn_k, self%layers(layer_index)%attn_v)) then
+                call cuda_q4_matvec_device_group_remote_output(self%cuda_q4, &
+                    self%cuda_q4_weights(self%layers(layer_index)%attn_q), &
+                    self%cuda_q4_weights(self%layers(layer_index)%attn_k), &
+                    self%cuda_q4_weights(self%layers(layer_index)%attn_v), 3, self%cuda_normalized, hidden_elements, &
+                    self%cuda_attention_q_device_second, &
+                    int(2 * self%attention_heads * self%attention_head_size, c_size_t), &
+                    self%cuda_attention_k_device_second, int(self%attention_heads_kv * self%attention_head_size, c_size_t), &
+                    self%cuda_attention_v_device_second, int(self%attention_heads_kv * self%value_length, c_size_t), stat)
+            else
+                call cuda_device_matvec_triplet(self, self%layers(layer_index)%attn_q, &
+                    self%layers(layer_index)%attn_k, self%layers(layer_index)%attn_v, self%cuda_normalized, hidden_elements, &
+                    self%cuda_attention_q_device, int(2 * self%attention_heads * self%attention_head_size, c_size_t), &
+                    self%cuda_attention_k_device, int(self%attention_heads_kv * self%attention_head_size, c_size_t), &
+                    self%cuda_attention_v_device, int(self%attention_heads_kv * self%value_length, c_size_t), stat)
+            end if
             if (.not. stat%is_ok()) return
             if (on_second) then
-                call cuda_attention_move_qkv_to_second(self, stat)
-                if (.not. stat%is_ok()) return
+                if (.not. (self%cuda_q4_group_enabled .and. cuda_q4_triplet_on_second(self, self%layers(layer_index)%attn_q, &
+                    self%layers(layer_index)%attn_k, self%layers(layer_index)%attn_v))) then
+                    call cuda_attention_move_qkv_to_second(self, stat)
+                    if (.not. stat%is_ok()) return
+                end if
                 call self%cuda_second%set_position(int(position), stat)
                 if (.not. stat%is_ok()) return
                 call self%layers(layer_index)%cuda_attention%run_core_device(self%cuda_attention_q_device_second, &
@@ -2424,10 +2548,15 @@ contains
                     int(position), self%cuda_attention_work_device_second, &
                     int(self%attention_heads * self%value_length, c_size_t), stat)
                 if (.not. stat%is_ok()) return
-                call self%cuda_second%download_real(self%cuda_attention_work_device_second, self%attention_work, stat)
-                if (.not. stat%is_ok()) return
-                call self%cuda%upload_real(self%cuda_attention_work_device, self%attention_work, stat)
-                if (.not. stat%is_ok()) return
+                if (.not. (self%cuda_q4_group_enabled .and. cuda_q4_triplet_on_second(self, &
+                    self%layers(layer_index)%attn_q, self%layers(layer_index)%attn_k, &
+                    self%layers(layer_index)%attn_v) .and. cuda_q4_on_second(self, &
+                    self%layers(layer_index)%attn_out))) then
+                    call self%cuda_second%download_real(self%cuda_attention_work_device_second, self%attention_work, stat)
+                    if (.not. stat%is_ok()) return
+                    call self%cuda%upload_real(self%cuda_attention_work_device, self%attention_work, stat)
+                    if (.not. stat%is_ok()) return
+                end if
             else
                 call self%layers(layer_index)%cuda_attention%run_core_device(self%cuda_attention_q_device, &
                     int(2 * self%attention_heads * self%attention_head_size, c_size_t), self%cuda_attention_k_device, &
@@ -2436,8 +2565,14 @@ contains
                     self%cuda_attention_work_device, int(self%attention_heads * self%value_length, c_size_t), stat)
                 if (.not. stat%is_ok()) return
             end if
-            call cuda_device_matvec(self, self%layers(layer_index)%attn_out, self%cuda_attention_work_device, &
-                int(self%attention_heads * self%value_length, c_size_t), self%cuda_hidden, hidden_elements, stat)
+            if (on_second .and. cuda_q4_on_second(self, self%layers(layer_index)%attn_out)) then
+                call cuda_q4_matvec_device_remote_input(self%cuda_q4, &
+                    self%cuda_q4_weights(self%layers(layer_index)%attn_out), self%cuda_attention_work_device_second, &
+                    int(self%attention_heads * self%value_length, c_size_t), self%cuda_hidden, hidden_elements, stat)
+            else
+                call cuda_device_matvec(self, self%layers(layer_index)%attn_out, self%cuda_attention_work_device, &
+                    int(self%attention_heads * self%value_length, c_size_t), self%cuda_hidden, hidden_elements, stat)
+            end if
         end if
         if (.not. stat%is_ok()) return
         call cuda_qwen35_add_device(self%cuda, self%cuda_hidden, self%cuda_residual, self%cuda_x, &
@@ -2507,8 +2642,8 @@ contains
         ! matrices are Q4.  It owns the GDN/conv state but has no Q8 weight
         ! bundle, so only the full Q8 handle may enter the host `run` path.
         if (self%cuda_enabled .and. self%cuda_device_pipeline .and. &
-                all_q8_recurrent_weights(self, layer_index) .and. &
-                c_associated(self%layers(layer_index)%cuda_recurrent%handle)) then
+            all_q8_recurrent_weights(self, layer_index) .and. &
+            c_associated(self%layers(layer_index)%cuda_recurrent%handle)) then
             if (mod(size(input), 32) /= 0) then
                 call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA recurrent input is not block aligned')
                 return
@@ -2647,6 +2782,68 @@ contains
         if (len(tensor_name) >= 7) is_unused_q4_tensor = tensor_name(1:7) == 'blk.64.'
     end function is_unused_q4_tensor
 
+    logical function is_host_lookup_q4_tensor(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+
+        is_host_lookup_q4_tensor = .false.
+        if (tensor_index <= 0 .or. tensor_index > size(self%file%tensors)) return
+        ! The resident pipeline intentionally performs the tiny token lookup
+        ! through the validated GGUF path.  Do not upload an untied embedding
+        ! (or an MTP embedding) just to satisfy a readiness check.  A tied
+        ! output must stay resident because it is also the LM-head matvec.
+        if (tensor_index == self%token_embedding .and. self%output /= self%token_embedding) then
+            is_host_lookup_q4_tensor = .true.
+            return
+        end if
+        if (self%mtp_embed_tokens > 0 .and. tensor_index == self%mtp_embed_tokens .and. &
+            tensor_index /= self%output) is_host_lookup_q4_tensor = .true.
+    end function is_host_lookup_q4_tensor
+
+    integer function q4_layer_for_tensor(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+        integer :: layer_number, j
+        integer :: indices(20)
+
+        q4_layer_for_tensor = 0
+        if (tensor_index <= 0 .or. tensor_index > size(self%file%tensors)) return
+        if (.not. allocated(self%layers)) return
+        do layer_number = 1, size(self%layers)
+            indices = [self%layers(layer_number)%attn_norm, self%layers(layer_number)%post_norm, &
+                self%layers(layer_number)%ffn_gate, self%layers(layer_number)%ffn_up, &
+                self%layers(layer_number)%ffn_down, self%layers(layer_number)%attn_qkv, &
+                self%layers(layer_number)%attn_gate, self%layers(layer_number)%attn_q, &
+                self%layers(layer_number)%attn_k, self%layers(layer_number)%attn_v, &
+                self%layers(layer_number)%attn_out, self%layers(layer_number)%q_norm, &
+                self%layers(layer_number)%k_norm, self%layers(layer_number)%ssm_a, &
+                self%layers(layer_number)%ssm_alpha, self%layers(layer_number)%ssm_beta, &
+                self%layers(layer_number)%ssm_conv, self%layers(layer_number)%ssm_dt, &
+                self%layers(layer_number)%ssm_norm, self%layers(layer_number)%ssm_out]
+            do j = 1, size(indices)
+                if (indices(j) == tensor_index) then
+                    q4_layer_for_tensor = layer_number
+                    return
+                end if
+            end do
+        end do
+        if (self%mtp_available) then
+            indices = [self%mtp_layer%attn_norm, self%mtp_layer%post_norm, self%mtp_layer%ffn_gate, &
+                self%mtp_layer%ffn_up, self%mtp_layer%ffn_down, self%mtp_layer%attn_qkv, &
+                self%mtp_layer%attn_gate, self%mtp_layer%attn_q, self%mtp_layer%attn_k, &
+                self%mtp_layer%attn_v, self%mtp_layer%attn_out, self%mtp_layer%q_norm, &
+                self%mtp_layer%k_norm, self%mtp_layer%ssm_a, self%mtp_layer%ssm_alpha, &
+                self%mtp_layer%ssm_beta, self%mtp_layer%ssm_conv, self%mtp_layer%ssm_dt, &
+                self%mtp_layer%ssm_norm, self%mtp_layer%ssm_out]
+            do j = 1, size(indices)
+                if (indices(j) == tensor_index) then
+                    q4_layer_for_tensor = size(self%layers) + 1
+                    return
+                end if
+            end do
+        end if
+    end function q4_layer_for_tensor
+
     logical function all_q8_recurrent_weights(self, layer_index)
         class(qwen35_cpu_model_t), intent(in) :: self
         integer, intent(in) :: layer_index
@@ -2729,28 +2926,33 @@ contains
         class(qwen35_cpu_model_t), intent(in) :: self
         integer, intent(in) :: layer_index
         integer :: indices(4), i
-        logical :: has_q4
+        logical :: has_q4, split_attention_enabled
         character(len=16) :: split_attention_value
-        integer :: split_attention_length
+        character(len=128) :: tensor_split_value
+        integer :: split_attention_length, tensor_split_length, tensor_split_status
+        real(real64) :: tensor_split_fraction(2), tensor_split_sum, layer_position
 
         cuda_attention_split_requested = .false.
         if (.not. self%cuda_q4_split .or. .not. allocated(self%cuda_q4_weight_device)) return
         split_attention_value = ''
         call get_environment_variable('FORTAI_CUDA_Q4_SPLIT_ATTENTION', split_attention_value, &
             length=split_attention_length)
-        ! The host bridge used by the two non-peer GPUs makes moving a full
-        ! attention state more expensive than keeping it on the primary
-        ! context.  Q4 weights are still distributed by tensor split; an
-        ! explicit opt-in is required for alternating attention state.
-        if (split_attention_length <= 0) return
-        select case (trim(split_attention_value(:min(split_attention_length, len(split_attention_value)))))
-        case ('0', 'false', 'off', 'no')
-            return
-        case ('1', 'true', 'on', 'yes')
-            continue
-        case default
-            return
-        end select
+        split_attention_enabled = cuda_split_mode_layer()
+        if (split_attention_length > 0) then
+            select case (trim(split_attention_value(:min(split_attention_length, len(split_attention_value)))))
+            case ('0', 'false', 'off', 'no')
+                split_attention_enabled = .false.
+            case ('1', 'true', 'on', 'yes')
+                split_attention_enabled = .true.
+            case default
+                split_attention_enabled = .false.
+            end select
+        end if
+        ! Layer placement is also the default for llama.cpp.  Keep the full
+        ! attention/KV state on the same side of the normalized split as its
+        ! Q4 projections; an explicit FORTAI_CUDA_Q4_SPLIT_ATTENTION=0 still
+        ! provides the diagnostic single-device fallback.
+        if (.not. split_attention_enabled) return
         if (layer_index <= 0 .or. layer_index > size(self%layers)) return
         if (self%layers(layer_index)%recurrent) return
         indices = [self%layers(layer_index)%attn_q, self%layers(layer_index)%attn_k, &
@@ -2761,12 +2963,21 @@ contains
             if (is_q4_xl_type(self%file%tensors(indices(i))%value_type)) has_q4 = .true.
         end do
         if (.not. has_q4) return
-        ! Split the long-context attention state independently of the weight
-        ! placement.  Q4 projections already return their results to the
-        ! primary stream, so alternating full-attention layers keeps the
-        ! q8_0 KV allocation balanced even when a layer's four projections
-        ! straddle the requested tensor split.
-        cuda_attention_split_requested = mod(layer_index / 4, 2) == 0 .and. c_associated(self%cuda_second%handle)
+        tensor_split_fraction = 0.5_real64
+        tensor_split_value = ''
+        call get_environment_variable('FORTAI_TENSOR_SPLIT', tensor_split_value, length=tensor_split_length)
+        if (tensor_split_length <= 0) call get_environment_variable('LLAMA_ARG_TENSOR_SPLIT', tensor_split_value, &
+            length=tensor_split_length)
+        if (tensor_split_length > 0 .and. tensor_split_length <= len(tensor_split_value)) then
+            tensor_split_status = 0
+            read(tensor_split_value(:tensor_split_length), *, iostat=tensor_split_status) tensor_split_fraction
+            tensor_split_sum = sum(tensor_split_fraction)
+            if (tensor_split_status == 0 .and. all(tensor_split_fraction >= 0.0_real64) .and. &
+                tensor_split_sum > 0.0_real64) tensor_split_fraction = tensor_split_fraction / tensor_split_sum
+        end if
+        layer_position = real(layer_index - 1, real64) / real(max(1, int(self%layer_count) + 1), real64)
+        cuda_attention_split_requested = layer_position >= tensor_split_fraction(1) .and. &
+            c_associated(self%cuda_second%handle)
     end function cuda_attention_split_requested
 
     logical function cuda_attention_on_second(self, layer_index)
@@ -3292,6 +3503,28 @@ contains
         cuda_q4_single_ready = .true.
     end function cuda_q4_single_ready
 
+    logical function cuda_q4_on_second(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+
+        cuda_q4_on_second = .false.
+        if (.not. allocated(self%cuda_q4_weight_device)) return
+        if (tensor_index <= 0) return
+        if (tensor_index > size(self%cuda_q4_weight_device)) return
+        cuda_q4_on_second = self%cuda_q4_weight_device(tensor_index) == 2
+    end function cuda_q4_on_second
+
+    logical function cuda_q4_triplet_on_second(self, first_index, second_index, third_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: first_index, second_index, third_index
+
+        cuda_q4_triplet_on_second = .false.
+        if (.not. cuda_q4_on_second(self, first_index)) return
+        if (.not. cuda_q4_on_second(self, second_index)) return
+        if (.not. cuda_q4_on_second(self, third_index)) return
+        cuda_q4_triplet_on_second = .true.
+    end function cuda_q4_triplet_on_second
+
     logical function cuda_q8_on_second(self, tensor_index)
         class(qwen35_cpu_model_t), intent(in) :: self
         integer, intent(in) :: tensor_index
@@ -3410,7 +3643,7 @@ contains
             return
         end if
         if (self % file % tensors(tensor_index) % value_type == GGML_TYPE_Q8_0) then
-        if (self%cuda_enabled .and. cuda_host_q8_enabled() .and. &
+            if (self%cuda_enabled .and. cuda_host_q8_enabled() .and. &
                 .not. self%cuda_q8_cpu_override .and. &
                 size(self%file%tensors(tensor_index)%shape) == 2) then
                 if (mod(size(input), 32) /= 0) then
@@ -3981,6 +4214,7 @@ contains
         integer(int64), intent(in) :: position
         integer :: i, head, offset, scale_offset, key_row, value_row, key_blocks, value_blocks
 
+        call allocate_attention_cache(self, layer)
         do head = 1, self % attention_heads_kv
             offset = int(position) * self % attention_head_size * self % attention_heads_kv + &
                 (head - 1) * self % attention_head_size

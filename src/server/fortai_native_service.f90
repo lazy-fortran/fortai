@@ -13,6 +13,9 @@ module fortai_native_service
     type(fortai_native_tokenizer_t), save :: service_tokenizer
     type(qwen35_cpu_model_t), save :: service_draft_model
     type(fortai_native_tokenizer_t), save :: service_draft_tokenizer
+    ! MTP tensors are rebound into service_model.  Keep the sidecar mapping
+    ! alive for exactly as long as those pointers are in use.
+    type(gguf_file_t), save :: service_mtp_sidecar
     logical, save :: service_ready = .false.
     logical, save :: service_external_draft_active = .false.
     logical, save :: service_mtp_sidecar_active = .false.
@@ -102,6 +105,7 @@ contains
         if (.not. tokenizer_ok) then
             write(error_unit, '(a)') 'fortai-native: GGUF tokenizer metadata is unavailable'
             call service_model%close()
+            call service_mtp_sidecar%close()
             return
         end if
         draft_path = configured_external_draft_path()
@@ -110,6 +114,7 @@ contains
             write(error_unit, '(a)') 'fortai-native: external draft initialization failed: ' // trim(stat%message)
             call service_tokenizer%close()
             call service_model%close()
+            call service_mtp_sidecar%close()
             return
         end if
         if (gpu_layers > 0_c_int) then
@@ -120,6 +125,7 @@ contains
                 call service_draft_model%close()
                 call service_tokenizer%close()
                 call service_model%close()
+                call service_mtp_sidecar%close()
                 return
             end if
             if (require_cuda /= 0_c_int .and. .not. service_model%cuda_enabled) then
@@ -128,6 +134,7 @@ contains
                 call service_draft_model%close()
                 call service_tokenizer%close()
                 call service_model%close()
+                call service_mtp_sidecar%close()
                 return
             end if
         end if
@@ -142,6 +149,9 @@ contains
         call service_draft_model%close()
         call service_tokenizer%close()
         call service_model%close()
+        ! The model owns pointers into this mapping for MTP tensors, so it
+        ! must be closed before releasing the sidecar address space.
+        call service_mtp_sidecar%close()
         service_ready = .false.
         service_external_draft_active = .false.
         service_mtp_sidecar_active = .false.
@@ -283,34 +293,32 @@ contains
     subroutine apply_mtp_sidecar(path, stat)
         character(len=*), intent(in) :: path
         type(status_t), intent(out) :: stat
-        type(gguf_file_t) :: sidecar
         integer :: i, target_index, copied
         character(len=:), allocatable :: tensor_name
 
         call stat%clear()
         service_mtp_sidecar_active = .false.
         if (len_trim(path) == 0) return
-        ! Keep the sidecar payload in owned storage before transferring the
-        ! selected blk.64 tensors into the target model.  The target GGUF may
-        ! be mmap-backed, but closing a separately mapped sidecar must never
-        ! leave dangling tensor pointers in the service model.
-        call sidecar%open(trim(path), stat, .false.)
+        ! Keep the sidecar mapping alive after transferring the selected
+        ! blk.64 tensor pointers into the target model.  Copying this ~1.3 GiB
+        ! GGUF is needlessly expensive at startup and raises peak RSS.
+        call service_mtp_sidecar%open(trim(path), stat, .true.)
         if (.not. stat%is_ok()) return
-        if (.not. allocated(sidecar%tensors)) then
+        if (.not. allocated(service_mtp_sidecar%tensors)) then
             call stat%set(FORTAI_INVALID, 'MTP sidecar has no tensors')
-            call sidecar%close()
+            call service_mtp_sidecar%close()
             return
         end if
         copied = 0
-        do i = 1, size(sidecar%tensors)
-            tensor_name = sidecar%tensors(i)%name
+        do i = 1, size(service_mtp_sidecar%tensors)
+            tensor_name = service_mtp_sidecar%tensors(i)%name
             if (index(tensor_name, 'blk.64.') /= 1) cycle
             target_index = service_model%file%find_tensor(tensor_name)
             if (target_index == 0) then
                 call stat%set(FORTAI_UNSUPPORTED, 'MTP sidecar tensor is absent from target: ' // trim(tensor_name))
                 exit
             end if
-            if (.not. allocated(sidecar%tensors(i)%shape)) then
+            if (.not. allocated(service_mtp_sidecar%tensors(i)%shape)) then
                 call stat%set(FORTAI_INVALID, 'MTP sidecar tensor has no shape: ' // trim(tensor_name))
                 exit
             end if
@@ -318,19 +326,20 @@ contains
                 call stat%set(FORTAI_INVALID, 'target MTP tensor has no shape: ' // trim(tensor_name))
                 exit
             end if
-            if (size(sidecar%tensors(i)%shape) /= size(service_model%file%tensors(target_index)%shape)) then
+            if (size(service_mtp_sidecar%tensors(i)%shape) /= size(service_model%file%tensors(target_index)%shape)) then
                 call stat%set(FORTAI_INVALID, 'MTP sidecar tensor rank differs from target: ' // trim(tensor_name))
                 exit
             end if
-            if (any(sidecar%tensors(i)%shape /= service_model%file%tensors(target_index)%shape)) then
+            if (any(service_mtp_sidecar%tensors(i)%shape /= service_model%file%tensors(target_index)%shape)) then
                 call stat%set(FORTAI_INVALID, 'MTP sidecar tensor shape differs from target: ' // trim(tensor_name))
                 exit
             end if
-            if (.not. associated(sidecar%tensors(i)%bytes)) then
+            if (.not. associated(service_mtp_sidecar%tensors(i)%bytes)) then
                 call stat%set(FORTAI_INVALID, 'MTP sidecar tensor has no data: ' // trim(tensor_name))
                 exit
             end if
-            if (sidecar%tensors(i)%byte_count /= int(size(sidecar%tensors(i)%bytes), int64)) then
+            if (service_mtp_sidecar%tensors(i)%byte_count /= &
+                int(size(service_mtp_sidecar%tensors(i)%bytes), int64)) then
                 call stat%set(FORTAI_INVALID, 'MTP sidecar tensor byte count is inconsistent: ' // trim(tensor_name))
                 exit
             end if
@@ -341,16 +350,18 @@ contains
                     deallocate(service_model%file%tensors(target_index)%bytes)
                 end if
             end if
-            service_model%file%tensors(target_index)%bytes => sidecar%tensors(i)%bytes
-            service_model%file%tensors(target_index)%bytes_mapped = .false.
-            nullify(sidecar%tensors(i)%bytes)
-            sidecar%tensors(i)%bytes_mapped = .false.
-            service_model%file%tensors(target_index)%value_type = sidecar%tensors(i)%value_type
-            service_model%file%tensors(target_index)%byte_count = sidecar%tensors(i)%byte_count
+            service_model%file%tensors(target_index)%bytes => service_mtp_sidecar%tensors(i)%bytes
+            service_model%file%tensors(target_index)%bytes_mapped = .true.
+            service_model%file%tensors(target_index)%bytes_mapped_external = .true.
+            nullify(service_mtp_sidecar%tensors(i)%bytes)
+            service_mtp_sidecar%tensors(i)%bytes_mapped = .false.
+            service_mtp_sidecar%tensors(i)%bytes_mapped_external = .false.
+            service_model%file%tensors(target_index)%value_type = service_mtp_sidecar%tensors(i)%value_type
+            service_model%file%tensors(target_index)%byte_count = service_mtp_sidecar%tensors(i)%byte_count
             if (allocated(service_model%file%tensors(target_index)%decoded_values)) &
                 deallocate(service_model%file%tensors(target_index)%decoded_values)
-            if (allocated(sidecar%tensors(i)%decoded_values)) then
-                call move_alloc(sidecar%tensors(i)%decoded_values, &
+            if (allocated(service_mtp_sidecar%tensors(i)%decoded_values)) then
+                call move_alloc(service_mtp_sidecar%tensors(i)%decoded_values, &
                     service_model%file%tensors(target_index)%decoded_values)
             end if
             copied = copied + 1
@@ -358,11 +369,12 @@ contains
         if (stat%is_ok() .and. copied < 14) then
             call stat%set(FORTAI_UNSUPPORTED, 'MTP sidecar does not contain the complete blk.64 head')
         end if
-        if (stat%is_ok()) then
-            service_mtp_sidecar_active = .true.
-            write(error_unit, '(a,i0,a)') 'fortai-native: loaded ', copied, ' MTP head tensors from sidecar'
+        if (.not. stat%is_ok()) then
+            call service_mtp_sidecar%close()
+            return
         end if
-        call sidecar%close()
+        service_mtp_sidecar_active = .true.
+        write(error_unit, '(a,i0,a)') 'fortai-native: loaded ', copied, ' MTP head tensors from sidecar'
     end subroutine apply_mtp_sidecar
 
     subroutine open_external_draft(path, context_size, stat)
