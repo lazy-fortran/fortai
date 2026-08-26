@@ -179,9 +179,11 @@ service is FortAI-owned: build
 it with `tools/build_cuda_server.sh` and launch
 `tools/fortai-server --model MODEL.gguf --port 8080`. It loads the model
 through the native Fortran Qwen3.5 runtime, initializes the FortAI CUDA
-backend, and serves `/`, `/health`, `/props` (read-only unless `--props` is enabled), `/slots`, `/metrics`, `/v1/models`, `/v1/chat/completions`,
+backend, and serves `/`, `/health`, `/props` (read-only unless `--props` is enabled), `/slots`, `/metrics`, `/v1/models`, `/tokenize`, `/detokenize`, `/apply-template`, `/v1/chat/completions`,
 `/v1/completions`, and the OpenAI Responses-compatible `/v1/responses` wire
-API. The root endpoint is a small llama.cpp-style chat UI. The
+API. The tokenizer and template endpoints follow llama.cpp's request and
+response shapes, including special-token flags, token pieces, strict token
+ID validation, and optional generation-prompt suppression. The root endpoint is a small llama.cpp-style chat UI. The
 server never launches `llama-server` and reports `X-FortAI-Backend: fortai`.
 `--api-prefix`/`LLAMA_ARG_API_PREFIX` applies the configured base path to every
 endpoint (including the embedded UI), `--path` serves a safe static tree, and

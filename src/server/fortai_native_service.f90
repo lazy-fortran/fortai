@@ -35,6 +35,9 @@ module fortai_native_service
     public :: fortai_native_service_complete_text
     public :: fortai_native_service_complete_text_options
     public :: fortai_native_service_complete_text_sampling
+    public :: fortai_native_service_tokenize
+    public :: fortai_native_service_detokenize
+    public :: fortai_native_service_token_piece
     public :: fortai_native_service_close
     public :: fortai_native_service_default_thinking
     public :: fortai_native_service_supports_reasoning_effort
@@ -193,6 +196,50 @@ contains
         fortai_native_service_context_size = 0_int64
         if (service_ready) fortai_native_service_context_size = service_model%max_context
     end function fortai_native_service_context_size
+
+    logical function fortai_native_service_tokenize(text, add_special, parse_special, ids)
+        character(len=*), intent(in) :: text
+        logical, intent(in) :: add_special, parse_special
+        integer(int32), allocatable, intent(out) :: ids(:)
+
+        allocate(ids(0))
+        fortai_native_service_tokenize = .false.
+        if (.not. service_ready) return
+        call service_tokenizer%encode(text, ids, add_special, parse_special)
+        fortai_native_service_tokenize = allocated(ids)
+    end function fortai_native_service_tokenize
+
+    logical function fortai_native_service_detokenize(ids, text)
+        integer(int32), intent(in) :: ids(:)
+        character(len=:), allocatable, intent(out) :: text
+        integer :: i
+
+        fortai_native_service_detokenize = .false.
+        if (.not. service_ready) then
+            allocate(character(len=0) :: text)
+            return
+        end if
+        do i = 1, size(ids)
+            if (ids(i) < 0_int32 .or. ids(i) >= service_tokenizer%vocab_size) then
+                allocate(character(len=0) :: text)
+                return
+            end if
+        end do
+        call service_tokenizer%decode(ids, text)
+        fortai_native_service_detokenize = allocated(text)
+    end function fortai_native_service_detokenize
+
+    logical function fortai_native_service_token_piece(token, piece)
+        integer(int32), intent(in) :: token
+        character(len=:), allocatable, intent(out) :: piece
+        logical :: valid
+
+        allocate(character(len=0) :: piece)
+        fortai_native_service_token_piece = .false.
+        if (.not. service_ready) return
+        call service_tokenizer%token_piece(token, piece, valid)
+        fortai_native_service_token_piece = valid
+    end function fortai_native_service_token_piece
 
     logical function native_mtp_mode_requested()
         character(len=64) :: value

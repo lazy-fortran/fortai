@@ -329,7 +329,8 @@ contains
                     '--no-log-timestamps', '-kvo', '-nkvo', '--spec-draft-backend-sampling', &
                     '--no-spec-draft-backend-sampling', '--tts-use-guide-tokens', &
                     '--spec-draft-cpu-moe', '-cmoed', '--cpu-moe-draft', &
-                    '--embd-gemma-default', '--fim-qwen-1', '--fim-qwen-1.5b-default', '--fim-qwen-3b-default', '--fim-qwen-7b-default', &
+                    '--embd-gemma-default', '--fim-qwen-1', '--fim-qwen-1.5b-default', '--fim-qwen-3b-default', &
+                    '--fim-qwen-7b-default', &
                     '--fim-qwen-7b-spec', '--fim-qwen-14b-spec', '--fim-qwen-30b-default', '--gpt-oss-20b-default', &
                     '--gpt-oss-120b-default', '--vision-gemma-4b-default', '--vision-gemma-12b-default', '--spec-default', &
                     '-kvu', '--kv-unified', '-no-kvu', '--no-kv-unified', '--cache-idle-slots', '--no-cache-idle-slots', &

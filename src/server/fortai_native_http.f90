@@ -7,6 +7,7 @@ module fortai_native_http
     use, intrinsic :: iso_c_binding, only: c_char, c_int, c_null_char
     use, intrinsic :: iso_fortran_env, only: int32, int64, real32
     use fortai_native_service, only: fortai_native_service_complete_text_sampling, &
+        fortai_native_service_tokenize, fortai_native_service_detokenize, fortai_native_service_token_piece, &
         fortai_native_service_default_thinking, fortai_native_service_supports_preserve_thinking, &
         fortai_native_service_supports_reasoning_effort, fortai_native_service_mtp_available, &
         fortai_native_service_mtp_active, fortai_native_service_external_draft_active, &
@@ -18,6 +19,7 @@ module fortai_native_http
 
     integer, parameter :: max_generation = 32768
     integer, parameter :: max_messages = 256
+    integer, parameter :: max_token_array = 1000000
     integer(int64), save :: request_count = 0_int64
     integer(int64), save :: generation_count = 0_int64
 
@@ -441,6 +443,100 @@ contains
             if (text(position:position) == ']') parse_prompt_array = count > 0
         end if
     end function parse_prompt_array
+
+    logical function parse_token_array(text, array_key, ids)
+        character(len=*), intent(in) :: text, array_key
+        integer(int32), allocatable, intent(out) :: ids(:)
+        integer(int32), allocatable :: work(:), grown(:)
+        integer :: position, limit, cursor, count, capacity, digit, sign
+        integer(int64) :: value, max_token_id
+        logical :: saw_digit
+
+        allocate(ids(0))
+        parse_token_array = .false.
+        position = json_top_level_key(text, array_key)
+        if (position == 0 .or. position > len(text)) return
+        if (text(position:position) /= '[') return
+        limit = matching_delimiter(text, position, '[', ']')
+        if (limit == 0) return
+        max_token_id = int(huge(0_int32), int64)
+        capacity = 64
+        allocate(work(capacity))
+        count = 0
+        cursor = skip_space(text, position + 1)
+        if (cursor == limit) then
+            deallocate(work)
+            parse_token_array = .true.
+            return
+        end if
+        if (cursor > limit) then
+            deallocate(work)
+            return
+        end if
+        do
+            if (cursor >= limit) then
+                deallocate(work)
+                return
+            end if
+            sign = 1
+            if (text(cursor:cursor) == '-') then
+                sign = -1
+                cursor = cursor + 1
+            else if (text(cursor:cursor) == '+') then
+                deallocate(work)
+                return
+            end if
+            value = 0_int64
+            saw_digit = .false.
+            do while (cursor < limit)
+                if (text(cursor:cursor) < '0' .or. text(cursor:cursor) > '9') exit
+                saw_digit = .true.
+                digit = iachar(text(cursor:cursor)) - iachar('0')
+                if (value > (huge(value) - int(digit, int64)) / 10_int64) then
+                    deallocate(work)
+                    return
+                end if
+                value = 10_int64 * value + int(digit, int64)
+                cursor = cursor + 1
+            end do
+            if (.not. saw_digit .or. sign < 0 .or. value > max_token_id) then
+                deallocate(work)
+                return
+            end if
+            if (count >= max_token_array) then
+                deallocate(work)
+                return
+            end if
+            if (count == capacity) then
+                allocate(grown(min(max_token_array, 2 * capacity)))
+                grown(:capacity) = work
+                call move_alloc(grown, work)
+                capacity = size(work)
+            end if
+            count = count + 1
+            work(count) = int(value, int32)
+            cursor = skip_space(text, cursor)
+            if (cursor == limit) exit
+            if (cursor > limit) then
+                deallocate(work)
+                return
+            end if
+            if (text(cursor:cursor) /= ',') then
+                deallocate(work)
+                return
+            end if
+            cursor = skip_space(text, cursor + 1)
+            if (cursor >= limit) then
+                deallocate(work)
+                return
+            end if
+        end do
+        deallocate(ids)
+        allocate(ids(count))
+        if (count > 0) ids = work(:count)
+        deallocate(work)
+        parse_token_array = .true.
+    end function parse_token_array
 
     integer function json_integer(text, key, fallback)
         character(len=*), intent(in) :: text, key
@@ -958,20 +1054,23 @@ contains
     end function parse_response_messages
 
     function format_chat(messages, count, enable_thinking, tools_json, reasoning_instruction, &
-            preserve_thinking) result(prompt)
+            preserve_thinking, add_generation_prompt) result(prompt)
         type(message_t), intent(in) :: messages(:)
         integer, intent(in) :: count
         logical, intent(in) :: enable_thinking
         type(string_t), intent(in) :: tools_json
         type(string_t), intent(in) :: reasoning_instruction
         logical, intent(in) :: preserve_thinking
+        logical, intent(in), optional :: add_generation_prompt
         type(string_t) :: prompt
         integer :: i, start_index, last_user_index, leading_system_count
         character(len=:), allocatable :: role, reasoning, raw_content
         type(string_t) :: content, parsed_reasoning, merged_system
-        logical :: tool_group_open, has_real_reasoning
+        logical :: tool_group_open, has_real_reasoning, append_generation_prompt
 
         call prompt%clear()
+        append_generation_prompt = .true.
+        if (present(add_generation_prompt)) append_generation_prompt = add_generation_prompt
         call merged_system%clear()
         leading_system_count = 0
         do while (leading_system_count < count)
@@ -1095,18 +1194,20 @@ contains
             call prompt%append('<|im_end|>')
             call prompt%append(char(10))
         end if
-        call prompt%append('<|im_start|>assistant')
-        call prompt%append(char(10))
-        if (enable_thinking) then
-            call prompt%append('<think>')
+        if (append_generation_prompt) then
+            call prompt%append('<|im_start|>assistant')
             call prompt%append(char(10))
-        else
-            call prompt%append('<think>')
-            call prompt%append(char(10))
-            call prompt%append(char(10))
-            call prompt%append('</think>')
-            call prompt%append(char(10))
-            call prompt%append(char(10))
+            if (enable_thinking) then
+                call prompt%append('<think>')
+                call prompt%append(char(10))
+            else
+                call prompt%append('<think>')
+                call prompt%append(char(10))
+                call prompt%append(char(10))
+                call prompt%append('</think>')
+                call prompt%append(char(10))
+                call prompt%append(char(10))
+            end if
         end if
     end function format_chat
 
@@ -1771,6 +1872,114 @@ contains
         call escaped%append_char('"')
     end function json_escape
 
+    integer function utf8_piece_width(text, position)
+        character(len=*), intent(in) :: text
+        integer, intent(in) :: position
+        integer :: first, second, third, fourth, codepoint
+
+        utf8_piece_width = 0
+        if (position < 1 .or. position > len(text)) return
+        first = iachar(text(position:position))
+        if (first < 128) then
+            utf8_piece_width = 1
+            return
+        end if
+        if (first >= int(z'c2') .and. first <= int(z'df')) then
+            if (position + 1 > len(text)) return
+            second = iachar(text(position + 1:position + 1))
+            if (second >= int(z'80') .and. second <= int(z'bf')) utf8_piece_width = 2
+            return
+        end if
+        if (first >= int(z'e0') .and. first <= int(z'ef')) then
+            if (position + 2 > len(text)) return
+            second = iachar(text(position + 1:position + 1))
+            third = iachar(text(position + 2:position + 2))
+            if (second < int(z'80') .or. second > int(z'bf') .or. third < int(z'80') .or. third > int(z'bf')) return
+            codepoint = iand(first, 15) * 4096 + iand(second, 63) * 64 + iand(third, 63)
+            if (codepoint < int(z'800') .or. (codepoint >= int(z'd800') .and. codepoint <= int(z'dfff'))) return
+            utf8_piece_width = 3
+            return
+        end if
+        if (first >= int(z'f0') .and. first <= int(z'f4')) then
+            if (position + 3 > len(text)) return
+            second = iachar(text(position + 1:position + 1))
+            third = iachar(text(position + 2:position + 2))
+            fourth = iachar(text(position + 3:position + 3))
+            if (second < int(z'80') .or. second > int(z'bf') .or. third < int(z'80') .or. third > int(z'bf') .or. &
+                fourth < int(z'80') .or. fourth > int(z'bf')) return
+            codepoint = iand(first, 7) * 262144 + iand(second, 63) * 4096 + iand(third, 63) * 64 + iand(fourth, 63)
+            if (codepoint < int(z'10000') .or. codepoint > int(z'10ffff')) return
+            utf8_piece_width = 4
+        end if
+    end function utf8_piece_width
+
+    logical function valid_utf8_piece(text)
+        character(len=*), intent(in) :: text
+        integer :: position, width
+
+        valid_utf8_piece = .true.
+        position = 1
+        do while (position <= len(text))
+            width = utf8_piece_width(text, position)
+            if (width == 0) then
+                valid_utf8_piece = .false.
+                return
+            end if
+            position = position + width
+        end do
+    end function valid_utf8_piece
+
+    subroutine append_token_piece_json(output, piece)
+        type(string_t), intent(inout) :: output
+        character(len=*), intent(in) :: piece
+        type(string_t) :: piece_string, escaped
+        integer :: i, byte_value
+
+        call piece_string%set(piece)
+        if (valid_utf8_piece(piece)) then
+            escaped = json_escape(piece_string)
+            call output%append_string(escaped)
+            return
+        end if
+        call output%append('[')
+        do i = 1, len(piece)
+            if (i > 1) call output%append(',')
+            byte_value = iand(iachar(piece(i:i)), int(z'ff'))
+            call output%append_int(byte_value)
+        end do
+        call output%append(']')
+    end subroutine append_token_piece_json
+
+    function tokenization_response(ids, with_pieces) result(output)
+        integer(int32), intent(in) :: ids(:)
+        logical, intent(in) :: with_pieces
+        type(string_t) :: output
+        character(len=:), allocatable :: piece
+        logical :: piece_ok
+        integer :: i
+
+        call output%set('{"tokens":[')
+        do i = 1, size(ids)
+            if (i > 1) call output%append(',')
+            if (.not. with_pieces) then
+                call output%append_int(int(ids(i)))
+            else
+                call output%append('{"id":')
+                call output%append_int(int(ids(i)))
+                call output%append(',"piece":')
+                piece_ok = fortai_native_service_token_piece(ids(i), piece)
+                if (piece_ok) then
+                    call append_token_piece_json(output, piece)
+                else
+                    call output%append('""')
+                end if
+                call output%append('}')
+            end if
+        end do
+        call output%append(']}')
+        call output%append(char(10))
+    end function tokenization_response
+
     character(len=1) function hex_character(value)
         integer, intent(in) :: value
         if (value < 10) then
@@ -1786,6 +1995,8 @@ contains
         type(string_t), intent(out) :: response
         type(string_t) :: escaped
         type(string_t) :: detail
+        associate (ignored_status => status)
+        end associate
         call detail%set(message)
         escaped = json_escape(detail)
         call response%clear()
@@ -1808,17 +2019,54 @@ contains
         call page%append(':root{color-scheme:dark;font:16px system-ui,sans-serif}body{margin:0;background:#10131a;color:#edf2f7}')
         call page%append('main{max-width:960px;margin:auto;padding:28px}.brand{display:flex;align-items:center;gap:12px}')
         call page%append('.dot{width:13px;height:13px;border-radius:50%;background:#53e6a7;box-shadow:0 0 18px #53e6a7}')
-        call page%append('h1{font-size:1.5rem;margin:0}.sub{color:#9ba7b5;margin:4px 0 24px}.chat{min-height:55vh;border:1px solid #2d3748;border-radius:14px;padding:18px;background:#151a23;overflow:auto}')
-        call page%append('.msg{white-space:pre-wrap;line-height:1.5;margin:12px 0;padding:12px 15px;border-radius:10px;max-width:85%}.user{margin-left:auto;background:#1d4d43}.assistant{background:#222b39}.role{font-size:.75rem;color:#9ba7b5;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px}.thought{margin-bottom:10px;color:#aeb8c5;font-size:.9rem}.thought summary{cursor:pointer;color:#73d6b1;margin-bottom:6px}')
-        call page%append('form{display:flex;gap:10px;margin-top:14px}textarea{flex:1;resize:vertical;min-height:58px;max-height:240px;border:1px solid #39475a;border-radius:10px;padding:12px;background:#0e1117;color:inherit;font:inherit}button{border:0;border-radius:10px;padding:0 22px;background:#53e6a7;color:#0b2118;font-weight:700;cursor:pointer}.status{color:#9ba7b5;font-size:.85rem;margin-top:9px}</style></head><body><main>')
-        call page%append('<div class=brand><span class=dot></span><div><h1>FortAI</h1><div class=sub>Native Qwen3.5 CUDA inference</div></div></div>')
-        call page%append('<section id=chat class="chat"><div class="msg assistant"><div class=role>FortAI</div>Ready.</div></section>')
-        call page%append('<form id=form><textarea id=input placeholder="Message FortAI…"></textarea><button id=send>Send</button></form><div id=status class=status>Connected to the FortAI-native server.</div></main><script>')
+        call page%append('h1{font-size:1.5rem;margin:0}.sub{color:#9ba7b5;margin:4px 0 24px}')
+        call page%append('.chat{min-height:55vh;border:1px solid #2d3748')
+        call page%append(';border-radius:14px;padding:18px;background:#151a23;overflow:auto}')
+        call page%append('.msg{white-space:pre-wrap;line-height:1.5;margin:12px 0;padding:12px 15px;border-radius:10px;')
+        call page%append('max-width:85%}')
+        call page%append('.user{margin-left:auto;background:#1d4d43}.assistant{background:#222b39}.role{font-size:.75rem;')
+        call page%append('color:#9ba7b5;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px}')
+        call page%append('.thought{margin-bottom:10px;color:#aeb8c5;font-size:.9rem}.thought summary{cursor:pointer;')
+        call page%append('color:#73d6b1;margin-bottom:6px}')
+        call page%append('form{display:flex;gap:10px;margin-top:14px}textarea{flex:1;resize:vertical;min-height:58px;')
+        call page%append('max-height:240px;border:1px solid #39475a;border-radius:10px;padding:12px;background:#0e1117;')
+        call page%append('color:inherit;font:inherit}')
+        call page%append('button{border:0;border-radius:10px;padding:0 22px;background:#53e6a7;color:#0b2118;')
+        call page%append('font-weight:700;cursor:pointer}.status{color:#9ba7b5;font-size:.85rem;margin-top:9px}</style>')
+        call page%append('</head><body><main>')
+        call page%append('<div class=brand><span class=dot></span><div><h1>FortAI</h1>')
+        call page%append('<div class=sub>Native Qwen3.5 CUDA inference</div></div></div>')
+        call page%append('<section id=chat class="chat"><div class="msg assistant"><div class=role>FortAI</div>Ready.</div>')
+        call page%append('</section>')
+        call page%append('<form id=form><textarea id=input placeholder="Message FortAI…"></textarea>')
+        call page%append('<button id=send>Send</button>')
+        call page%append('</form>')
+        call page%append('<div id=status class=status>Connected to the FortAI-native server.</div></main><script>')
         call page%append('const apiPrefix=')
         call page%append_string(api_prefix_json)
-        call page%append(',chat=document.querySelector("#chat"),input=document.querySelector("#input"),form=document.querySelector("#form"),send=document.querySelector("#send"),status=document.querySelector("#status"),messages=[];')
-        call page%append('function add(role,text){const el=document.createElement("div");el.className="msg "+role;const r=document.createElement("div");r.className="role";r.textContent=role==="user"?"You":"FortAI";const t=document.createElement("div");t.textContent=text;el.append(r,t);chat.append(el);chat.scrollTop=chat.scrollHeight;return t}')
-        call page%append('form.addEventListener("submit",async e=>{e.preventDefault();const text=input.value.trim();if(!text)return;input.value="";add("user",text);messages.push({role:"user",content:text});send.disabled=true;status.textContent="Generating…";const target=add("assistant","");try{const r=await fetch(apiPrefix+"/v1/chat/completions",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({model:"qwen",messages,max_tokens:512,stream:false,temperature:0})});const d=await r.json();if(!r.ok)throw Error(d.error?.message||"request failed");const m=d.choices?.[0]?.message||{};target.textContent=m.content||"";if(m.reasoning_content){const details=document.createElement("details"),summary=document.createElement("summary"),thought=document.createElement("div");details.className="thought";summary.textContent="Thinking";thought.textContent=m.reasoning_content;details.append(summary,thought);target.parentElement.insertBefore(details,target)}messages.push({role:"assistant",content:m.content||"",reasoning_content:m.reasoning_content||""});status.textContent="FortAI native CUDA"}catch(err){target.textContent="Error: "+err.message;status.textContent="Request failed"}finally{send.disabled=false;input.focus()}})</script></body></html>')
+        call page%append(',chat=document.querySelector("#chat"),input=document.querySelector("#input"),')
+        call page%append('form=document.querySelector("#form"),')
+        call page%append('send=document.querySelector("#send"),status=document.querySelector("#status"),messages=[];')
+        call page%append('function add(role,text){const el=document.createElement("div");el.className="msg "+role;')
+        call page%append('const r=document.createElement("div");r.className="role";r.textContent=role==="user"?"You":"FortAI";')
+        call page%append('const t=document.createElement("div");t.textContent=text;')
+        call page%append('el.append(r,t);chat.append(el);chat.scrollTop=chat.scrollHeight;return t}')
+        call page%append('form.addEventListener("submit",async e=>{e.preventDefault();const text=input.value.trim();')
+        call page%append('if(!text)return;input.value="";add("user",text);messages.push({role:"user",content:text});')
+        call page%append('send.disabled=true;status.textContent="Generating…";const target=add("assistant","");')
+        call page%append('try{const r=await fetch(apiPrefix+"/v1/chat/completions",{method:"POST",')
+        call page%append('headers:{"content-type":"application/json"},body:JSON.stringify({model:"qwen",messages,')
+        call page%append('max_tokens:512,stream:false,temperature:0})});const d=await r.json();')
+        call page%append('if(!r.ok)throw Error(d.error?.message||"request failed");const m=d.choices?.[0]?.message||{};')
+        call page%append('target.textContent=m.content||"";')
+        call page%append('if(m.reasoning_content){const details=document.createElement("details"),')
+        call page%append('summary=document.createElement("summary"),thought=document.createElement("div");')
+        call page%append('details.className="thought";')
+        call page%append('summary.textContent="Thinking";thought.textContent=m.reasoning_content;details.append(summary,thought);')
+        call page%append('target.parentElement.insertBefore(details,target)}messages.push({role:"assistant",content:m.content||"",')
+        call page%append('reasoning_content:m.reasoning_content||""});status.textContent="FortAI native CUDA"}')
+        call page%append('catch(err){target.textContent="Error: "+err.message;status.textContent="Request failed"}')
+        call page%append('finally{send.disabled=false;input.focus()}})</script></body></html>')
     end function web_ui
 
     subroutine parse_http_request(request, method, path, body, okay)
@@ -2282,6 +2530,7 @@ contains
         type(string_t), allocatable :: prompt_batch(:), batch_generated(:)
         type(message_t), allocatable :: messages(:)
         type(tool_call_t), allocatable :: tool_calls(:)
+        integer(int32), allocatable :: token_ids(:)
         integer, allocatable :: batch_prompt_tokens(:), batch_tokens(:)
         integer :: count, max_tokens, prompt_tokens, tokens, result_code, required, tool_count
         integer :: prompt_batch_count, batch_limit, batch_index
@@ -2395,6 +2644,170 @@ contains
             call result%append(char(10))
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        if (path_value == '/tokenize' .and. method%as_character() == 'POST') then
+            block
+                character(len=:), allocatable :: body_text, content_text
+                type(string_t) :: parsed_content
+                integer :: content_value, after
+                logical :: content_valid, add_special, parse_special, with_pieces
+                logical :: option_valid, option_found, token_ok
+
+                body_text = body%as_character()
+                content_value = json_top_level_key(body_text, 'content')
+                content_valid = .false.
+                if (content_value > 0 .and. content_value <= len(body_text)) then
+                    if (body_text(content_value:content_value) == '"') then
+                        content_valid = json_string(body_text, content_value, parsed_content, after)
+                        if (content_valid) content_text = parsed_content%as_character()
+                    end if
+                end if
+                if (.not. content_valid) then
+                    call error_body(400, 'content must be a string', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                add_special = json_boolean_checked(body_text, 'add_special', .false., option_valid, option_found)
+                if (.not. option_valid) then
+                    call error_body(400, 'add_special must be a boolean', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                parse_special = json_boolean_checked(body_text, 'parse_special', .true., option_valid, option_found)
+                if (.not. option_valid) then
+                    call error_body(400, 'parse_special must be a boolean', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                with_pieces = json_boolean_checked(body_text, 'with_pieces', .false., option_valid, option_found)
+                if (.not. option_valid) then
+                    call error_body(400, 'with_pieces must be a boolean', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                token_ok = fortai_native_service_tokenize(content_text, add_special, parse_special, token_ids)
+                if (.not. token_ok) then
+                    call error_body(500, 'FortAI tokenization failed', result)
+                    status = 500_c_int
+                else
+                    result = tokenization_response(token_ids, with_pieces)
+                    status = 200_c_int
+                end if
+            end block
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle)
+            return
+        end if
+        if (path_value == '/detokenize' .and. method%as_character() == 'POST') then
+            block
+                character(len=:), allocatable :: decoded_text
+                type(string_t) :: decoded_string, escaped
+                logical :: token_ok
+
+                if (.not. parse_token_array(body%as_character(), 'tokens', token_ids)) then
+                    call error_body(400, 'tokens must be an array of non-negative token IDs', result)
+                    status = 400_c_int
+                else
+                    token_ok = fortai_native_service_detokenize(token_ids, decoded_text)
+                    if (.not. token_ok) then
+                        call error_body(400, 'tokens contains an invalid token ID', result)
+                        status = 400_c_int
+                    else
+                        call decoded_string%set(decoded_text)
+                        escaped = json_escape(decoded_string)
+                        call result%set('{"content":')
+                        call result%append_string(escaped)
+                        call result%append('}')
+                        call result%append(char(10))
+                        status = 200_c_int
+                    end if
+                end if
+            end block
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle)
+            return
+        end if
+        if (path_value == '/apply-template' .and. method%as_character() == 'POST') then
+            block
+                character(len=:), allocatable :: body_text
+                logical :: option_valid, option_found, nested_valid, nested_found
+                logical :: add_generation_prompt, enable_thinking, preserve_template_thinking
+
+                body_text = body%as_character()
+                add_generation_prompt = json_boolean_checked(body_text, 'add_generation_prompt', .true., &
+                    option_valid, option_found)
+                if (.not. option_valid) then
+                    call error_body(400, 'add_generation_prompt must be a boolean', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                enable_thinking = json_boolean_checked(body_text, 'enable_thinking', &
+                    fortai_native_service_default_thinking(), option_valid, option_found)
+                if (.not. option_valid) then
+                    call error_body(400, 'enable_thinking must be a boolean', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                enable_thinking = json_object_boolean_checked(body_text, 'chat_template_kwargs', 'enable_thinking', &
+                    enable_thinking, nested_valid, nested_found)
+                if (.not. nested_valid) then
+                    call error_body(400, 'chat_template_kwargs.enable_thinking must be a boolean', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                preserve_template_thinking = server_boolean_default('FORTAI_REASONING_PRESERVE', &
+                    fortai_native_service_supports_preserve_thinking())
+                preserve_template_thinking = json_boolean_checked(body_text, 'preserve_thinking', &
+                    preserve_template_thinking, option_valid, option_found)
+                if (.not. option_valid) then
+                    call error_body(400, 'preserve_thinking must be a boolean', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                preserve_template_thinking = json_object_boolean_checked(body_text, 'chat_template_kwargs', &
+                    'preserve_thinking', preserve_template_thinking, nested_valid, nested_found)
+                if (.not. nested_valid) then
+                    call error_body(400, 'chat_template_kwargs.preserve_thinking must be a boolean', result)
+                    status = 400_c_int
+                    call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+                call tools_json%clear()
+                if (.not. json_array_value(body_text, 'tools', tools_json)) call tools_json%clear()
+                call reasoning_instruction%clear()
+                if (.not. parse_messages(body_text, messages, count)) then
+                    call error_body(400, 'messages must contain role/content strings', result)
+                    status = 400_c_int
+                else
+                    prompt = format_chat(messages, count, enable_thinking, tools_json, reasoning_instruction, &
+                        preserve_template_thinking, add_generation_prompt)
+                    call result%set('{"prompt":')
+                    call result%append_string(json_escape(prompt))
+                    call result%append('}')
+                    call result%append(char(10))
+                    status = 200_c_int
+                end if
+            end block
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle)
+            return
         end if
         if ((path_value == '/v1/models' .or. index(path_value, '/v1/models/') == 1) .and. &
             method%as_character() /= 'POST') then
@@ -2634,7 +3047,7 @@ contains
                     if (batch_limit <= 0) batch_limit = 1
                     batch_limit = min(batch_limit, max_messages)
                     if (.not. parse_prompt_array(body_text, trim(prompt_key), prompt_batch, &
-                            prompt_batch_count, batch_limit)) then
+                        prompt_batch_count, batch_limit)) then
                         call error_body(400, 'prompt array must contain non-empty strings', result)
                         status = 400_c_int
                         call copy_result(result, 'application/json', response, response_capacity, response_length, &
@@ -2887,7 +3300,8 @@ contains
         configured = trim(configured)
         if (configured(1:1) /= '/') configured = '/' // configured
         last = len(configured)
-        do while (last > 1 .and. configured(last:last) == '/')
+        do while (last > 1)
+            if (configured(last:last) /= '/') exit
             last = last - 1
         end do
         if (last < len(configured)) configured = configured(:last)
@@ -2925,7 +3339,8 @@ contains
         call result%clear()
         mime = 'application/octet-stream'
         found = .false.
-        if (len(path_value) == 0 .or. path_value(1:1) /= '/') return
+        if (len(path_value) == 0) return
+        if (path_value(1:1) /= '/') return
         if (index(path_value, '..') > 0) return
         root = server_text_default('FORTAI_STATIC_PATH', '')
         if (len_trim(root) == 0) return
@@ -3025,21 +3440,21 @@ contains
         end if
         if (json_top_level_key(text, 'repeat_penalty') > 0) then
             if (.not. update_real_property(text, 'repeat_penalty', 'FORTAI_REPEAT_PENALTY', tiny(1.0_real32), &
-                    huge(0.0_real32))) then
+                huge(0.0_real32))) then
                 call error_body(400, 'invalid repeat_penalty property', result)
                 return
             end if
         end if
         if (json_top_level_key(text, 'presence_penalty') > 0) then
             if (.not. update_real_property(text, 'presence_penalty', 'FORTAI_PRESENCE_PENALTY', -huge(0.0_real32), &
-                    huge(0.0_real32))) then
+                huge(0.0_real32))) then
                 call error_body(400, 'invalid presence_penalty property', result)
                 return
             end if
         end if
         if (json_top_level_key(text, 'frequency_penalty') > 0) then
             if (.not. update_real_property(text, 'frequency_penalty', 'FORTAI_FREQUENCY_PENALTY', -huge(0.0_real32), &
-                    huge(0.0_real32))) then
+                huge(0.0_real32))) then
                 call error_body(400, 'invalid frequency_penalty property', result)
                 return
             end if

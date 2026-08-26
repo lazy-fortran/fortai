@@ -14,9 +14,10 @@ module fortai_native_tokenizer
         integer(int32) :: eos_token = -1_int32
         logical :: add_bos_token = .false.
         logical :: qwen35_pretokenizer = .false.
-        ! Qwen ships both thinking-default and no-thinking-default chat
-        ! templates.  Keep the template policy with the tokenizer rather
-        ! than guessing from the model filename in the HTTP layer.
+        ! llama.cpp defines enable_thinking=true whenever the loaded chat
+        ! template supports that control.  Keep the same native default;
+        ! an explicit chat_template_kwargs.enable_thinking=false still
+        ! selects the template's no-thinking branch.
         logical :: default_enable_thinking = .true.
         logical :: supports_reasoning_effort = .false.
         logical :: supports_preserve_thinking = .false.
@@ -38,6 +39,7 @@ module fortai_native_tokenizer
         procedure :: open => native_tokenizer_open
         procedure :: encode => native_tokenizer_encode
         procedure :: decode => native_tokenizer_decode
+        procedure :: token_piece => native_tokenizer_token_piece
         procedure :: is_eos => native_tokenizer_is_eos
         procedure :: is_stop => native_tokenizer_is_stop
     end type fortai_native_tokenizer_t
@@ -78,15 +80,9 @@ contains
             if (file%metadata(metadata_index)%value_type == 8) then
                 if (allocated(file%metadata(metadata_index)%string_value)) then
                     chat_template = file%metadata(metadata_index)%string_value
-                    ! Qwen3.5 no-thinking templates test for `is true`;
-                    ! thinking templates test for `is false` (or explicitly
-                    ! allow undefined).
-                    if (index(chat_template, 'enable_thinking is defined and enable_thinking is true') > 0 .and. &
-                        index(chat_template, 'enable_thinking is undefined or enable_thinking is true') == 0) then
-                        self%default_enable_thinking = .false.
-                    else
-                        self%default_enable_thinking = .true.
-                    end if
+                    ! Do not follow the template's undefined-value branch:
+                    ! llama.cpp supplies a true value before rendering.
+                    self%default_enable_thinking = .true.
                     self%supports_reasoning_effort = index(chat_template, 'reasoning_effort') > 0
                     self%supports_preserve_thinking = index(chat_template, 'preserve_thinking') > 0
                 end if
@@ -230,25 +226,39 @@ contains
 
     integer function byte_unicode(value)
         integer, intent(in) :: value
-        integer :: b, extra
-        logical :: listed
-        extra = 0
-        do b = 0, 255
-            listed = (b >= 33 .and. b <= 126) .or. (b >= 161 .and. b <= 172) .or. &
-                (b >= 174 .and. b <= 255)
-            if (.not. listed) then
-                if (b == value) then
-                    byte_unicode = 256 + extra
-                    return
-                end if
-                extra = extra + 1
-            else if (b == value) then
-                byte_unicode = b
-                return
-            end if
-        end do
+        if ((value >= 33 .and. value <= 126) .or. (value >= 161 .and. value <= 172) .or. &
+            (value >= 174 .and. value <= 255)) then
+            byte_unicode = value
+            return
+        end if
+        if (value >= 0 .and. value <= 32) then
+            byte_unicode = 256 + value
+            return
+        end if
+        if (value >= 127 .and. value <= 160) then
+            byte_unicode = value + 162
+            return
+        end if
+        if (value == 173) then
+            byte_unicode = 323
+            return
+        end if
         byte_unicode = value
     end function byte_unicode
+
+    integer function unicode_byte(value)
+        integer, intent(in) :: value
+
+        unicode_byte = value
+        if (value < 256 .or. value >= 512) return
+        if (value <= 288) then
+            unicode_byte = value - 256
+        else if (value <= 322) then
+            unicode_byte = value - 162
+        else if (value == 323) then
+            unicode_byte = 173
+        end if
+    end function unicode_byte
 
     function utf8_encode(codepoint) result(text)
         integer, intent(in) :: codepoint
@@ -650,23 +660,37 @@ contains
             .not. qwen35_is_number(codepoint) .and. .not. qwen35_is_word(codepoint)
     end function qwen35_is_optional_prefix
 
-    subroutine native_tokenizer_encode(self, text, ids)
+    subroutine native_tokenizer_encode(self, text, ids, add_special, parse_special)
         class(fortai_native_tokenizer_t), intent(in) :: self
         character(len=*), intent(in) :: text
         integer(int32), allocatable, intent(out) :: ids(:)
+        logical, intent(in), optional :: add_special, parse_special
         integer(int32), allocatable :: work(:)
         integer :: capacity, count, start, finish, relative, special_end, id
         integer :: marker_length, candidate, marker_position
         character(len=:), allocatable :: special
+        logical :: add_special_value, parse_special_value
         character(len=16), parameter :: inline_specials(6) = [character(len=16) :: &
             '<think>', '</think>', '<tool_call>', '</tool_call>', '<tool_response>', '</tool_response>']
 
         capacity = max(32, 4 * len(text) + 8)
         allocate(work(capacity))
         count = 0
-        if (self%add_bos_token .and. self%bos_token >= 0) then
+        add_special_value = self%add_bos_token
+        if (present(add_special)) add_special_value = add_special
+        parse_special_value = .true.
+        if (present(parse_special)) parse_special_value = parse_special
+        if (add_special_value .and. self%bos_token >= 0) then
             count = 1
             work(count) = self%bos_token
+        end if
+        if (.not. parse_special_value) then
+            call encode_plain(self, text, work, count, capacity)
+            if (allocated(ids)) deallocate(ids)
+            allocate(ids(count))
+            if (count > 0) ids = work(:count)
+            deallocate(work)
+            return
         end if
         start = 1
         do while (start <= len(text))
@@ -721,6 +745,72 @@ contains
         deallocate(work)
     end subroutine native_tokenizer_encode
 
+    subroutine native_tokenizer_token_piece(self, token, piece, valid)
+        class(fortai_native_tokenizer_t), intent(in) :: self
+        integer(int32), intent(in) :: token
+        character(len=:), allocatable, intent(out) :: piece
+        logical, intent(out) :: valid
+        integer :: index, length, position, codepoint, width, total, byte_value, i
+        character(len=:), allocatable :: raw, encoded
+
+        valid = .false.
+        allocate(character(len=0) :: piece)
+        if (token < 0_int32 .or. token >= self%vocab_size) return
+        if (.not. allocated(self%vocabulary_offset) .or. .not. allocated(self%vocabulary_length)) return
+        index = int(token) + 1
+        if (index < 1 .or. index > size(self%vocabulary_offset)) return
+        length = int(self%vocabulary_length(index))
+        if (length <= 0) then
+            valid = .true.
+            return
+        end if
+        raw = self%vocabulary_blob(self%vocabulary_offset(index): &
+            self%vocabulary_offset(index) + length - 1)
+        ! GGUF BPE vocabularies store arbitrary bytes through the GPT-2
+        ! byte-to-unicode alphabet.  The HTTP piece API, like llama.cpp's
+        ! common_token_to_piece(), must expose those original bytes rather
+        ! than the printable surrogate code points (for example, emoji
+        ! fragments are returned as a JSON byte array when not valid UTF-8).
+        total = 0
+        position = 1
+        do while (position <= len(raw))
+            call utf8_decode(raw, position, codepoint, width)
+            if (codepoint >= 256 .and. codepoint < 512) then
+                total = total + 1
+            else if (codepoint <= 255) then
+                total = total + 1
+            else
+                encoded = utf8_encode(codepoint)
+                total = total + len(encoded)
+            end if
+            position = position + width
+        end do
+        deallocate(piece)
+        allocate(character(len=total) :: piece)
+        total = 0
+        position = 1
+        do while (position <= len(raw))
+            call utf8_decode(raw, position, codepoint, width)
+            if (codepoint >= 256 .and. codepoint < 512) then
+                byte_value = unicode_byte(codepoint)
+                total = total + 1
+                piece(total:total) = achar(byte_value)
+            else if (codepoint <= 255) then
+                byte_value = codepoint
+                total = total + 1
+                piece(total:total) = achar(byte_value)
+            else
+                encoded = utf8_encode(codepoint)
+                do i = 1, len(encoded)
+                    total = total + 1
+                    piece(total:total) = encoded(i:i)
+                end do
+            end if
+            position = position + width
+        end do
+        valid = .true.
+    end subroutine native_tokenizer_token_piece
+
     subroutine native_tokenizer_decode(self, ids, text)
         class(fortai_native_tokenizer_t), intent(in) :: self
         integer(int32), intent(in) :: ids(:)
@@ -759,7 +849,7 @@ contains
             do while (j <= len(piece))
                 call utf8_decode(piece, j, codepoint, width)
                 if (codepoint >= 256 .and. codepoint < 512) then
-                    byte_value = codepoint - 256
+                    byte_value = unicode_byte(codepoint)
                     total = total + 1
                     raw(total:total) = achar(byte_value)
                 else if (codepoint <= 255) then
@@ -798,7 +888,7 @@ contains
                 output_position = output_position + valid_width
                 j = j + valid_width
             else
-                text(output_position:output_position + 2) = achar(int(z'ef')) // achar(int(z'bf')) // achar(int(z'bd'))
+                text(output_position:output_position + 2) = char(int(z'ef')) // char(int(z'bf')) // char(int(z'bd'))
                 output_position = output_position + 3
                 j = j + 1
             end if
