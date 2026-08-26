@@ -12,7 +12,8 @@ module fortai_whisper_decoder
         ggml_backend_alloc_context, ggml_backend_buffer_clear, ggml_backend_for_cpu, ggml_backend_free, &
         ggml_backend_free_buffer, ggml_backend_get_tensor, ggml_backend_sched_alloc_graph, &
         ggml_backend_sched_graph_compute, ggml_backend_sched_new, ggml_backend_sched_reset, &
-        ggml_backend_sched_free, ggml_backend_sched_synchronize, ggml_backend_set_tensor, ggml_context_free, &
+        ggml_backend_sched_free, ggml_backend_sched_synchronize, ggml_backend_set_tensor, ggml_backend_tensor_copy, &
+        ggml_context_free, &
         ggml_context_init, ggml_graph_build, ggml_graph_expand, ggml_graph_new, ggml_graph_overhead, &
         ggml_init_params, ggml_tensor_add, ggml_tensor_cast, ggml_tensor_cpy, ggml_tensor_flash_attn_ext, &
         ggml_tensor_gelu, ggml_tensor_get_rows, ggml_tensor_mul, ggml_tensor_mul_mat, ggml_tensor_new_1d, &
@@ -141,11 +142,10 @@ contains
         type(c_ptr) :: context, graph, scheduler, key, value, destination, encoder_input
         integer(int32) :: layer
         integer(c_int64_t) :: nstate, nctx, nctx_pad, nhead, nlayer, head_dim
-        integer(c_size_t) :: offset, nbytes
+        integer(c_size_t) :: offset
         integer(c_int) :: code
         character(len=128) :: name
         logical :: ok
-        real(real32), allocatable, target :: encoder_host(:,:)
 
         call stat%clear()
         if (.not. self%is_ready() .or. .not. c_associated(encoder_output)) then
@@ -172,9 +172,6 @@ contains
             return
         end if
         call ggml_tensor_set_input(encoder_input)
-        allocate(encoder_host(int(nstate, int32), int(nctx, int32)))
-        nbytes = int(size(encoder_host), c_size_t) * int(storage_size(encoder_host(1, 1)) / 8, c_size_t)
-        call ggml_backend_get_tensor(encoder_output, c_loc(encoder_host(1, 1)), 0_c_size_t, nbytes)
         do layer = 0_int32, self%n_layers - 1_int32
             call whisper_decoder_name(name, layer, 'cross_attn.key.weight')
             key = ggml_tensor_mul_mat(context, self%model%tensor_by_name(trim(name)), encoder_input)
@@ -203,7 +200,6 @@ contains
         scheduler = ggml_backend_sched_new(self%model%backend, int(WHISPER_GRAPH_NODES, c_size_t), WHISPER_C_FALSE, &
             WHISPER_C_TRUE, self%fallback_backend)
         if (.not. c_associated(scheduler)) then
-            deallocate(encoder_host)
             call ggml_context_free(context)
             call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper cross-attention scheduler allocation failed')
             return
@@ -211,18 +207,19 @@ contains
         ok = ggml_backend_sched_alloc_graph(scheduler, graph)
         if (.not. ok) then
             call ggml_backend_sched_free(scheduler)
-            deallocate(encoder_host)
             call ggml_context_free(context)
             call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper cross-attention compute arena allocation failed')
             return
         end if
-        call ggml_backend_set_tensor(encoder_input, c_loc(encoder_host(1, 1)), 0_c_size_t, nbytes)
+        ! Both tensors have the same contiguous F32 layout.  GGML dispatches
+        ! this through the backend's native copy path (CUDA D2D here),
+        ! avoiding the previous device-to-host-to-device staging buffer.
+        call ggml_backend_tensor_copy(encoder_output, encoder_input)
         code = ggml_backend_sched_graph_compute(scheduler, graph)
         call ggml_backend_sched_synchronize(scheduler)
         call ggml_backend_sched_reset(scheduler)
         call ggml_backend_sched_free(scheduler)
         call ggml_context_free(context)
-        deallocate(encoder_host)
         if (code /= GGML_STATUS_SUCCESS) then
             call stat%set(FORTAI_UNSUPPORTED, 'Whisper cross-attention cache computation failed')
             return

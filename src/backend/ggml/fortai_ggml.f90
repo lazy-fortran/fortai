@@ -109,6 +109,7 @@ module fortai_ggml
     public :: ggml_backend_buffer_size
     public :: ggml_backend_set_tensor
     public :: ggml_backend_get_tensor
+    public :: ggml_backend_tensor_copy
     public :: ggml_backend_buffer_clear
     public :: ggml_backend_synchronize
     public :: ggml_backend_free
@@ -535,6 +536,11 @@ module fortai_ggml
             type(c_ptr), value :: tensor, data
             integer(c_size_t), value :: offset, size
         end subroutine c_ggml_backend_tensor_get
+
+        subroutine c_ggml_backend_tensor_copy(source, destination) bind(C, name='ggml_backend_tensor_copy')
+            import c_ptr
+            type(c_ptr), value :: source, destination
+        end subroutine c_ggml_backend_tensor_copy
 
         subroutine c_ggml_backend_synchronize(backend) bind(C, name='ggml_backend_synchronize')
             import c_ptr
@@ -1186,6 +1192,14 @@ contains
         if (present(bytes)) actual_bytes = bytes
         call c_ggml_backend_tensor_get(tensor, data, actual_offset, actual_bytes)
     end subroutine ggml_backend_get_tensor
+
+    subroutine ggml_backend_tensor_copy(source, destination)
+        type(c_ptr), intent(in) :: source, destination
+
+        if (c_associated(source) .and. c_associated(destination)) then
+            call c_ggml_backend_tensor_copy(source, destination)
+        end if
+    end subroutine ggml_backend_tensor_copy
 
     subroutine ggml_backend_synchronize(backend)
         type(c_ptr), intent(in) :: backend
