@@ -1,9 +1,10 @@
 module fortai_whisper_tokenizer
-    !! Whisper's byte-level vocabulary helpers.
+    !! Whisper vocabulary helpers.
     !!
-    !! Legacy Whisper files contain the GPT-2 byte vocabulary directly (there
-    !! is no merge table to load).  The model runtime therefore only needs the
-    !! inverse byte-to-unicode map for decoding generated pieces.
+    !! Legacy Whisper files store the exact byte strings used by whisper.cpp.
+    !! Pieces must therefore be copied byte-for-byte: ASCII spaces are real
+    !! bytes, while multilingual pieces may be UTF-8 or intentionally invalid
+    !! byte sequences from the GPT-2 alphabet.
     use, intrinsic :: iso_fortran_env, only: int32
     use fortai_string, only: string_t
     use fortai_status, only: FORTAI_INVALID, status_t
@@ -101,11 +102,8 @@ contains
         type(string_t), intent(out) :: piece
         logical, intent(out), optional :: valid
         character(len=:), allocatable :: raw
-        integer :: position, codepoint, next_position, byte_value
-        logical :: okay
 
         call piece%clear()
-        okay = .false.
         if (token < 0_int32 .or. .not. allocated(file%vocab%token)) then
             if (present(valid)) valid = .false.
             return
@@ -119,102 +117,8 @@ contains
             if (present(valid)) valid = .true.
             return
         end if
-        position = 1
-        do while (position <= len(raw))
-            call utf8_codepoint(raw, position, codepoint, next_position, okay)
-            if (.not. okay) then
-                call piece%append_char(raw(position:position))
-                position = position + 1
-                cycle
-            end if
-            byte_value = gpt2_codepoint_to_byte(codepoint)
-            if (byte_value >= 0) call piece%append_char(achar(byte_value))
-            position = next_position
-        end do
+        call piece%append(raw)
         if (present(valid)) valid = .true.
     end subroutine whisper_token_piece
-
-    subroutine utf8_codepoint(text, first, codepoint, next, okay)
-        character(len=*), intent(in) :: text
-        integer, intent(in) :: first
-        integer(int32), intent(out) :: codepoint
-        integer, intent(out) :: next
-        logical, intent(out) :: okay
-        integer :: b0, b1, b2, b3, count
-
-        b0 = iachar(text(first:first))
-        codepoint = 0_int32
-        next = first + 1
-        okay = .false.
-        if (b0 < 128) then
-            codepoint = b0
-            okay = .true.
-            return
-        end if
-        if (b0 >= 194 .and. b0 <= 223) then
-            count = 2
-        else if (b0 >= 224 .and. b0 <= 239) then
-            count = 3
-        else if (b0 >= 240 .and. b0 <= 244) then
-            count = 4
-        else
-            return
-        end if
-        if (first + count - 1 > len(text)) return
-        b1 = iachar(text(first + 1:first + 1))
-        if (b1 < 128 .or. b1 > 191) return
-        if (count == 2) then
-            codepoint = int(b0 - 192, int32) * 64_int32 + int(b1 - 128, int32)
-            next = first + 2
-            okay = .true.
-            return
-        end if
-        b2 = iachar(text(first + 2:first + 2))
-        if (b2 < 128 .or. b2 > 191) return
-        if (count == 3) then
-            codepoint = int(b0 - 224, int32) * 4096_int32 + int(b1 - 128, int32) * 64_int32 + int(b2 - 128, int32)
-            next = first + 3
-            okay = codepoint >= 2048_int32
-            return
-        end if
-        b3 = iachar(text(first + 3:first + 3))
-        if (b3 < 128 .or. b3 > 191) return
-        codepoint = int(b0 - 240, int32) * 262144_int32 + int(b1 - 128, int32) * 4096_int32 + &
-            int(b2 - 128, int32) * 64_int32 + int(b3 - 128, int32)
-        next = first + 4
-        okay = codepoint >= 65536_int32 .and. codepoint <= int(z'10ffff')
-    end subroutine utf8_codepoint
-
-    integer function gpt2_codepoint_to_byte(codepoint)
-        integer(int32), intent(in) :: codepoint
-        integer :: byte_value, index
-        logical :: direct
-
-        direct = (codepoint >= 33 .and. codepoint <= 126) .or. &
-            (codepoint >= 161 .and. codepoint <= 172) .or. (codepoint >= 174 .and. codepoint <= 255)
-        if (direct) then
-            gpt2_codepoint_to_byte = codepoint
-            return
-        end if
-        if (codepoint < 256 .or. codepoint > 511) then
-            gpt2_codepoint_to_byte = -1
-            return
-        end if
-        index = codepoint - 256
-        byte_value = 0
-        do while (byte_value <= 255)
-            direct = (byte_value >= 33 .and. byte_value <= 126) .or. &
-                (byte_value >= 161 .and. byte_value <= 172) .or. (byte_value >= 174 .and. byte_value <= 255)
-            if (.not. direct) then
-                if (index == 0) then
-                    gpt2_codepoint_to_byte = byte_value
-                    return
-                end if
-                index = index - 1
-            end if
-            byte_value = byte_value + 1
-        end do
-        gpt2_codepoint_to_byte = -1
-    end function gpt2_codepoint_to_byte
 
 end module fortai_whisper_tokenizer

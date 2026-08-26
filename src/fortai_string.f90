@@ -22,6 +22,7 @@ module fortai_string
         procedure, public :: append_int => string_append_int
         procedure, public :: append_logical => string_append_logical
         procedure, public :: set => string_set
+        procedure, public :: equals => string_equals
         procedure, public :: length => string_length
         procedure, public :: as_character => string_as_character
         procedure, public :: from_c => string_from_c
@@ -108,6 +109,19 @@ contains
         call self%clear()
         call self%append(text)
     end subroutine string_set
+
+    logical function string_equals(self, text)
+        class(string_t), intent(in) :: self
+        character(len=*), intent(in) :: text
+
+        string_equals = .false.
+        if (self%used /= len(text)) return
+        if (self%used == 0) then
+            string_equals = .true.
+        else if (allocated(self%value)) then
+            string_equals = self%value(:self%used) == text
+        end if
+    end function string_equals
 
     integer function string_length(self)
         class(string_t), intent(in) :: self

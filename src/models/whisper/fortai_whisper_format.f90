@@ -427,7 +427,11 @@ contains
         allocate(self%filters(filter_mel, filter_fft))
         do j = 1, filter_fft
             do i = 1, filter_mel
-                self%filters(i, j) = filter_values((j - 1) * filter_mel + i)
+                ! The legacy GGML file stores each mel row contiguously
+                ! ([mel][fft]); the Fortran array is [mel,fft].  Index the
+                ! file row explicitly instead of treating it as a Fortran
+                ! column-major matrix.
+                self%filters(i, j) = filter_values((i - 1) * filter_fft + j)
             end do
         end do
         deallocate(filter_values)
@@ -507,13 +511,11 @@ contains
         class(whisper_file_t), intent(in) :: self
         character(len=*), intent(in) :: name
         integer :: i
-        character(len=:), allocatable :: candidate
 
         whisper_file_tensor_index = 0_int32
         if (.not. allocated(self%tensors)) return
         do i = 1, size(self%tensors)
-            candidate = self%tensors(i)%name%as_character()
-            if (candidate == name) then
+            if (self%tensors(i)%name%equals(name)) then
                 whisper_file_tensor_index = int(i, int32)
                 return
             end if

@@ -73,6 +73,11 @@ contains
             call self%close()
             return
         end if
+        call self%decoder%init(self%model, self%flash_attention, stat)
+        if (.not. stat%is_ok()) then
+            call self%close()
+            return
+        end if
         self%ready = .true.
     end subroutine whisper_runtime_init
 
@@ -200,23 +205,25 @@ contains
 
         call whisper_log_mel_spectrogram(samples, self%model%file%filters, mel, self%threads, stat)
         if (.not. stat%is_ok()) return
-        call self%encoder%encode(mel, encoder_values, stat)
+        ! The decoder consumes the backend-resident encoder tensor directly;
+        ! do not stage its full 7.7 MiB activation back to the host only to
+        ! discard it before cross-attention preparation.
+        call self%encoder%encode(mel, encoder_values, stat, copy_output=.false.)
         if (.not. stat%is_ok()) then
             if (allocated(encoder_values)) deallocate(encoder_values)
             return
         end if
-        deallocate(encoder_values)
-        call self%decoder%init(self%model, self%flash_attention, stat)
-        if (.not. stat%is_ok()) return
+        if (allocated(encoder_values)) deallocate(encoder_values)
         call self%decoder%prepare_cross(self%encoder%output, stat)
         if (.not. stat%is_ok()) return
 
         position = 0_int32
-        do step = 1, size(prefix)
-            call self%decoder%decode(prefix(step), position, logits, stat)
-            if (.not. stat%is_ok()) return
-            position = position + 1_int32
-        end do
+        ! The prompt is causal but independent across audio chunks.  Submit
+        ! its four tokens as one GGML batch so the GPU performs one decoder
+        ! graph traversal instead of rebuilding and launching it four times.
+        call self%decoder%decode_tokens(prefix, position, logits, stat)
+        if (.not. stat%is_ok()) return
+        position = position + int(size(prefix), int32)
         do step = 1, max_tokens
             call whisper_suppress_special_tokens(logits, self%model%file%hparams%n_vocab)
             token = whisper_native_sample(logits, actual_temperature, random_state)

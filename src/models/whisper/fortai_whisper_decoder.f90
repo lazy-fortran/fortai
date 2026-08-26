@@ -12,14 +12,15 @@ module fortai_whisper_decoder
         ggml_backend_alloc_context, ggml_backend_buffer_clear, ggml_backend_for_cpu, ggml_backend_free, &
         ggml_backend_free_buffer, ggml_backend_get_tensor, ggml_backend_sched_alloc_graph, &
         ggml_backend_sched_graph_compute, ggml_backend_sched_new, ggml_backend_sched_reset, &
-        ggml_backend_sched_free, ggml_backend_sched_synchronize, ggml_backend_set_tensor, ggml_backend_tensor_copy, &
+        ggml_backend_sched_free, ggml_backend_sched_set_tensor_backend, &
+        ggml_backend_set_tensor, &
         ggml_context_free, &
-        ggml_context_init, ggml_graph_build, ggml_graph_expand, ggml_graph_new, ggml_graph_overhead, &
+        ggml_context_init, ggml_context_reset, ggml_graph_build, ggml_graph_expand, ggml_graph_new, ggml_graph_overhead, &
         ggml_init_params, ggml_tensor_add, ggml_tensor_cast, ggml_tensor_cpy, ggml_tensor_flash_attn_ext, &
         ggml_tensor_gelu, ggml_tensor_get_rows, ggml_tensor_mul, ggml_tensor_mul_mat, ggml_tensor_new_1d, &
-        ggml_tensor_new_2d, ggml_tensor_new_3d, ggml_tensor_norm, ggml_tensor_permute, ggml_tensor_reshape_3d, &
+        ggml_tensor_new_3d, ggml_tensor_norm, ggml_tensor_permute, ggml_tensor_reshape_3d, &
         ggml_tensor_scale, ggml_tensor_set_input, ggml_tensor_set_output, ggml_tensor_transpose, ggml_tensor_view_1d, &
-        ggml_tensor_view_2d, ggml_tensor_view_3d, &
+        ggml_tensor_view, ggml_tensor_view_2d, ggml_tensor_view_3d, &
         ggml_tensor_reshape_2d, ggml_tensor_cont_2d, ggml_tensor_soft_max_ext, ggml_tensor_nbytes, ggml_tensor_overhead
     use fortai_status, only: FORTAI_INVALID, FORTAI_OUT_OF_MEMORY, FORTAI_UNSUPPORTED, status_t
     use fortai_whisper_model, only: whisper_native_model_t
@@ -40,6 +41,7 @@ module fortai_whisper_decoder
         type(c_ptr) :: cross_v = c_null_ptr
         type(c_ptr) :: self_k = c_null_ptr
         type(c_ptr) :: self_v = c_null_ptr
+        type(c_ptr) :: decode_context = c_null_ptr
         type(c_ptr) :: scheduler = c_null_ptr
         type(c_ptr) :: fallback_backend = c_null_ptr
         integer(int32) :: n_audio_ctx = 0_int32
@@ -57,6 +59,7 @@ module fortai_whisper_decoder
         procedure :: init => whisper_decoder_init
         procedure :: prepare_cross => whisper_decoder_prepare_cross
         procedure :: decode => whisper_decoder_decode
+        procedure :: decode_tokens => whisper_decoder_decode_tokens
         procedure :: close => whisper_decoder_close
         procedure :: memory_bytes => whisper_decoder_memory_bytes
         procedure :: is_ready => whisper_decoder_is_ready
@@ -127,6 +130,15 @@ contains
             call self%close()
             return
         end if
+        ! Match whisper.cpp's preallocated decoder metadata arena.  Resetting
+        ! this context for each graph avoids a host malloc/free cycle for
+        ! every token while keeping graph tensors short-lived.
+        self%decode_context = ggml_context_init(ggml_init_params(16_c_size_t * 1024_c_size_t * 1024_c_size_t, WHISPER_C_TRUE))
+        if (.not. c_associated(self%decode_context)) then
+            call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper decoder graph metadata allocation failed')
+            call self%close()
+            return
+        end if
     end subroutine whisper_decoder_init
 
     integer(int32) function whisper_pad_256(value)
@@ -139,7 +151,7 @@ contains
         class(whisper_decoder_t), intent(inout) :: self
         type(c_ptr), intent(in) :: encoder_output
         type(status_t), intent(out) :: stat
-        type(c_ptr) :: context, graph, scheduler, key, value, destination, encoder_input
+        type(c_ptr) :: context, graph, key, value, destination, encoder_input
         integer(int32) :: layer
         integer(c_int64_t) :: nstate, nctx, nctx_pad, nhead, nlayer, head_dim
         integer(c_size_t) :: offset
@@ -165,7 +177,9 @@ contains
             return
         end if
         graph = ggml_graph_new(context, int(WHISPER_GRAPH_NODES, c_size_t), WHISPER_C_FALSE)
-        encoder_input = ggml_tensor_new_2d(context, GGML_TYPE_F32, nstate, nctx)
+        ! Reuse the encoder's backend allocation through a metadata-only view;
+        ! the output is synchronized above and remains live for this graph.
+        encoder_input = ggml_tensor_view(context, encoder_output)
         if (.not. c_associated(graph) .or. .not. c_associated(encoder_input)) then
             call ggml_context_free(context)
             call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper cross-attention graph allocation failed')
@@ -197,28 +211,32 @@ contains
             end if
             call ggml_graph_expand(graph, ggml_tensor_cpy(context, value, destination))
         end do
-        scheduler = ggml_backend_sched_new(self%model%backend, int(WHISPER_GRAPH_NODES, c_size_t), WHISPER_C_FALSE, &
-            WHISPER_C_TRUE, self%fallback_backend)
-        if (.not. c_associated(scheduler)) then
+        ! Reuse the decoder scheduler for cross-attention preparation.  The
+        ! graph metadata is short-lived, but retaining the scheduler keeps its
+        ! backend allocators and CUDA stream state hot across audio chunks.
+        if (.not. c_associated(self%scheduler)) then
+            self%scheduler = ggml_backend_sched_new(self%model%backend, int(WHISPER_GRAPH_NODES, c_size_t), WHISPER_C_FALSE, &
+                WHISPER_C_TRUE, self%fallback_backend)
+        end if
+        if (.not. c_associated(self%scheduler)) then
             call ggml_context_free(context)
             call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper cross-attention scheduler allocation failed')
             return
         end if
-        ok = ggml_backend_sched_alloc_graph(scheduler, graph)
+        ! The encoder output is already resident on the model backend.  Pin
+        ! this graph input there so the scheduler does not silently select its
+        ! CPU fallback and insert a device-to-host-to-device staging copy.
+        call ggml_backend_sched_reset(self%scheduler)
+        call ggml_backend_sched_set_tensor_backend(self%scheduler, encoder_input, self%model%backend)
+        ok = ggml_backend_sched_alloc_graph(self%scheduler, graph)
         if (.not. ok) then
-            call ggml_backend_sched_free(scheduler)
+            call ggml_backend_sched_reset(self%scheduler)
             call ggml_context_free(context)
             call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper cross-attention compute arena allocation failed')
             return
         end if
-        ! Both tensors have the same contiguous F32 layout.  GGML dispatches
-        ! this through the backend's native copy path (CUDA D2D here),
-        ! avoiding the previous device-to-host-to-device staging buffer.
-        call ggml_backend_tensor_copy(encoder_output, encoder_input)
-        code = ggml_backend_sched_graph_compute(scheduler, graph)
-        call ggml_backend_sched_synchronize(scheduler)
-        call ggml_backend_sched_reset(scheduler)
-        call ggml_backend_sched_free(scheduler)
+        code = ggml_backend_sched_graph_compute(self%scheduler, graph)
+        call ggml_backend_sched_reset(self%scheduler)
         call ggml_context_free(context)
         if (code /= GGML_STATUS_SUCCESS) then
             call stat%set(FORTAI_UNSUPPORTED, 'Whisper cross-attention cache computation failed')
@@ -227,19 +245,20 @@ contains
         self%cross_ready = .true.
     end subroutine whisper_decoder_prepare_cross
 
-    subroutine whisper_decoder_decode(self, token, position, logits, stat)
+    subroutine whisper_decoder_decode_tokens(self, tokens, position, logits, stat)
         class(whisper_decoder_t), intent(inout) :: self
-        integer(int32), intent(in) :: token, position
-        real(real32), allocatable, target, intent(out) :: logits(:)
+        integer(int32), intent(in), target :: tokens(:)
+        integer(int32), intent(in) :: position
+        real(real32), allocatable, target, intent(inout) :: logits(:)
         type(status_t), intent(out) :: stat
-        type(c_ptr) :: context, graph, token_tensor, position_tensor, mask_tensor, mask_f16
+        type(c_ptr) :: context, graph, token_tensor, position_tensor, mask_tensor, mask_f16, logits_tensor
         type(c_ptr) :: cur, inp_l, inp_ca, inp_ff, qcur, kcur, vcur, query, key, value, attended
         type(c_ptr) :: scores, probabilities, destination, cross_key, cross_value
         type(c_ptr) :: layer_k, layer_v, dweight, dbias
-        integer(c_int64_t) :: nstate, nctx, nctx_pad, nhead, head_dim, n_kv, one
+        integer(c_int64_t) :: nstate, nctx, nctx_pad, nhead, head_dim, n_kv, one, n_tokens, n_vocab
         integer(c_size_t) :: offset, bytes, stride1, stride2
-        integer(int32) :: layer, i
-        integer(int32), target :: token_host, position_host
+        integer(int32) :: layer, i, j, token_count
+        integer(int32), allocatable, target :: token_host(:), position_host(:)
         real(real32), allocatable, target :: mask_host(:)
         character(len=128) :: name
         integer(c_int) :: code
@@ -250,7 +269,12 @@ contains
             call stat%set(FORTAI_INVALID, 'Whisper decoder requires a prepared cross-attention cache')
             return
         end if
-        if (position < 0 .or. position >= self%n_text_ctx) then
+        token_count = int(size(tokens), int32)
+        if (token_count <= 0) then
+            call stat%set(FORTAI_INVALID, 'Whisper decoder token batch is empty')
+            return
+        end if
+        if (position < 0 .or. position >= self%n_text_ctx .or. token_count > self%n_text_ctx - position) then
             call stat%set(FORTAI_INVALID, 'Whisper decoder position is outside the context')
             return
         end if
@@ -260,20 +284,23 @@ contains
         nhead = int(self%n_heads, c_int64_t)
         head_dim = nstate / nhead
         one = 1_c_int64_t
+        n_tokens = int(token_count, c_int64_t)
+        n_vocab = int(self%model%file%hparams%n_vocab, c_int64_t)
         if (self%flash_attention .and. self%model%use_gpu) then
-            n_kv = min(nctx, int(((position + 1_int32 + 255_int32) / 256_int32) * 256_int32, c_int64_t))
+            n_kv = min(nctx, int(((position + token_count + 255_int32) / 256_int32) * 256_int32, c_int64_t))
         else
-            n_kv = int(position + 1_int32, c_int64_t)
+            n_kv = int(position + token_count, c_int64_t)
         end if
-        context = ggml_context_init(ggml_init_params(16_c_size_t * 1024_c_size_t * 1024_c_size_t, WHISPER_C_TRUE))
+        context = self%decode_context
+        call ggml_context_reset(context)
         if (.not. c_associated(context)) then
             call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper decoder graph metadata allocation failed')
             return
         end if
         graph = ggml_graph_new(context, int(WHISPER_GRAPH_NODES, c_size_t), WHISPER_C_FALSE)
-        token_tensor = ggml_tensor_new_1d(context, GGML_TYPE_I32, one)
-        position_tensor = ggml_tensor_new_1d(context, GGML_TYPE_I32, one)
-        mask_tensor = ggml_tensor_new_3d(context, GGML_TYPE_F32, n_kv, one, one)
+        token_tensor = ggml_tensor_new_1d(context, GGML_TYPE_I32, n_tokens)
+        position_tensor = ggml_tensor_new_1d(context, GGML_TYPE_I32, n_tokens)
+        mask_tensor = ggml_tensor_new_3d(context, GGML_TYPE_F32, n_kv, n_tokens, one)
         call ggml_tensor_set_input(token_tensor)
         call ggml_tensor_set_input(position_tensor)
         call ggml_tensor_set_input(mask_tensor)
@@ -306,26 +333,27 @@ contains
             vcur = ggml_tensor_add(context, vcur, self%model%tensor_by_name(trim(name)))
 
             offset = int(layer, c_size_t) * int(2_int64 * nstate * nctx_pad, c_size_t)
-            destination = ggml_tensor_view_1d(context, self%self_k, nstate, offset + int(2_int64 * nstate * position, c_size_t))
+            destination = ggml_tensor_view_1d(context, self%self_k, nstate * n_tokens, &
+                offset + int(2_int64 * nstate * position, c_size_t))
             call ggml_graph_expand(graph, ggml_tensor_cpy(context, kcur, destination))
             if (self%flash_attention) then
-                destination = ggml_tensor_view_1d(context, self%self_v, nstate, &
+                destination = ggml_tensor_view_1d(context, self%self_v, nstate * n_tokens, &
                     offset + int(2_int64 * nstate * position, c_size_t))
             else
-                vcur = ggml_tensor_transpose(context, ggml_tensor_reshape_2d(context, vcur, nstate, one))
-                destination = ggml_tensor_view_2d(context, self%self_v, one, nstate, &
+                vcur = ggml_tensor_transpose(context, ggml_tensor_reshape_2d(context, vcur, nstate, n_tokens))
+                destination = ggml_tensor_view_2d(context, self%self_v, n_tokens, nstate, &
                     int(2_int64 * nctx_pad, c_size_t), offset + int(2_int64 * position, c_size_t))
             end if
             call ggml_graph_expand(graph, ggml_tensor_cpy(context, vcur, destination))
 
-            query = ggml_tensor_permute(context, ggml_tensor_reshape_3d(context, qcur, head_dim, nhead, one), &
+            query = ggml_tensor_permute(context, ggml_tensor_reshape_3d(context, qcur, head_dim, nhead, n_tokens), &
                 0_c_int, 2_c_int, 1_c_int, 3_c_int)
             if (self%flash_attention) then
                 layer_k = ggml_tensor_view_3d(context, self%self_k, head_dim, n_kv, nhead, stride1, stride2, offset)
                 layer_v = ggml_tensor_view_3d(context, self%self_v, head_dim, n_kv, nhead, stride1, stride2, offset)
                 attended = ggml_tensor_flash_attn_ext(context, query, layer_k, layer_v, mask_f16, &
                     1.0_real32, 0.0_real32, 0.0_real32)
-                cur = ggml_tensor_reshape_2d(context, attended, nstate, one)
+                cur = ggml_tensor_reshape_2d(context, attended, nstate, n_tokens)
             else
                 layer_k = ggml_tensor_view_3d(context, self%self_k, head_dim, n_kv, nhead, stride1, stride2, offset)
                 layer_v = ggml_tensor_view_3d(context, self%self_v, n_kv, head_dim, nhead, &
@@ -336,7 +364,7 @@ contains
                 probabilities = ggml_tensor_soft_max_ext(context, scores, mask_tensor, 1.0_real32, 0.0_real32)
                 attended = ggml_tensor_mul_mat(context, value, probabilities)
                 cur = ggml_tensor_cont_2d(context, ggml_tensor_permute(context, attended, 0_c_int, 2_c_int, 1_c_int, 3_c_int), &
-                    nstate, one)
+                    nstate, n_tokens)
             end if
             call whisper_decoder_name(name, layer, 'attn.out.weight')
             cur = ggml_tensor_mul_mat(context, self%model%tensor_by_name(trim(name)), cur)
@@ -354,7 +382,7 @@ contains
             qcur = ggml_tensor_mul_mat(context, self%model%tensor_by_name(trim(name)), cur)
             call whisper_decoder_name(name, layer, 'cross_attn.query.bias')
             qcur = ggml_tensor_add(context, qcur, self%model%tensor_by_name(trim(name)))
-            query = ggml_tensor_permute(context, ggml_tensor_reshape_3d(context, qcur, head_dim, nhead, one), &
+            query = ggml_tensor_permute(context, ggml_tensor_reshape_3d(context, qcur, head_dim, nhead, n_tokens), &
                 0_c_int, 2_c_int, 1_c_int, 3_c_int)
             if (self%flash_attention) then
                 offset = int(layer, c_size_t) * int(2_int64 * nstate * self%n_audio_ctx_pad, c_size_t)
@@ -375,7 +403,7 @@ contains
             if (self%flash_attention) then
                 attended = ggml_tensor_flash_attn_ext(context, query, cross_key, cross_value, c_null_ptr, &
                     real(head_dim, real32) ** (-0.25_real32), 0.0_real32, 0.0_real32)
-                cur = ggml_tensor_reshape_2d(context, attended, nstate, one)
+                cur = ggml_tensor_reshape_2d(context, attended, nstate, n_tokens)
             else
                 scores = ggml_tensor_mul_mat(context, cross_key, query)
                 probabilities = ggml_tensor_soft_max_ext(context, scores, c_null_ptr, &
@@ -386,7 +414,7 @@ contains
                     int(layer, c_size_t) * int(2_int64 * nstate * int(self%n_audio_ctx, c_int64_t), c_size_t))
                 attended = ggml_tensor_mul_mat(context, value, probabilities)
                 cur = ggml_tensor_cont_2d(context, ggml_tensor_permute(context, attended, 0_c_int, 2_c_int, 1_c_int, 3_c_int), &
-                    nstate, one)
+                    nstate, n_tokens)
             end if
             call whisper_decoder_name(name, layer, 'cross_attn.out.weight')
             cur = ggml_tensor_mul_mat(context, self%model%tensor_by_name(trim(name)), cur)
@@ -416,18 +444,28 @@ contains
         cur = ggml_tensor_add(context, ggml_tensor_mul(context, cur, self%model%tensor_by_name('decoder.ln.weight')), &
             self%model%tensor_by_name('decoder.ln.bias'))
         cur = ggml_tensor_mul_mat(context, self%model%tensor_by_name('decoder.token_embedding.weight'), cur)
-        call ggml_tensor_set_output(cur)
-        call ggml_graph_build(graph, cur)
+        logits_tensor = cur
+        if (token_count > 1) then
+            logits_tensor = ggml_tensor_view_2d(context, cur, n_vocab, one, &
+                int(4_int64 * n_vocab, c_size_t), int(4_int64 * n_vocab * int(token_count - 1, int64), c_size_t))
+        end if
+        call ggml_tensor_set_output(logits_tensor)
+        call ggml_graph_build(graph, logits_tensor)
 
-        token_host = token
-        position_host = position
-        allocate(mask_host(int(n_kv, int32)))
-        do i = 1, int(n_kv, int32)
-            if (i - 1 <= position) then
-                mask_host(i) = 0.0_real32
-            else
-                mask_host(i) = -huge(1.0_real32)
-            end if
+        allocate(token_host(token_count), position_host(token_count))
+        do j = 1, token_count
+            token_host(j) = tokens(j)
+            position_host(j) = position + j - 1
+        end do
+        allocate(mask_host(int(n_kv, int32) * token_count))
+        do j = 0, token_count - 1
+            do i = 0, int(n_kv, int32) - 1
+                if (i <= position + j) then
+                    mask_host(j * int(n_kv, int32) + i + 1) = 0.0_real32
+                else
+                    mask_host(j * int(n_kv, int32) + i + 1) = -huge(1.0_real32)
+                end if
+            end do
         end do
         if (.not. c_associated(self%scheduler)) then
             self%scheduler = ggml_backend_sched_new(self%model%backend, int(WHISPER_GRAPH_NODES, c_size_t), &
@@ -435,39 +473,54 @@ contains
                 self%fallback_backend)
         end if
         if (.not. c_associated(self%scheduler)) then
+            deallocate(token_host, position_host)
             deallocate(mask_host)
-            call ggml_context_free(context)
             call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper decoder scheduler allocation failed')
             return
         end if
         ok = ggml_backend_sched_alloc_graph(self%scheduler, graph)
         if (.not. ok) then
+            deallocate(token_host, position_host)
             deallocate(mask_host)
             call ggml_backend_sched_reset(self%scheduler)
-            call ggml_context_free(context)
             call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper decoder compute arena allocation failed')
             return
         end if
-        call ggml_backend_set_tensor(token_tensor, c_loc(token_host), 0_c_size_t, &
-            int(storage_size(token_host) / 8, c_size_t))
-        call ggml_backend_set_tensor(position_tensor, c_loc(position_host), 0_c_size_t, &
-            int(storage_size(position_host) / 8, c_size_t))
+        call ggml_backend_set_tensor(token_tensor, c_loc(token_host(1)), 0_c_size_t, &
+            int(size(token_host), c_size_t) * int(storage_size(token_host(1)) / 8, c_size_t))
+        call ggml_backend_set_tensor(position_tensor, c_loc(position_host(1)), 0_c_size_t, &
+            int(size(position_host), c_size_t) * int(storage_size(position_host(1)) / 8, c_size_t))
         bytes = int(size(mask_host), c_size_t) * int(storage_size(mask_host(1)) / 8, c_size_t)
         call ggml_backend_set_tensor(mask_tensor, c_loc(mask_host(1)), 0_c_size_t, bytes)
         code = ggml_backend_sched_graph_compute(self%scheduler, graph)
-        call ggml_backend_sched_synchronize(self%scheduler)
         if (code == GGML_STATUS_SUCCESS) then
-            allocate(logits(self%model%file%hparams%n_vocab))
+            if (.not. allocated(logits)) then
+                allocate(logits(int(n_vocab, int32)))
+            else if (size(logits) /= int(n_vocab, int32)) then
+                deallocate(logits)
+                allocate(logits(int(n_vocab, int32)))
+            end if
             bytes = int(size(logits), c_size_t) * int(storage_size(logits(1)) / 8, c_size_t)
-            call ggml_backend_get_tensor(cur, c_loc(logits(1)), 0_c_size_t, bytes)
+            call ggml_backend_get_tensor(logits_tensor, c_loc(logits(1)), 0_c_size_t, bytes)
         end if
         call ggml_backend_sched_reset(self%scheduler)
-        call ggml_context_free(context)
+        deallocate(token_host, position_host)
         deallocate(mask_host)
         if (code /= GGML_STATUS_SUCCESS) then
             if (allocated(logits)) deallocate(logits)
             call stat%set(FORTAI_UNSUPPORTED, 'Whisper decoder graph execution failed')
         end if
+    end subroutine whisper_decoder_decode_tokens
+
+    subroutine whisper_decoder_decode(self, token, position, logits, stat)
+        class(whisper_decoder_t), intent(inout) :: self
+        integer(int32), intent(in) :: token, position
+        real(real32), allocatable, target, intent(inout) :: logits(:)
+        type(status_t), intent(out) :: stat
+        integer(int32), target :: token_batch(1)
+
+        token_batch(1) = token
+        call whisper_decoder_decode_tokens(self, token_batch, position, logits, stat)
     end subroutine whisper_decoder_decode
 
     subroutine whisper_decoder_name(name, layer, suffix)
@@ -489,6 +542,7 @@ contains
         class(whisper_decoder_t), intent(inout) :: self
 
         call ggml_backend_sched_free(self%scheduler)
+        call ggml_context_free(self%decode_context)
         call ggml_backend_free_buffer(self%state_buffer)
         call ggml_context_free(self%state_context)
         call ggml_backend_free(self%fallback_backend)

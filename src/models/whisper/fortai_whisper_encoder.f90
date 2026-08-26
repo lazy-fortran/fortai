@@ -7,14 +7,17 @@ module fortai_whisper_encoder
     use, intrinsic :: iso_c_binding, only: c_associated, c_bool, c_int, c_int64_t, c_loc, c_ptr, c_size_t, c_null_ptr
     use, intrinsic :: iso_fortran_env, only: int32, int64, real32
     use fortai_ggml, only: GGML_STATUS_SUCCESS, GGML_TYPE_F16, GGML_TYPE_F32, &
+        ggml_backend_alloc_context, ggml_backend_buffer_clear, ggml_backend_free_buffer, &
         ggml_backend_sched_alloc_graph, ggml_backend_sched_buffer_size, ggml_backend_sched_graph_compute, &
-        ggml_backend_sched_new, ggml_backend_sched_free, ggml_backend_sched_synchronize, ggml_backend_for_cpu, &
+        ggml_backend_sched_new, ggml_backend_sched_free, ggml_backend_for_cpu, &
         ggml_backend_free, ggml_backend_set_tensor, &
         ggml_backend_get_tensor, ggml_context_free, ggml_context_init, ggml_graph_build, ggml_graph_new, &
-        ggml_graph_overhead, ggml_init_params, ggml_tensor_add, ggml_tensor_cast, ggml_tensor_cont_2d, &
+        ggml_graph_expand, ggml_graph_overhead, ggml_init_params, ggml_tensor_add, ggml_tensor_cast, ggml_tensor_cont_2d, &
         ggml_tensor_conv_1d_ph, ggml_tensor_flash_attn_ext, ggml_tensor_gelu, ggml_tensor_mul, ggml_tensor_mul_mat, &
-        ggml_tensor_new_2d, ggml_tensor_new_3d, ggml_tensor_norm, ggml_tensor_permute, ggml_tensor_reshape_2d, &
-        ggml_tensor_reshape_3d, ggml_tensor_set_input, ggml_tensor_set_output, ggml_tensor_soft_max_ext
+        ggml_tensor_cpy, ggml_tensor_new_1d, ggml_tensor_new_2d, ggml_tensor_new_3d, ggml_tensor_norm, &
+        ggml_tensor_overhead, ggml_tensor_permute, ggml_tensor_reshape_2d, &
+        ggml_tensor_reshape_3d, ggml_tensor_set_input, ggml_tensor_set_output, ggml_tensor_soft_max_ext, &
+        ggml_tensor_view_1d, ggml_tensor_view_3d
     use fortai_status, only: FORTAI_INVALID, FORTAI_OUT_OF_MEMORY, FORTAI_UNSUPPORTED, status_t
     use fortai_whisper_audio, only: whisper_mel_t
     use fortai_whisper_model, only: whisper_native_model_t
@@ -30,12 +33,17 @@ module fortai_whisper_encoder
     type, public :: whisper_encoder_t
         type(whisper_native_model_t), pointer :: model => null()
         type(c_ptr) :: context = c_null_ptr
+        type(c_ptr) :: pad_context = c_null_ptr
+        type(c_ptr) :: pad_buffer = c_null_ptr
         type(c_ptr) :: graph = c_null_ptr
         type(c_ptr) :: scheduler = c_null_ptr
         type(c_ptr) :: fallback_backend = c_null_ptr
         type(c_ptr) :: mel_input = c_null_ptr
         type(c_ptr) :: output = c_null_ptr
+        type(c_ptr) :: pad_k = c_null_ptr
+        type(c_ptr) :: pad_v = c_null_ptr
         integer(int32) :: n_ctx = 0_int32
+        integer(int32) :: n_ctx_pad = 0_int32
         integer(int32) :: n_state = 0_int32
         integer(int32) :: n_mels = 0_int32
         integer(int32) :: n_heads = 0_int32
@@ -64,7 +72,7 @@ contains
         type(c_ptr) :: inp_l, inp_ff
         type(c_ptr) :: weight, bias
         character(len=128) :: name
-        integer(c_int64_t) :: shape3(3)
+        integer(c_int64_t) :: shape3(3), nctx_pad
         integer(c_int64_t) :: nctx, nstate, nhead, head_dim
         integer(c_int) :: code
         logical :: allocated_ok
@@ -77,6 +85,7 @@ contains
         end if
         self%model => model
         self%n_ctx = model%file%hparams%n_audio_ctx
+        self%n_ctx_pad = ((self%n_ctx + 255_int32) / 256_int32) * 256_int32
         self%n_state = model%file%hparams%n_audio_state
         self%n_mels = model%file%hparams%n_mels
         self%n_heads = model%file%hparams%n_audio_head
@@ -85,6 +94,7 @@ contains
         self%flash_attention = use_flash
 
         nctx = int(self%n_ctx, c_int64_t)
+        nctx_pad = int(self%n_ctx_pad, c_int64_t)
         nstate = int(self%n_state, c_int64_t)
         nhead = int(self%n_heads, c_int64_t)
         head_dim = nstate / nhead
@@ -100,8 +110,31 @@ contains
             return
         end if
 
+        ! CUDA flash attention is materially faster with the same contiguous
+        ! F16, 256-frame-padded K/V staging used by whisper.cpp.  Keep this
+        ! one-layer cache persistent; each encoder graph overwrites its live
+        ! prefix and the zeroed tail supplies the padded frames.
+        if (self%flash_attention .and. model%use_gpu) then
+            self%pad_context = ggml_context_init(ggml_init_params(4_c_size_t * ggml_tensor_overhead(), WHISPER_C_TRUE))
+            if (.not. c_associated(self%pad_context)) then
+                call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper encoder flash cache metadata allocation failed')
+                call self%close()
+                return
+            end if
+            self%pad_k = ggml_tensor_new_1d(self%pad_context, GGML_TYPE_F16, nstate * nctx_pad)
+            self%pad_v = ggml_tensor_new_1d(self%pad_context, GGML_TYPE_F16, nstate * nctx_pad)
+            self%pad_buffer = ggml_backend_alloc_context(self%pad_context, model%backend)
+            if (.not. c_associated(self%pad_buffer)) then
+                call stat%set(FORTAI_OUT_OF_MEMORY, 'Whisper encoder flash cache allocation failed')
+                call self%close()
+                return
+            end if
+            call ggml_backend_buffer_clear(self%pad_buffer, 0)
+        end if
+
         self%mel_input = ggml_tensor_new_2d(self%context, GGML_TYPE_F32, 2_int64 * nctx, int(self%n_mels, c_int64_t))
         call ggml_tensor_set_input(self%mel_input)
+        self%graph = ggml_graph_new(self%context, int(WHISPER_GRAPH_NODES, c_size_t), WHISPER_C_FALSE)
         cur = ggml_tensor_conv_1d_ph(self%context, model%tensor_by_name('encoder.conv1.weight'), self%mel_input, 1_c_int, 1_c_int)
         cur = ggml_tensor_add(self%context, cur, model%tensor_by_name('encoder.conv1.bias'))
         cur = ggml_tensor_gelu(self%context, cur)
@@ -139,12 +172,27 @@ contains
             query = ggml_tensor_permute(self%context, ggml_tensor_reshape_3d(self%context, qcur, shape3(1), shape3(2), shape3(3)), &
                 0_c_int, 2_c_int, 1_c_int, 3_c_int)
             if (self%flash_attention) then
-                key = ggml_tensor_permute(self%context, ggml_tensor_cast(self%context, &
-                    ggml_tensor_reshape_3d(self%context, kcur, shape3(1), shape3(2), shape3(3)), GGML_TYPE_F16), &
-                    0_c_int, 2_c_int, 1_c_int, 3_c_int)
-                value = ggml_tensor_permute(self%context, ggml_tensor_cast(self%context, &
-                    ggml_tensor_reshape_3d(self%context, vcur, shape3(1), shape3(2), shape3(3)), GGML_TYPE_F16), &
-                    0_c_int, 2_c_int, 1_c_int, 3_c_int)
+                if (self%flash_attention .and. model%use_gpu) then
+                    ! Explicit cpy nodes perform F32 -> F16 conversion into
+                    ! contiguous storage before the attention node.  They are
+                    ! expanded first so graph execution preserves the write /
+                    ! read ordering for every encoder layer.
+                    call ggml_graph_expand(self%graph, ggml_tensor_cpy(self%context, kcur, &
+                        ggml_tensor_view_1d(self%context, self%pad_k, nstate * nctx, 0_c_size_t)))
+                    call ggml_graph_expand(self%graph, ggml_tensor_cpy(self%context, vcur, &
+                        ggml_tensor_view_1d(self%context, self%pad_v, nstate * nctx, 0_c_size_t)))
+                    key = ggml_tensor_view_3d(self%context, self%pad_k, head_dim, nctx_pad, nhead, &
+                        int(2_int64 * nstate, c_size_t), int(2_int64 * head_dim, c_size_t), 0_c_size_t)
+                    value = ggml_tensor_view_3d(self%context, self%pad_v, head_dim, nctx_pad, nhead, &
+                        int(2_int64 * nstate, c_size_t), int(2_int64 * head_dim, c_size_t), 0_c_size_t)
+                else
+                    key = ggml_tensor_permute(self%context, ggml_tensor_cast(self%context, &
+                        ggml_tensor_reshape_3d(self%context, kcur, shape3(1), shape3(2), shape3(3)), GGML_TYPE_F16), &
+                        0_c_int, 2_c_int, 1_c_int, 3_c_int)
+                    value = ggml_tensor_permute(self%context, ggml_tensor_cast(self%context, &
+                        ggml_tensor_reshape_3d(self%context, vcur, shape3(1), shape3(2), shape3(3)), GGML_TYPE_F16), &
+                        0_c_int, 2_c_int, 1_c_int, 3_c_int)
+                end if
                 attended = ggml_tensor_flash_attn_ext(self%context, query, key, value, c_null_ptr, &
                     1.0_real32 / sqrt(real(head_dim, real32)), 0.0_real32, 0.0_real32)
                 cur = ggml_tensor_reshape_2d(self%context, attended, nstate, nctx)
@@ -192,7 +240,6 @@ contains
             model%tensor_by_name('encoder.ln_post.bias'))
         self%output = cur
         call ggml_tensor_set_output(self%output)
-        self%graph = ggml_graph_new(self%context, int(WHISPER_GRAPH_NODES, c_size_t), WHISPER_C_FALSE)
         call ggml_graph_build(self%graph, self%output)
         self%fallback_backend = ggml_backend_for_cpu()
         if (.not. c_associated(self%fallback_backend)) then
@@ -225,11 +272,12 @@ contains
         write(name, '("encoder.blocks.",i0,".",a)') layer, trim(suffix)
     end subroutine whisper_encoder_name
 
-    subroutine whisper_encoder_encode(self, mel, output, stat)
+    subroutine whisper_encoder_encode(self, mel, output, stat, copy_output)
         class(whisper_encoder_t), intent(inout) :: self
         type(whisper_mel_t), intent(in) :: mel
         real(real32), allocatable, target, intent(out) :: output(:,:)
         type(status_t), intent(out) :: stat
+        logical, intent(in), optional :: copy_output
         real(real32), allocatable, target :: packed(:)
         integer(int32) :: i, j, n_time
         integer(c_int) :: code
@@ -262,7 +310,12 @@ contains
             call stat%set(FORTAI_UNSUPPORTED, 'Whisper encoder graph execution failed')
             return
         end if
-        call ggml_backend_sched_synchronize(self%scheduler)
+        if (present(copy_output)) then
+            if (.not. copy_output) then
+                deallocate(packed)
+                return
+            end if
+        end if
         allocate(output(self%n_state, self%n_ctx))
         nbytes = int(size(output), c_size_t) * int(storage_size(output(1, 1)) / 8, c_size_t)
         call ggml_backend_get_tensor(self%output, c_loc(output(1, 1)), 0_c_size_t, nbytes)
@@ -274,13 +327,20 @@ contains
 
         call ggml_backend_sched_free(self%scheduler)
         call ggml_backend_free(self%fallback_backend)
+        call ggml_backend_free_buffer(self%pad_buffer)
+        call ggml_context_free(self%pad_context)
         call ggml_context_free(self%context)
+        self%pad_k = c_null_ptr
+        self%pad_v = c_null_ptr
+        self%pad_buffer = c_null_ptr
+        self%pad_context = c_null_ptr
         self%graph = c_null_ptr
         self%mel_input = c_null_ptr
         self%output = c_null_ptr
         self%fallback_backend = c_null_ptr
         nullify(self%model)
         self%n_ctx = 0_int32
+        self%n_ctx_pad = 0_int32
         self%n_state = 0_int32
         self%n_mels = 0_int32
         self%n_heads = 0_int32

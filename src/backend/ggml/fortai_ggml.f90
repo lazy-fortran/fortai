@@ -56,6 +56,7 @@ module fortai_ggml
 
     public :: ggml_init_params
     public :: ggml_context_init
+    public :: ggml_context_reset
     public :: ggml_context_free
     public :: ggml_backend_device
     public :: ggml_backend_for_device
@@ -109,13 +110,13 @@ module fortai_ggml
     public :: ggml_backend_buffer_size
     public :: ggml_backend_set_tensor
     public :: ggml_backend_get_tensor
-    public :: ggml_backend_tensor_copy
     public :: ggml_backend_buffer_clear
     public :: ggml_backend_synchronize
     public :: ggml_backend_free
     public :: ggml_backend_memory
     public :: ggml_backend_sched_new
     public :: ggml_backend_sched_free
+    public :: ggml_backend_sched_set_tensor_backend
     public :: ggml_backend_sched_alloc_graph
     public :: ggml_backend_sched_graph_compute
     public :: ggml_backend_sched_synchronize
@@ -137,6 +138,11 @@ module fortai_ggml
             type(ggml_init_params_t), value :: params
             type(c_ptr) :: context
         end function c_ggml_init
+
+        subroutine c_ggml_reset(context) bind(C, name='ggml_reset')
+            import c_ptr
+            type(c_ptr), value :: context
+        end subroutine c_ggml_reset
 
         subroutine c_ggml_free(context) bind(C, name='ggml_free')
             import c_ptr
@@ -490,6 +496,12 @@ module fortai_ggml
             type(c_ptr), value :: sched
         end subroutine c_ggml_backend_sched_free
 
+        subroutine c_ggml_backend_sched_set_tensor_backend(sched, node, backend) &
+                bind(C, name='ggml_backend_sched_set_tensor_backend')
+            import c_ptr
+            type(c_ptr), value :: sched, node, backend
+        end subroutine c_ggml_backend_sched_set_tensor_backend
+
         function c_ggml_backend_sched_alloc_graph(sched, graph) bind(C, name='ggml_backend_sched_alloc_graph') result(ok)
             import c_bool, c_ptr
             type(c_ptr), value :: sched, graph
@@ -536,11 +548,6 @@ module fortai_ggml
             type(c_ptr), value :: tensor, data
             integer(c_size_t), value :: offset, size
         end subroutine c_ggml_backend_tensor_get
-
-        subroutine c_ggml_backend_tensor_copy(source, destination) bind(C, name='ggml_backend_tensor_copy')
-            import c_ptr
-            type(c_ptr), value :: source, destination
-        end subroutine c_ggml_backend_tensor_copy
 
         subroutine c_ggml_backend_synchronize(backend) bind(C, name='ggml_backend_synchronize')
             import c_ptr
@@ -660,6 +667,12 @@ contains
 
         context = c_ggml_init(params)
     end function ggml_context_init
+
+    subroutine ggml_context_reset(context)
+        type(c_ptr), intent(in) :: context
+
+        if (c_associated(context)) call c_ggml_reset(context)
+    end subroutine ggml_context_reset
 
     subroutine ggml_context_free(context)
         type(c_ptr), intent(inout) :: context
@@ -1193,13 +1206,13 @@ contains
         call c_ggml_backend_tensor_get(tensor, data, actual_offset, actual_bytes)
     end subroutine ggml_backend_get_tensor
 
-    subroutine ggml_backend_tensor_copy(source, destination)
-        type(c_ptr), intent(in) :: source, destination
+    subroutine ggml_backend_sched_set_tensor_backend(sched, node, backend)
+        type(c_ptr), intent(in) :: sched, node, backend
 
-        if (c_associated(source) .and. c_associated(destination)) then
-            call c_ggml_backend_tensor_copy(source, destination)
+        if (c_associated(sched) .and. c_associated(node) .and. c_associated(backend)) then
+            call c_ggml_backend_sched_set_tensor_backend(sched, node, backend)
         end if
-    end subroutine ggml_backend_tensor_copy
+    end subroutine ggml_backend_sched_set_tensor_backend
 
     subroutine ggml_backend_synchronize(backend)
         type(c_ptr), intent(in) :: backend
