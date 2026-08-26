@@ -10,7 +10,7 @@ program fortai_server
         type(string_t) :: host
         type(string_t) :: alias
         integer :: port = 8080
-        integer :: context_size = 4096
+        integer :: context_size = 0
         integer :: threads = 0
         integer :: gpu_layers = 999
         integer :: main_gpu = 0
@@ -36,19 +36,32 @@ program fortai_server
     end interface
 
     type(server_config_t) :: config
-    logical :: okay, show_help, show_version
+    logical :: okay, show_help, show_version, show_devices, show_cache_list, show_completion
     integer(c_int) :: status, vocab, layers
     integer :: require_cuda
     character(kind=c_char), allocatable :: cmodel(:), chost(:)
     character(len=32) :: number
 
-    call parse_arguments(config, okay, show_help, show_version)
+    call parse_arguments(config, okay, show_help, show_version, show_devices, show_cache_list, show_completion)
     if (show_help) then
         call print_usage()
         stop
     end if
     if (show_version) then
         write(output_unit, '(a)') 'fortai-server 0.1 (FortAI-owned native Fortran runtime)'
+        stop
+    end if
+    if (show_devices) then
+        call print_devices()
+        stop
+    end if
+    if (show_cache_list) then
+        write(output_unit, '(a)') 'FortAI model cache: no native cache entries'
+        stop
+    end if
+    if (show_completion) then
+        write(output_unit, '(a)') '# FortAI accepts the llama.cpp server option surface.'
+        write(output_unit, '(a)') '# Generate completion from the llama.cpp completion source if desired.'
         stop
     end if
     if (.not. okay) then
@@ -153,18 +166,19 @@ contains
         parse_gpu_layers = ios == 0 .and. value >= 0 .and. value <= 8192
     end function parse_gpu_layers
 
-    subroutine parse_arguments(config, okay, show_help, show_version)
+    subroutine parse_arguments(config, okay, show_help, show_version, show_devices, show_cache_list, show_completion)
         type(server_config_t), intent(inout) :: config
-        logical, intent(out) :: okay, show_help, show_version
+        logical, intent(out) :: okay, show_help, show_version, show_devices, show_cache_list, show_completion
         integer :: i, count, value
         type(string_t) :: argument, option
         character(len=:), allocatable :: option_text, value_text
-        character(len=16) :: device
+        character(len=4096) :: device
         character(len=4096) :: model_env
         character(len=256) :: alias_env
         integer :: device_length, model_length, alias_length
 
         okay = .true.; show_help = .false.; show_version = .false.
+        show_devices = .false.; show_cache_list = .false.; show_completion = .false.
         call config%host%set('127.0.0.1')
         ! Normalize llama-server's canonical LLAMA_ARG_* environment names
         ! before reading model defaults or applying command-line overrides.
@@ -192,10 +206,16 @@ contains
             option = argument
             option_text = option%as_character()
             select case (option_text)
-            case ('--help', '-h')
+            case ('--help', '-h', '--usage')
                 show_help = .true.; return
             case ('--version')
                 show_version = .true.; return
+            case ('--list-devices')
+                show_devices = .true.; return
+            case ('-cl', '--cache-list')
+                show_cache_list = .true.; return
+            case ('--completion-bash')
+                show_completion = .true.; return
             case ('-m', '--model')
                 i = i + 1; if (i > count) then; okay = .false.; return; end if
                 call argument_text_at(i, value_text)
@@ -234,14 +254,66 @@ contains
                     '--cache-type-v', '-ctv', '--cache-type-k-draft', '--spec-draft-type-k', '-ctkd', &
                     '--cache-type-v-draft', '--spec-draft-type-v', '-ctvd', '--batch-size', '-b', '--ubatch-size', '-ub', &
                     '--fit', '-fit', '--cache-ram', '-cram', '--cache-reuse', &
-                    '--n-cpu-moe', '--ncmoe', '--reasoning-budget', '--mmproj', '-mm', '--rpc', '--threads-http', &
+                    '--n-cpu-moe', '--ncmoe', '-ncmoe', '--reasoning-budget', '--mmproj', '-mm', '--rpc', '--threads-http', &
+                    '--load-mode', '-lm', '--mmproj-device', '-mmdev', &
                     '--temp', '--temperature', '--top-k', '--top-p', '--min-p', '--repeat-penalty', &
-                    '--presence-penalty', '--frequency-penalty', '--repeat-last-n', '--seed', '--reasoning-format', &
-                    '--reasoning', '--reasoning-effort', '--threads-batch', '-tb', '--n-predict', '--predict', '-n', &
-                    '--max-tokens', '--device', '--chat-template-kwargs')
+                    '--presence-penalty', '--frequency-penalty', '--repeat-last-n', '--seed', '-s', '--reasoning-format', &
+                    '--reasoning', '-rea', '--reasoning-effort', '--threads-batch', '-tb', '--n-predict', '--predict', '-n', &
+                    '--max-tokens', '--device', '-dev', '--chat-template-kwargs')
                 i = i + 1; if (i > count) then; okay = .false.; return; end if
                 call argument_text_at(i, value_text)
                 call set_option_environment(option_text, value_text)
+            case ('-C', '--cpu-mask', '-Cr', '--cpu-range', '--cpu-strict', '--prio', '--poll', &
+                    '-Cb', '--cpu-mask-batch', '-Crb', '--cpu-range-batch', '--cpu-strict-batch', '--prio-batch', &
+                    '--poll-batch', '--keep', '--rope-scaling', '--rope-scale', '--rope-freq-base', '--rope-freq-scale', &
+                    '--yarn-orig-ctx', '--yarn-ext-factor', '--yarn-attn-factor', '--yarn-beta-slow', '--yarn-beta-fast', &
+                    '-dt', '--defrag-thold', '--override-tensor', '-ot', '--fit-target', '-fitt', '--fit-ctx', '-fitc', &
+                    '--numa', &
+                    '--override-kv', '--lora', '--lora-scaled', '--control-vector', '--control-vector-scaled', &
+                    '-mu', '--model-url', '-dr', '--docker-repo', '-hf', '-hfr', '--hf-repo', '-hff', '--hf-file', &
+                    '-hfv', '-hfrv', '--hf-repo-v', '-hffv', '--hf-file-v', '-hft', '--hf-token', '--log-file', &
+                    '--log-colors', '-lv', '--verbosity', '--log-verbosity', '--samplers', '--sampler-seq', '--sampling-seq', &
+                    '--top-nsigma', '--top-n-sigma', '--xtc-probability', '--xtc-threshold', '--typical', '--typical-p', &
+                    '--dry-multiplier', '--dry-base', '--dry-allowed-length', '--dry-penalty-last-n', &
+                    '--dry-sequence-breaker', '--adaptive-target', '--adaptive-decay', '--dynatemp-range', '--dynatemp-exp', &
+                    '--mirostat', '--mirostat-lr', '--mirostat-ent', '--logit-bias', '-l', '--grammar', '--grammar-file', &
+                    '--json-schema', '-j', '--json-schema-file', '-jf', '-lcs', '--lookup-cache-static', '-lcd', &
+                    '--lookup-cache-dynamic', '-ctxcp', '--ctx-checkpoints', '--swa-checkpoints', '-cms', &
+                    '--checkpoint-min-step', '--reverse-prompt', '-r', '--pooling', '-mmu', '--mmproj-url', &
+                    '--image-min-tokens', '--image-max-tokens', '--mtmd-batch-max-tokens', '--tags', '--embd-normalize', &
+                    '--timeout', '-to', '--sse-ping-interval', '--slot-save-path', '--media-path', '--models-dir', &
+                    '--models-preset', '--models-max', '--reasoning-budget-message', '--chat-template', &
+                    '--chat-template-file', '--slot-prompt-similarity', '-sps', '--sleep-idle-seconds', '--api-key', &
+                    '--api-key-file', '--ssl-key-file', '--ssl-cert-file', '--path', '--api-prefix', '--cors-origins', &
+                    '--cors-methods', '--cors-headers', '--tools-runtime', '--mcp-servers-config', '--mcp-servers-json', &
+                    '--ui-config', &
+                    '--webui-config', '--ui-config-file', '--webui-config-file', '--tools', '--log-prompts-dir', &
+                    '--spec-draft-hf', '-hfd', '-hfrd', '--hf-repo-draft', '--spec-draft-threads', '-td', &
+                    '--threads-draft', '--spec-draft-threads-batch', '-tbd', '--threads-batch-draft', &
+                    '--spec-draft-cpu-mask', '-Cd', '--cpu-mask-draft', '--spec-draft-cpu-range', '-Crd', &
+                    '--cpu-range-draft', '--spec-draft-cpu-strict', '--cpu-strict-draft', '--spec-draft-prio', &
+                    '--prio-draft', '--spec-draft-poll', '--poll-draft', '--spec-draft-cpu-mask-batch', '-Cbd', &
+                    '--cpu-mask-batch-draft', '--spec-draft-cpu-strict-batch', '--cpu-strict-batch-draft', &
+                    '--spec-draft-prio-batch', '--prio-batch-draft', '--spec-draft-poll-batch', '--poll-batch-draft', &
+                    '--spec-draft-override-tensor', '-otd', '--override-tensor-draft', '--spec-draft-n-cpu-moe', &
+                    '--spec-draft-ncmoe', '-ncmoed', '--n-cpu-moe-draft', &
+                    '--spec-draft-n-min', '--spec-draft-p-split', '--draft-p-split', '--spec-draft-p-min', '--draft-p-min', &
+                    '--spec-draft-device', '-devd', '--device-draft', '--spec-draft-ngl', '-ngld', '--gpu-layers-draft', &
+                    '--n-gpu-layers-draft', '--spec-ngram-mod-n-min', '--spec-ngram-mod-n-max', '--spec-ngram-mod-n-match', &
+                    '--spec-ngram-simple-size-n', '--spec-ngram-simple-size-m', '--spec-ngram-simple-min-hits', &
+                    '--spec-ngram-map-k-size-n', '--spec-ngram-map-k-size-m', '--spec-ngram-map-k-min-hits', &
+                    '--spec-ngram-map-k4v-size-n', '--spec-ngram-map-k4v-size-m', '--spec-ngram-map-k4v-min-hits', &
+                    '--draft', '--draft-n', '--draft-max', '--draft-min', '--draft-n-min', '--spec-ngram-size-n', &
+                    '--spec-ngram-size-m', '--spec-ngram-min-hits', '-mv', '--model-vocoder')
+                i = i + 1; if (i > count) then; okay = .false.; return; end if
+                call argument_text_at(i, value_text)
+                call set_option_environment(option_text, value_text)
+            case ('--control-vector-layer-range')
+                i = i + 1; if (i > count) then; okay = .false.; return; end if
+                call argument_text_at(i, value_text)
+                i = i + 1; if (i > count) then; okay = .false.; return; end if
+                call argument_text_at(i, option_text)
+                call set_option_environment('--control-vector-layer-range', trim(value_text) // ',' // trim(option_text))
             case ('--alias', '-a', '--served-model-name')
                 i = i + 1; if (i > count) then; okay = .false.; return; end if
                 call argument_text_at(i, value_text)
@@ -250,6 +322,25 @@ contains
                     '--context-shift', '--no-context-shift', '--metrics', '--log-timestamps', '--mmproj-offload', &
                     '--no-mmproj-offload', '--webui', '--no-ui', '--no-webui', '--op-offload', '--no-op-offload', &
                     '--reasoning-preserve', '--no-reasoning-preserve', '--ui')
+                call set_flag_environment(option_text)
+            case ('--swa-full', '--perf', '--no-perf', '-e', '--escape', '--no-escape', '--repack', '-nr', '--no-repack', &
+                    '--no-host', '--direct-io', '-dio', '--no-direct-io', '-ndio', '--check-tensors', '--cpu-moe', '-cmoe', &
+                    '--log-disable', '-v', '--verbose', '--log-verbose', '--offline', '--log-prefix', '--no-log-prefix', &
+                    '--no-log-timestamps', '-kvo', '-nkvo', '--spec-draft-backend-sampling', &
+                    '--no-spec-draft-backend-sampling', '--tts-use-guide-tokens', &
+                    '--spec-draft-cpu-moe', '-cmoed', '--cpu-moe-draft', &
+                    '--embd-gemma-default', '--fim-qwen-1', '--fim-qwen-1.5b-default', '--fim-qwen-3b-default', '--fim-qwen-7b-default', &
+                    '--fim-qwen-7b-spec', '--fim-qwen-14b-spec', '--fim-qwen-30b-default', '--gpt-oss-20b-default', &
+                    '--gpt-oss-120b-default', '--vision-gemma-4b-default', '--vision-gemma-12b-default', '--spec-default', &
+                    '-kvu', '--kv-unified', '-no-kvu', '--no-kv-unified', '--cache-idle-slots', '--no-cache-idle-slots', &
+                    '--warmup', '--no-warmup', '-sp', '--special', '--spm-infill', '-cb', '--cont-batching', '-nocb', &
+                    '--no-cont-batching', '--mmproj-auto', '--no-mmproj', '--no-mmproj-auto', '--ui-mcp-proxy', &
+                    '--webui-mcp-proxy', '--no-ui-mcp-proxy', '--no-webui-mcp-proxy', '-ag', '--agent', '-no-ag', &
+                    '--no-agent', '--embedding', '--embeddings', '--rerank', '--reranking', '--reuse-port', '--props', &
+                    '--slots', '--no-slots', '--cache-prompt', '--no-cache-prompt', '--prefill-assistant', &
+                    '--no-prefill-assistant', '--skip-chat-parsing', '--no-skip-chat-parsing', '--ignore-eos', &
+                    '--cors-credentials', '--no-cors-credentials', &
+                    '-bs', '--backend-sampling', '--lora-init-without-apply', '--models-autoload', '--no-models-autoload')
                 call set_flag_environment(option_text)
             case default
                 if (len(option_text) > 0) then
@@ -265,14 +356,66 @@ contains
             i = i + 1
         end do
         device = ''; call get_environment_variable('FORTAI_SERVER_DEVICE', device, length=device_length)
-        if (device_length > 0) then
+        if (device_length > 0 .and. device_length <= len(device)) then
             select case (trim(device(:device_length)))
             case ('cpu', 'host', 'none')
                 config%gpu_layers = 0
             end select
+            call apply_device_selection(device(:device_length), config)
         end if
         if (config%model%length() == 0) okay = .false.
     end subroutine parse_arguments
+
+    subroutine apply_device_selection(value, config)
+        character(len=*), intent(in) :: value
+        type(server_config_t), intent(inout) :: config
+        character(len=:), allocatable :: first, second
+        integer :: comma, first_device, second_device
+
+        if (len_trim(value) == 0) return
+        if (trim(value) == 'cpu' .or. trim(value) == 'host' .or. trim(value) == 'none') return
+        comma = index(value, ',')
+        if (comma > 1 .and. comma < len_trim(value)) then
+            first = trim(value(:comma - 1))
+            second = trim(value(comma + 1:))
+        else
+            first = trim(value)
+            allocate(character(len=0) :: second)
+        end if
+        if (parse_device_index(first, first_device)) config%main_gpu = first_device
+        if (comma > 0 .and. parse_device_index(second, second_device)) then
+            call set_environment('FORTAI_CUDA_Q4_SECOND_DEVICE', int_text(second_device))
+        else if (comma == 0) then
+            ! A single explicit device is the llama.cpp equivalent of a
+            ! one-board placement; do not silently split Q4 weights onto the
+            ! next visible CUDA device.
+            call set_environment('FORTAI_CUDA_Q4_SPLIT', '0')
+        end if
+    end subroutine apply_device_selection
+
+    logical function parse_device_index(value, index_value)
+        character(len=*), intent(in) :: value
+        integer, intent(out) :: index_value
+        character(len=:), allocatable :: digits
+        integer :: i, first_digit, last_digit, ios
+
+        parse_device_index = .false.
+        index_value = 0
+        first_digit = 0
+        last_digit = 0
+        do i = 1, len_trim(value)
+            if (value(i:i) >= '0' .and. value(i:i) <= '9') then
+                if (first_digit == 0) first_digit = i
+                last_digit = i
+            else if (first_digit > 0) then
+                exit
+            end if
+        end do
+        if (first_digit == 0 .or. last_digit < first_digit) return
+        digits = value(first_digit:last_digit)
+        read(digits, *, iostat=ios) index_value
+        parse_device_index = ios == 0 .and. index_value >= 0 .and. index_value <= 255
+    end function parse_device_index
 
     subroutine configure_environment(config)
         type(server_config_t), intent(in) :: config
@@ -288,7 +431,7 @@ contains
 
     subroutine set_option_environment(option, value)
         character(len=*), intent(in) :: option, value
-        character(len=32) :: name
+        character(len=64) :: name
         select case (option)
         case ('--parallel', '-np'); name = 'FORTAI_PARALLEL'
         case ('--tensor-split', '-ts'); name = 'FORTAI_TENSOR_SPLIT'
@@ -305,13 +448,15 @@ contains
         case ('--batch-size', '-b'); name = 'FORTAI_BATCH'
         case ('--cache-ram', '-cram'); name = 'FORTAI_CACHE_RAM'
         case ('--cache-reuse'); name = 'FORTAI_CACHE_REUSE'
-        case ('--n-cpu-moe', '--ncmoe'); name = 'FORTAI_N_CPU_MOE'
+        case ('--n-cpu-moe', '--ncmoe', '-ncmoe'); name = 'FORTAI_N_CPU_MOE'
         case ('--reasoning-budget'); name = 'FORTAI_REASONING_BUDGET'
         case ('--reasoning-effort'); name = 'FORTAI_REASONING_EFFORT'
-        case ('--reasoning'); name = 'FORTAI_REASONING'
+        case ('--reasoning', '-rea'); name = 'FORTAI_REASONING'
         case ('--mmproj', '-mm'); name = 'FORTAI_MMPROJ'
         case ('--rpc'); name = 'FORTAI_RPC'
         case ('--threads-http'); name = 'FORTAI_THREADS_HTTP'
+        case ('--load-mode', '-lm'); name = 'FORTAI_LOAD_MODE'
+        case ('--mmproj-device', '-mmdev'); name = 'MTMD_BACKEND_DEVICE'
         case ('--fit', '-fit'); name = 'FORTAI_FIT'
         case ('--chat-template-kwargs'); name = 'FORTAI_CHAT_TEMPLATE_KWARGS'
         case ('--temp', '--temperature'); name = 'FORTAI_TEMPERATURE'
@@ -322,11 +467,151 @@ contains
         case ('--presence-penalty'); name = 'FORTAI_PRESENCE_PENALTY'
         case ('--frequency-penalty'); name = 'FORTAI_FREQUENCY_PENALTY'
         case ('--repeat-last-n'); name = 'FORTAI_REPEAT_LAST_N'
-        case ('--seed'); name = 'FORTAI_SEED'
+        case ('--seed', '-s'); name = 'FORTAI_SEED'
         case ('--reasoning-format'); name = 'FORTAI_REASONING_FORMAT'
         case ('--threads-batch', '-tb'); name = 'FORTAI_THREADS_BATCH'
         case ('--n-predict', '--predict', '-n', '--max-tokens'); name = 'FORTAI_MAX_TOKENS'
-        case ('--device'); name = 'FORTAI_SERVER_DEVICE'
+        case ('--device', '-dev'); name = 'FORTAI_SERVER_DEVICE'
+        case ('-C', '--cpu-mask'); name = 'FORTAI_CPU_MASK'
+        case ('-Cr', '--cpu-range'); name = 'FORTAI_CPU_RANGE'
+        case ('--cpu-strict'); name = 'FORTAI_CPU_STRICT'
+        case ('--prio'); name = 'FORTAI_PRIO'
+        case ('--poll'); name = 'FORTAI_POLL'
+        case ('-Cb', '--cpu-mask-batch'); name = 'FORTAI_CPU_MASK_BATCH'
+        case ('-Crb', '--cpu-range-batch'); name = 'FORTAI_CPU_RANGE_BATCH'
+        case ('--cpu-strict-batch'); name = 'FORTAI_CPU_STRICT_BATCH'
+        case ('--prio-batch'); name = 'FORTAI_PRIO_BATCH'
+        case ('--poll-batch'); name = 'FORTAI_POLL_BATCH'
+        case ('--keep'); name = 'FORTAI_KEEP'
+        case ('--rope-scaling'); name = 'FORTAI_ROPE_SCALING_TYPE'
+        case ('--rope-scale'); name = 'FORTAI_ROPE_SCALE'
+        case ('--rope-freq-base'); name = 'FORTAI_ROPE_FREQ_BASE'
+        case ('--rope-freq-scale'); name = 'FORTAI_ROPE_FREQ_SCALE'
+        case ('--yarn-orig-ctx'); name = 'FORTAI_YARN_ORIG_CTX'
+        case ('--yarn-ext-factor'); name = 'FORTAI_YARN_EXT_FACTOR'
+        case ('--yarn-attn-factor'); name = 'FORTAI_YARN_ATTN_FACTOR'
+        case ('--yarn-beta-slow'); name = 'FORTAI_YARN_BETA_SLOW'
+        case ('--yarn-beta-fast'); name = 'FORTAI_YARN_BETA_FAST'
+        case ('-dt', '--defrag-thold'); name = 'FORTAI_DEFRAG_THOLD'
+        case ('--numa'); name = 'FORTAI_NUMA'
+        case ('--override-tensor', '-ot'); name = 'FORTAI_OVERRIDE_TENSOR'
+        case ('--fit-target', '-fitt'); name = 'FORTAI_FIT_TARGET'
+        case ('--fit-ctx', '-fitc'); name = 'FORTAI_FIT_CTX'
+        case ('--override-kv'); name = 'FORTAI_OVERRIDE_KV'
+        case ('--lora'); name = 'FORTAI_LORA'
+        case ('--lora-scaled'); name = 'FORTAI_LORA_SCALED'
+        case ('--control-vector'); name = 'FORTAI_CONTROL_VECTOR'
+        case ('--control-vector-scaled'); name = 'FORTAI_CONTROL_VECTOR_SCALED'
+        case ('--control-vector-layer-range'); name = 'FORTAI_CONTROL_VECTOR_LAYER_RANGE'
+        case ('-mu', '--model-url'); name = 'FORTAI_MODEL_URL'
+        case ('-dr', '--docker-repo'); name = 'FORTAI_DOCKER_REPO'
+        case ('-hf', '-hfr', '--hf-repo'); name = 'FORTAI_HF_REPO'
+        case ('-hff', '--hf-file'); name = 'FORTAI_HF_FILE'
+        case ('-hfv', '-hfrv', '--hf-repo-v'); name = 'FORTAI_HF_REPO_V'
+        case ('-hffv', '--hf-file-v'); name = 'FORTAI_HF_FILE_V'
+        case ('-hft', '--hf-token'); name = 'HF_TOKEN'
+        case ('--log-file'); name = 'FORTAI_LOG_FILE'
+        case ('--log-colors'); name = 'FORTAI_LOG_COLORS'
+        case ('-lv', '--verbosity', '--log-verbosity'); name = 'FORTAI_LOG_VERBOSITY'
+        case ('--samplers'); name = 'FORTAI_SAMPLERS'
+        case ('--sampler-seq', '--sampling-seq'); name = 'FORTAI_SAMPLING_SEQ'
+        case ('--top-nsigma', '--top-n-sigma'); name = 'FORTAI_TOP_N_SIGMA'
+        case ('--xtc-probability'); name = 'FORTAI_XTC_PROBABILITY'
+        case ('--xtc-threshold'); name = 'FORTAI_XTC_THRESHOLD'
+        case ('--typical', '--typical-p'); name = 'FORTAI_TYPICAL_P'
+        case ('--dry-multiplier'); name = 'FORTAI_DRY_MULTIPLIER'
+        case ('--dry-base'); name = 'FORTAI_DRY_BASE'
+        case ('--dry-allowed-length'); name = 'FORTAI_DRY_ALLOWED_LENGTH'
+        case ('--dry-penalty-last-n'); name = 'FORTAI_DRY_PENALTY_LAST_N'
+        case ('--dry-sequence-breaker'); name = 'FORTAI_DRY_SEQUENCE_BREAKER'
+        case ('--adaptive-target'); name = 'FORTAI_ADAPTIVE_TARGET'
+        case ('--adaptive-decay'); name = 'FORTAI_ADAPTIVE_DECAY'
+        case ('--dynatemp-range'); name = 'FORTAI_DYNATEMP_RANGE'
+        case ('--dynatemp-exp'); name = 'FORTAI_DYNATEMP_EXP'
+        case ('--mirostat'); name = 'FORTAI_MIROSTAT'
+        case ('--mirostat-lr'); name = 'FORTAI_MIROSTAT_LR'
+        case ('--mirostat-ent'); name = 'FORTAI_MIROSTAT_ENT'
+        case ('--logit-bias', '-l'); name = 'FORTAI_LOGIT_BIAS'
+        case ('--grammar'); name = 'FORTAI_GRAMMAR'
+        case ('--grammar-file'); name = 'FORTAI_GRAMMAR_FILE'
+        case ('--json-schema', '-j'); name = 'FORTAI_JSON_SCHEMA'
+        case ('--json-schema-file', '-jf'); name = 'FORTAI_JSON_SCHEMA_FILE'
+        case ('-lcs', '--lookup-cache-static'); name = 'FORTAI_LOOKUP_CACHE_STATIC'
+        case ('-lcd', '--lookup-cache-dynamic'); name = 'FORTAI_LOOKUP_CACHE_DYNAMIC'
+        case ('-ctxcp', '--ctx-checkpoints', '--swa-checkpoints'); name = 'FORTAI_CTX_CHECKPOINTS'
+        case ('-cms', '--checkpoint-min-step'); name = 'FORTAI_CHECKPOINT_MIN_SPACING_NT'
+        case ('--reverse-prompt', '-r'); name = 'FORTAI_REVERSE_PROMPT'
+        case ('--pooling'); name = 'FORTAI_POOLING'
+        case ('-mmu', '--mmproj-url'); name = 'FORTAI_MMPROJ_URL'
+        case ('--image-min-tokens'); name = 'FORTAI_IMAGE_MIN_TOKENS'
+        case ('--image-max-tokens'); name = 'FORTAI_IMAGE_MAX_TOKENS'
+        case ('--mtmd-batch-max-tokens'); name = 'FORTAI_MTMD_BATCH_MAX_TOKENS'
+        case ('--tags'); name = 'FORTAI_TAGS'
+        case ('--embd-normalize'); name = 'FORTAI_EMBD_NORMALIZE'
+        case ('--timeout', '-to'); name = 'FORTAI_TIMEOUT'
+        case ('--sse-ping-interval'); name = 'FORTAI_SSE_PING_INTERVAL'
+        case ('--slot-save-path'); name = 'FORTAI_SLOT_SAVE_PATH'
+        case ('--media-path'); name = 'FORTAI_MEDIA_PATH'
+        case ('--models-dir'); name = 'FORTAI_MODELS_DIR'
+        case ('--models-preset'); name = 'FORTAI_MODELS_PRESET'
+        case ('--models-max'); name = 'FORTAI_MODELS_MAX'
+        case ('--reasoning-budget-message'); name = 'FORTAI_REASONING_BUDGET_MESSAGE'
+        case ('--chat-template'); name = 'FORTAI_CHAT_TEMPLATE'
+        case ('--chat-template-file'); name = 'FORTAI_CHAT_TEMPLATE_FILE'
+        case ('--slot-prompt-similarity', '-sps'); name = 'FORTAI_SLOT_PROMPT_SIMILARITY'
+        case ('--sleep-idle-seconds'); name = 'FORTAI_SLEEP_IDLE_SECONDS'
+        case ('--api-key'); name = 'LLAMA_API_KEY'
+        case ('--api-key-file'); name = 'FORTAI_API_KEY_FILE'
+        case ('--ssl-key-file'); name = 'FORTAI_SSL_KEY_FILE'
+        case ('--ssl-cert-file'); name = 'FORTAI_SSL_CERT_FILE'
+        case ('--path'); name = 'FORTAI_STATIC_PATH'
+        case ('--api-prefix'); name = 'FORTAI_API_PREFIX'
+        case ('--cors-origins'); name = 'FORTAI_CORS_ORIGINS'
+        case ('--cors-methods'); name = 'FORTAI_CORS_METHODS'
+        case ('--cors-headers'); name = 'FORTAI_CORS_HEADERS'
+        case ('--tools-runtime'); name = 'FORTAI_TOOLS_RUNTIME'
+        case ('--mcp-servers-config'); name = 'FORTAI_MCP_SERVERS_CONFIG'
+        case ('--mcp-servers-json'); name = 'FORTAI_MCP_SERVERS_JSON'
+        case ('--ui-config', '--webui-config'); name = 'FORTAI_UI_CONFIG'
+        case ('--ui-config-file', '--webui-config-file'); name = 'FORTAI_UI_CONFIG_FILE'
+        case ('--tools'); name = 'FORTAI_TOOLS'
+        case ('--log-prompts-dir'); name = 'FORTAI_LOG_PROMPTS_DIR'
+        case ('--spec-draft-hf', '-hfd', '-hfrd', '--hf-repo-draft'); name = 'FORTAI_SPEC_DRAFT_HF'
+        case ('--spec-draft-threads', '-td', '--threads-draft'); name = 'FORTAI_SPEC_DRAFT_THREADS'
+        case ('--spec-draft-threads-batch', '-tbd', '--threads-batch-draft'); name = 'FORTAI_SPEC_DRAFT_THREADS_BATCH'
+        case ('--spec-draft-cpu-mask', '-Cd', '--cpu-mask-draft'); name = 'FORTAI_SPEC_DRAFT_CPU_MASK'
+        case ('--spec-draft-cpu-range', '-Crd', '--cpu-range-draft'); name = 'FORTAI_SPEC_DRAFT_CPU_RANGE'
+        case ('--spec-draft-cpu-strict', '--cpu-strict-draft'); name = 'FORTAI_SPEC_DRAFT_CPU_STRICT'
+        case ('--spec-draft-prio', '--prio-draft'); name = 'FORTAI_SPEC_DRAFT_PRIO'
+        case ('--spec-draft-poll', '--poll-draft'); name = 'FORTAI_SPEC_DRAFT_POLL'
+        case ('--spec-draft-cpu-mask-batch', '-Cbd', '--cpu-mask-batch-draft'); name = 'FORTAI_SPEC_DRAFT_CPU_MASK_BATCH'
+        case ('--spec-draft-cpu-strict-batch', '--cpu-strict-batch-draft'); name = 'FORTAI_SPEC_DRAFT_CPU_STRICT_BATCH'
+        case ('--spec-draft-prio-batch', '--prio-batch-draft'); name = 'FORTAI_SPEC_DRAFT_PRIO_BATCH'
+        case ('--spec-draft-poll-batch', '--poll-batch-draft'); name = 'FORTAI_SPEC_DRAFT_POLL_BATCH'
+        case ('--spec-draft-override-tensor', '-otd', '--override-tensor-draft'); name = 'FORTAI_SPEC_DRAFT_OVERRIDE_TENSOR'
+        case ('--spec-draft-n-cpu-moe', '--spec-draft-ncmoe', '-ncmoed', '--n-cpu-moe-draft'); name = 'FORTAI_SPEC_DRAFT_N_CPU_MOE'
+        case ('--spec-draft-n-min'); name = 'FORTAI_SPEC_DRAFT_N_MIN'
+        case ('--spec-draft-p-split', '--draft-p-split'); name = 'FORTAI_SPEC_DRAFT_P_SPLIT'
+        case ('--spec-draft-p-min', '--draft-p-min'); name = 'FORTAI_SPEC_DRAFT_P_MIN'
+        case ('--spec-draft-device', '-devd', '--device-draft'); name = 'FORTAI_SPEC_DRAFT_DEVICE'
+        case ('--spec-draft-ngl', '-ngld', '--gpu-layers-draft', '--n-gpu-layers-draft'); name = 'FORTAI_SPEC_DRAFT_N_GPU_LAYERS'
+        case ('--spec-ngram-mod-n-min'); name = 'FORTAI_SPEC_NGRAM_MOD_N_MIN'
+        case ('--spec-ngram-mod-n-max'); name = 'FORTAI_SPEC_NGRAM_MOD_N_MAX'
+        case ('--spec-ngram-mod-n-match'); name = 'FORTAI_SPEC_NGRAM_MOD_N_MATCH'
+        case ('--spec-ngram-simple-size-n'); name = 'FORTAI_SPEC_NGRAM_SIMPLE_SIZE_N'
+        case ('--spec-ngram-simple-size-m'); name = 'FORTAI_SPEC_NGRAM_SIMPLE_SIZE_M'
+        case ('--spec-ngram-simple-min-hits'); name = 'FORTAI_SPEC_NGRAM_SIMPLE_MIN_HITS'
+        case ('--spec-ngram-map-k-size-n'); name = 'FORTAI_SPEC_NGRAM_MAP_K_SIZE_N'
+        case ('--spec-ngram-map-k-size-m'); name = 'FORTAI_SPEC_NGRAM_MAP_K_SIZE_M'
+        case ('--spec-ngram-map-k-min-hits'); name = 'FORTAI_SPEC_NGRAM_MAP_K_MIN_HITS'
+        case ('--spec-ngram-map-k4v-size-n'); name = 'FORTAI_SPEC_NGRAM_MAP_K4V_SIZE_N'
+        case ('--spec-ngram-map-k4v-size-m'); name = 'FORTAI_SPEC_NGRAM_MAP_K4V_SIZE_M'
+        case ('--spec-ngram-map-k4v-min-hits'); name = 'FORTAI_SPEC_NGRAM_MAP_K4V_MIN_HITS'
+        case ('--draft', '--draft-n', '--draft-max', '--draft-min', '--draft-n-min'); name = 'FORTAI_DRAFT_N'
+        case ('--spec-ngram-size-n'); name = 'FORTAI_SPEC_NGRAM_SIZE_N'
+        case ('--spec-ngram-size-m'); name = 'FORTAI_SPEC_NGRAM_SIZE_M'
+        case ('--spec-ngram-min-hits'); name = 'FORTAI_SPEC_NGRAM_MIN_HITS'
+        case ('-mv', '--model-vocoder'); name = 'FORTAI_MODEL_VOCODER'
         case default; name = 'FORTAI_OPTION'
         end select
         call set_environment(trim(name), value)
@@ -334,7 +619,7 @@ contains
 
     subroutine set_flag_environment(option)
         character(len=*), intent(in) :: option
-        character(len=32) :: name, value
+        character(len=64) :: name, value
         select case (option)
         case ('--jinja'); name = 'FORTAI_JINJA'; value = '1'
         case ('--no-jinja'); name = 'FORTAI_JINJA'; value = '0'
@@ -355,6 +640,70 @@ contains
         case ('--no-op-offload'); name = 'FORTAI_NO_OP_OFFLOAD'; value = '1'
         case ('--reasoning-preserve'); name = 'FORTAI_REASONING_PRESERVE'; value = '1'
         case ('--no-reasoning-preserve'); name = 'FORTAI_REASONING_PRESERVE'; value = '0'
+        case ('--swa-full'); name = 'FORTAI_SWA_FULL'; value = '1'
+        case ('--perf'); name = 'FORTAI_PERF'; value = '1'
+        case ('--no-perf'); name = 'FORTAI_PERF'; value = '0'
+        case ('-e', '--escape'); name = 'FORTAI_ESCAPE'; value = '1'
+        case ('--no-escape'); name = 'FORTAI_ESCAPE'; value = '0'
+        case ('--repack', '-nr'); name = 'FORTAI_REPACK'; value = '1'
+        case ('--no-repack'); name = 'FORTAI_REPACK'; value = '0'
+        case ('--no-host'); name = 'FORTAI_NO_HOST'; value = '1'
+        case ('--direct-io', '-dio'); name = 'FORTAI_DIRECT_IO'; value = '1'
+        case ('--no-direct-io', '-ndio'); name = 'FORTAI_DIRECT_IO'; value = '0'
+        case ('--check-tensors'); name = 'FORTAI_CHECK_TENSORS'; value = '1'
+        case ('--cpu-moe', '-cmoe'); name = 'FORTAI_CPU_MOE'; value = '1'
+        case ('--log-disable'); name = 'FORTAI_LOG_DISABLE'; value = '1'
+        case ('-v', '--verbose', '--log-verbose'); name = 'FORTAI_LOG_VERBOSITY'; value = '5'
+        case ('--offline'); name = 'FORTAI_OFFLINE'; value = '1'
+        case ('--log-prefix'); name = 'FORTAI_LOG_PREFIX'; value = '1'
+        case ('--no-log-prefix'); name = 'FORTAI_LOG_PREFIX'; value = '0'
+        case ('--no-log-timestamps'); name = 'FORTAI_LOG_TIMESTAMPS'; value = '0'
+        case ('-kvo'); name = 'FORTAI_NO_KV_OFFLOAD'; value = '0'
+        case ('-nkvo'); name = 'FORTAI_NO_KV_OFFLOAD'; value = '1'
+        case ('-kvu', '--kv-unified'); name = 'FORTAI_KV_UNIFIED'; value = '1'
+        case ('-no-kvu', '--no-kv-unified'); name = 'FORTAI_KV_UNIFIED'; value = '0'
+        case ('--cache-idle-slots'); name = 'FORTAI_CACHE_IDLE_SLOTS'; value = '1'
+        case ('--no-cache-idle-slots'); name = 'FORTAI_CACHE_IDLE_SLOTS'; value = '0'
+        case ('--warmup'); name = 'FORTAI_WARMUP'; value = '1'
+        case ('--no-warmup'); name = 'FORTAI_WARMUP'; value = '0'
+        case ('-sp', '--special'); name = 'FORTAI_SPECIAL'; value = '1'
+        case ('--spm-infill'); name = 'FORTAI_SPM_INFILL'; value = '1'
+        case ('-cb', '--cont-batching'); name = 'FORTAI_CONT_BATCHING'; value = '1'
+        case ('-nocb', '--no-cont-batching'); name = 'FORTAI_CONT_BATCHING'; value = '0'
+        case ('--mmproj-auto'); name = 'FORTAI_MMPROJ_AUTO'; value = '1'
+        case ('--no-mmproj', '--no-mmproj-auto'); name = 'FORTAI_MMPROJ_AUTO'; value = '0'
+        case ('--ui-mcp-proxy', '--webui-mcp-proxy'); name = 'FORTAI_UI_MCP_PROXY'; value = '1'
+        case ('--no-ui-mcp-proxy', '--no-webui-mcp-proxy'); name = 'FORTAI_UI_MCP_PROXY'; value = '0'
+        case ('-ag', '--agent'); name = 'FORTAI_AGENT'; value = '1'
+        case ('-no-ag', '--no-agent'); name = 'FORTAI_AGENT'; value = '0'
+        case ('--embedding', '--embeddings'); name = 'FORTAI_EMBEDDINGS'; value = '1'
+        case ('--rerank', '--reranking'); name = 'FORTAI_RERANKING'; value = '1'
+        case ('--reuse-port'); name = 'FORTAI_REUSE_PORT'; value = '1'
+        case ('--cors-credentials'); name = 'FORTAI_CORS_CREDENTIALS'; value = '1'
+        case ('--no-cors-credentials'); name = 'FORTAI_CORS_CREDENTIALS'; value = '0'
+        case ('--props'); name = 'FORTAI_ENDPOINT_PROPS'; value = '1'
+        case ('--slots'); name = 'FORTAI_ENDPOINT_SLOTS'; value = '1'
+        case ('--no-slots'); name = 'FORTAI_ENDPOINT_SLOTS'; value = '0'
+        case ('--cache-prompt'); name = 'FORTAI_CACHE_PROMPT'; value = '1'
+        case ('--no-cache-prompt'); name = 'FORTAI_CACHE_PROMPT'; value = '0'
+        case ('--prefill-assistant'); name = 'FORTAI_PREFILL_ASSISTANT'; value = '1'
+        case ('--no-prefill-assistant'); name = 'FORTAI_PREFILL_ASSISTANT'; value = '0'
+        case ('--skip-chat-parsing'); name = 'FORTAI_SKIP_CHAT_PARSING'; value = '1'
+        case ('--no-skip-chat-parsing'); name = 'FORTAI_SKIP_CHAT_PARSING'; value = '0'
+        case ('--ignore-eos'); name = 'FORTAI_IGNORE_EOS'; value = '1'
+        case ('--spec-draft-backend-sampling'); name = 'FORTAI_SPEC_DRAFT_BACKEND_SAMPLING'; value = '1'
+        case ('--no-spec-draft-backend-sampling'); name = 'FORTAI_SPEC_DRAFT_BACKEND_SAMPLING'; value = '0'
+        case ('--spec-draft-cpu-moe', '-cmoed', '--cpu-moe-draft'); name = 'FORTAI_SPEC_DRAFT_CPU_MOE'; value = '1'
+        case ('--tts-use-guide-tokens'); name = 'FORTAI_TTS_USE_GUIDE_TOKENS'; value = '1'
+        case ('--embd-gemma-default'); name = 'FORTAI_EMBD_GEMMA_DEFAULT'; value = '1'
+        case ('--fim-qwen-1', '--fim-qwen-1.5b-default', '--fim-qwen-3b-default', '--fim-qwen-7b-default', '--fim-qwen-7b-spec', &
+                '--fim-qwen-14b-spec', '--fim-qwen-30b-default', '--gpt-oss-20b-default', '--gpt-oss-120b-default', &
+                '--vision-gemma-4b-default', '--vision-gemma-12b-default', '--spec-default')
+            name = 'FORTAI_PRESET'; value = option
+        case ('-bs', '--backend-sampling'); name = 'FORTAI_BACKEND_SAMPLING'; value = '1'
+        case ('--lora-init-without-apply'); name = 'FORTAI_LORA_INIT_WITHOUT_APPLY'; value = '1'
+        case ('--models-autoload'); name = 'FORTAI_MODELS_AUTOLOAD'; value = '1'
+        case ('--no-models-autoload'); name = 'FORTAI_MODELS_AUTOLOAD'; value = '0'
         case default; return
         end select
         call set_environment(trim(name), trim(value))
@@ -392,6 +741,8 @@ contains
         call load_text_option('FORTAI_REASONING_BUDGET', 'LLAMACPP_REASONING_BUDGET')
         call load_text_option('FORTAI_MMPROJ', 'LLAMACPP_MMPROJ')
         call load_text_option('FORTAI_MMPROJ_OFFLOAD', 'LLAMACPP_MMPROJ_OFFLOAD')
+        call load_text_option('FORTAI_LOAD_MODE', 'LLAMACPP_LOAD_MODE')
+        call load_text_option('MTMD_BACKEND_DEVICE', 'LLAMACPP_MMPROJ_DEVICE')
         call load_text_option('FORTAI_RPC', 'LLAMACPP_RPC')
         call load_text_option('FORTAI_THREADS_HTTP', 'LLAMACPP_THREADS_HTTP')
         call load_text_option('FORTAI_CHAT_TEMPLATE_KWARGS', 'LLAMACPP_CHAT_TEMPLATE_KWARGS')
@@ -415,6 +766,98 @@ contains
         call load_text_option('FORTAI_NO_KV_OFFLOAD', 'LLAMACPP_NO_KV_OFFLOAD')
         call load_text_option('FORTAI_NO_WEBUI', 'LLAMACPP_NO_WEBUI')
         call load_text_option('FORTAI_NO_OP_OFFLOAD', 'LLAMACPP_NO_OP_OFFLOAD')
+        call load_text_option('FORTAI_CPU_MASK', 'LLAMACPP_CPU_MASK')
+        call load_text_option('FORTAI_CPU_RANGE', 'LLAMACPP_CPU_RANGE')
+        call load_text_option('FORTAI_CPU_STRICT', 'LLAMACPP_CPU_STRICT')
+        call load_text_option('FORTAI_PRIO', 'LLAMACPP_PRIO')
+        call load_text_option('FORTAI_POLL', 'LLAMACPP_POLL')
+        call load_text_option('FORTAI_CPU_MASK_BATCH', 'LLAMACPP_CPU_MASK_BATCH')
+        call load_text_option('FORTAI_CPU_RANGE_BATCH', 'LLAMACPP_CPU_RANGE_BATCH')
+        call load_text_option('FORTAI_CPU_STRICT_BATCH', 'LLAMACPP_CPU_STRICT_BATCH')
+        call load_text_option('FORTAI_PRIO_BATCH', 'LLAMACPP_PRIO_BATCH')
+        call load_text_option('FORTAI_POLL_BATCH', 'LLAMACPP_POLL_BATCH')
+        call load_text_option('FORTAI_KEEP', 'LLAMACPP_KEEP')
+        call load_text_option('FORTAI_SWA_FULL', 'LLAMACPP_SWA_FULL')
+        call load_text_option('FORTAI_PERF', 'LLAMACPP_PERF')
+        call load_text_option('FORTAI_ESCAPE', 'LLAMACPP_ESCAPE')
+        call load_text_option('FORTAI_ROPE_SCALING_TYPE', 'LLAMACPP_ROPE_SCALING_TYPE')
+        call load_text_option('FORTAI_ROPE_SCALE', 'LLAMACPP_ROPE_SCALE')
+        call load_text_option('FORTAI_ROPE_FREQ_BASE', 'LLAMACPP_ROPE_FREQ_BASE')
+        call load_text_option('FORTAI_ROPE_FREQ_SCALE', 'LLAMACPP_ROPE_FREQ_SCALE')
+        call load_text_option('FORTAI_YARN_ORIG_CTX', 'LLAMACPP_YARN_ORIG_CTX')
+        call load_text_option('FORTAI_YARN_EXT_FACTOR', 'LLAMACPP_YARN_EXT_FACTOR')
+        call load_text_option('FORTAI_YARN_ATTN_FACTOR', 'LLAMACPP_YARN_ATTN_FACTOR')
+        call load_text_option('FORTAI_YARN_BETA_SLOW', 'LLAMACPP_YARN_BETA_SLOW')
+        call load_text_option('FORTAI_YARN_BETA_FAST', 'LLAMACPP_YARN_BETA_FAST')
+        call load_text_option('FORTAI_DEFRAG_THOLD', 'LLAMACPP_DEFRAG_THOLD')
+        call load_text_option('FORTAI_DIRECT_IO', 'LLAMACPP_DIO')
+        call load_text_option('FORTAI_NUMA', 'LLAMACPP_NUMA')
+        call load_text_option('FORTAI_OVERRIDE_TENSOR', 'LLAMACPP_OVERRIDE_TENSOR')
+        call load_text_option('FORTAI_CPU_MOE', 'LLAMACPP_CPU_MOE')
+        call load_text_option('FORTAI_NO_HOST', 'LLAMACPP_NO_HOST')
+        call load_text_option('FORTAI_REPACK', 'LLAMACPP_REPACK')
+        call load_text_option('FORTAI_FIT_TARGET', 'LLAMACPP_FIT_TARGET')
+        call load_text_option('FORTAI_FIT_CTX', 'LLAMACPP_FIT_CTX')
+        call load_text_option('FORTAI_OVERRIDE_KV', 'LLAMACPP_OVERRIDE_KV')
+        call load_text_option('FORTAI_MODEL_URL', 'LLAMACPP_MODEL_URL')
+        call load_text_option('FORTAI_DOCKER_REPO', 'LLAMACPP_DOCKER_REPO')
+        call load_text_option('FORTAI_HF_REPO', 'LLAMACPP_HF_REPO')
+        call load_text_option('FORTAI_HF_FILE', 'LLAMACPP_HF_FILE')
+        call load_text_option('FORTAI_HF_REPO_V', 'LLAMACPP_HF_REPO_V')
+        call load_text_option('FORTAI_HF_FILE_V', 'LLAMACPP_HF_FILE_V')
+        call load_text_option('FORTAI_LOG_FILE', 'LLAMACPP_LOG_FILE')
+        call load_text_option('FORTAI_LOG_COLORS', 'LLAMACPP_LOG_COLORS')
+        call load_text_option('FORTAI_LOG_VERBOSITY', 'LLAMACPP_LOG_VERBOSITY')
+        call load_text_option('FORTAI_SAMPLERS', 'LLAMACPP_SAMPLERS')
+        call load_text_option('FORTAI_SAMPLING_SEQ', 'LLAMACPP_SAMPLING_SEQ')
+        call load_text_option('FORTAI_TOP_N_SIGMA', 'LLAMACPP_TOP_N_SIGMA')
+        call load_text_option('FORTAI_XTC_PROBABILITY', 'LLAMACPP_XTC_PROBABILITY')
+        call load_text_option('FORTAI_XTC_THRESHOLD', 'LLAMACPP_XTC_THRESHOLD')
+        call load_text_option('FORTAI_TYPICAL_P', 'LLAMACPP_TYPICAL_P')
+        call load_text_option('FORTAI_DRY_MULTIPLIER', 'LLAMACPP_DRY_MULTIPLIER')
+        call load_text_option('FORTAI_DRY_BASE', 'LLAMACPP_DRY_BASE')
+        call load_text_option('FORTAI_DRY_ALLOWED_LENGTH', 'LLAMACPP_DRY_ALLOWED_LENGTH')
+        call load_text_option('FORTAI_DRY_PENALTY_LAST_N', 'LLAMACPP_DRY_PENALTY_LAST_N')
+        call load_text_option('FORTAI_DRY_SEQUENCE_BREAKER', 'LLAMACPP_DRY_SEQUENCE_BREAKER')
+        call load_text_option('FORTAI_ADAPTIVE_TARGET', 'LLAMACPP_ADAPTIVE_TARGET')
+        call load_text_option('FORTAI_ADAPTIVE_DECAY', 'LLAMACPP_ADAPTIVE_DECAY')
+        call load_text_option('FORTAI_DYNATEMP_RANGE', 'LLAMACPP_DYNATEMP_RANGE')
+        call load_text_option('FORTAI_DYNATEMP_EXP', 'LLAMACPP_DYNATEMP_EXP')
+        call load_text_option('FORTAI_MIROSTAT', 'LLAMACPP_MIROSTAT')
+        call load_text_option('FORTAI_MIROSTAT_LR', 'LLAMACPP_MIROSTAT_LR')
+        call load_text_option('FORTAI_MIROSTAT_ENT', 'LLAMACPP_MIROSTAT_ENT')
+        call load_text_option('FORTAI_LOGIT_BIAS', 'LLAMACPP_LOGIT_BIAS')
+        call load_text_option('FORTAI_GRAMMAR', 'LLAMACPP_GRAMMAR')
+        call load_text_option('FORTAI_GRAMMAR_FILE', 'LLAMACPP_GRAMMAR_FILE')
+        call load_text_option('FORTAI_JSON_SCHEMA', 'LLAMACPP_JSON_SCHEMA')
+        call load_text_option('FORTAI_JSON_SCHEMA_FILE', 'LLAMACPP_JSON_SCHEMA_FILE')
+        call load_text_option('FORTAI_POOLING', 'LLAMACPP_POOLING')
+        call load_text_option('FORTAI_TIMEOUT', 'LLAMACPP_TIMEOUT')
+        call load_text_option('FORTAI_THREADS_HTTP', 'LLAMACPP_THREADS_HTTP')
+        call load_text_option('FORTAI_SSE_PING_INTERVAL', 'LLAMACPP_SSE_PING_INTERVAL')
+        call load_text_option('FORTAI_CACHE_PROMPT', 'LLAMACPP_CACHE_PROMPT')
+        call load_text_option('FORTAI_KV_UNIFIED', 'LLAMACPP_KV_UNIFIED')
+        call load_text_option('FORTAI_CONT_BATCHING', 'LLAMACPP_CONT_BATCHING')
+        call load_text_option('FORTAI_REUSE_PORT', 'LLAMACPP_REUSE_PORT')
+        call load_text_option('FORTAI_STATIC_PATH', 'LLAMACPP_STATIC_PATH')
+        call load_text_option('FORTAI_API_PREFIX', 'LLAMACPP_API_PREFIX')
+        call load_text_option('FORTAI_CORS_ORIGINS', 'LLAMACPP_CORS_ORIGINS')
+        call load_text_option('FORTAI_CORS_METHODS', 'LLAMACPP_CORS_METHODS')
+        call load_text_option('FORTAI_CORS_HEADERS', 'LLAMACPP_CORS_HEADERS')
+        call load_text_option('FORTAI_CORS_CREDENTIALS', 'LLAMACPP_CORS_CREDENTIALS')
+        call load_text_option('FORTAI_TOOLS_RUNTIME', 'LLAMACPP_TOOLS_RUNTIME')
+        call load_text_option('FORTAI_MCP_SERVERS_CONFIG', 'LLAMACPP_MCP_SERVERS_CONFIG')
+        call load_text_option('FORTAI_MCP_SERVERS_JSON', 'LLAMACPP_MCP_SERVERS_JSON')
+        call load_text_option('FORTAI_UI_CONFIG', 'LLAMACPP_UI_CONFIG')
+        call load_text_option('FORTAI_UI_CONFIG_FILE', 'LLAMACPP_UI_CONFIG_FILE')
+        call load_text_option('FORTAI_ENDPOINT_PROPS', 'LLAMACPP_ENDPOINT_PROPS')
+        call load_text_option('FORTAI_ENDPOINT_SLOTS', 'LLAMACPP_ENDPOINT_SLOTS')
+        call load_text_option('FORTAI_EMBEDDINGS', 'LLAMACPP_EMBEDDINGS')
+        call load_text_option('FORTAI_RERANKING', 'LLAMACPP_RERANKING')
+        call load_text_option('FORTAI_CHAT_TEMPLATE', 'LLAMACPP_CHAT_TEMPLATE')
+        call load_text_option('FORTAI_CHAT_TEMPLATE_FILE', 'LLAMACPP_CHAT_TEMPLATE_FILE')
+        call load_text_option('FORTAI_SKIP_CHAT_PARSING', 'LLAMACPP_SKIP_CHAT_PARSING')
+        call load_text_option('FORTAI_PREFILL_ASSISTANT', 'LLAMACPP_PREFILL_ASSISTANT')
     end subroutine load_environment_defaults
 
     subroutine load_alias_environment(alias)
@@ -466,6 +909,8 @@ contains
         call import_environment_alias('FORTAI_REASONING_PRESERVE', 'LLAMA_ARG_REASONING_PRESERVE')
         call import_environment_alias('FORTAI_MMPROJ', 'LLAMA_ARG_MMPROJ')
         call import_environment_alias('FORTAI_MMPROJ_OFFLOAD', 'LLAMA_ARG_MMPROJ_OFFLOAD')
+        call import_environment_alias('FORTAI_LOAD_MODE', 'LLAMA_ARG_LOAD_MODE')
+        call import_environment_alias('MTMD_BACKEND_DEVICE', 'LLAMA_ARG_MMPROJ_DEVICE')
         call import_environment_alias('FORTAI_RPC', 'LLAMA_ARG_RPC')
         call import_environment_alias('FORTAI_THREADS_HTTP', 'LLAMA_ARG_THREADS_HTTP')
         call import_environment_alias('FORTAI_CHAT_TEMPLATE_KWARGS', 'LLAMA_ARG_CHAT_TEMPLATE_KWARGS')
@@ -489,12 +934,166 @@ contains
         call import_inverse_boolean_alias('FORTAI_NO_KV_OFFLOAD', 'LLAMA_ARG_KV_OFFLOAD')
         call import_inverse_boolean_alias('FORTAI_NO_OP_OFFLOAD', 'LLAMA_ARG_OP_OFFLOAD')
         call import_inverse_boolean_alias('FORTAI_NO_CONTEXT_SHIFT', 'LLAMA_ARG_CONTEXT_SHIFT')
+        call import_environment_alias('FORTAI_CPU_MASK', 'LLAMA_ARG_CPU_MASK')
+        call import_environment_alias('FORTAI_CPU_RANGE', 'LLAMA_ARG_CPU_RANGE')
+        call import_environment_alias('FORTAI_CPU_STRICT', 'LLAMA_ARG_CPU_STRICT')
+        call import_environment_alias('FORTAI_PRIO', 'LLAMA_ARG_PRIO')
+        call import_environment_alias('FORTAI_POLL', 'LLAMA_ARG_POLL')
+        call import_environment_alias('FORTAI_CPU_MASK_BATCH', 'LLAMA_ARG_CPU_MASK_BATCH')
+        call import_environment_alias('FORTAI_CPU_RANGE_BATCH', 'LLAMA_ARG_CPU_RANGE_BATCH')
+        call import_environment_alias('FORTAI_CPU_STRICT_BATCH', 'LLAMA_ARG_CPU_STRICT_BATCH')
+        call import_environment_alias('FORTAI_PRIO_BATCH', 'LLAMA_ARG_PRIO_BATCH')
+        call import_environment_alias('FORTAI_POLL_BATCH', 'LLAMA_ARG_POLL_BATCH')
+        call import_environment_alias('FORTAI_KEEP', 'LLAMA_ARG_KEEP')
+        call import_environment_alias('FORTAI_SWA_FULL', 'LLAMA_ARG_SWA_FULL')
+        call import_environment_alias('FORTAI_PERF', 'LLAMA_ARG_PERF')
+        call import_environment_alias('FORTAI_ESCAPE', 'LLAMA_ARG_ESCAPE')
+        call import_environment_alias('FORTAI_ROPE_SCALING_TYPE', 'LLAMA_ARG_ROPE_SCALING_TYPE')
+        call import_environment_alias('FORTAI_ROPE_SCALE', 'LLAMA_ARG_ROPE_SCALE')
+        call import_environment_alias('FORTAI_ROPE_FREQ_BASE', 'LLAMA_ARG_ROPE_FREQ_BASE')
+        call import_environment_alias('FORTAI_ROPE_FREQ_SCALE', 'LLAMA_ARG_ROPE_FREQ_SCALE')
+        call import_environment_alias('FORTAI_YARN_ORIG_CTX', 'LLAMA_ARG_YARN_ORIG_CTX')
+        call import_environment_alias('FORTAI_YARN_EXT_FACTOR', 'LLAMA_ARG_YARN_EXT_FACTOR')
+        call import_environment_alias('FORTAI_YARN_ATTN_FACTOR', 'LLAMA_ARG_YARN_ATTN_FACTOR')
+        call import_environment_alias('FORTAI_YARN_BETA_SLOW', 'LLAMA_ARG_YARN_BETA_SLOW')
+        call import_environment_alias('FORTAI_YARN_BETA_FAST', 'LLAMA_ARG_YARN_BETA_FAST')
+        call import_environment_alias('FORTAI_DEFRAG_THOLD', 'LLAMA_ARG_DEFRAG_THOLD')
+        call import_environment_alias('FORTAI_DIRECT_IO', 'LLAMA_ARG_DIO')
+        call import_environment_alias('FORTAI_NUMA', 'LLAMA_ARG_NUMA')
+        call import_environment_alias('FORTAI_OVERRIDE_TENSOR', 'LLAMA_ARG_OVERRIDE_TENSOR')
+        call import_environment_alias('FORTAI_CPU_MOE', 'LLAMA_ARG_CPU_MOE')
+        call import_environment_alias('FORTAI_NO_HOST', 'LLAMA_ARG_NO_HOST')
+        call import_environment_alias('FORTAI_REPACK', 'LLAMA_ARG_REPACK')
+        call import_environment_alias('FORTAI_FIT_TARGET', 'LLAMA_ARG_FIT_TARGET')
+        call import_environment_alias('FORTAI_FIT_CTX', 'LLAMA_ARG_FIT_CTX')
+        call import_environment_alias('FORTAI_OVERRIDE_KV', 'LLAMA_ARG_OVERRIDE_KV')
+        call import_environment_alias('FORTAI_MODEL_URL', 'LLAMA_ARG_MODEL_URL')
+        call import_environment_alias('FORTAI_DOCKER_REPO', 'LLAMA_ARG_DOCKER_REPO')
+        call import_environment_alias('FORTAI_HF_REPO', 'LLAMA_ARG_HF_REPO')
+        call import_environment_alias('FORTAI_HF_FILE', 'LLAMA_ARG_HF_FILE')
+        call import_environment_alias('FORTAI_HF_REPO_V', 'LLAMA_ARG_HF_REPO_V')
+        call import_environment_alias('FORTAI_HF_FILE_V', 'LLAMA_ARG_HF_FILE_V')
+        call import_environment_alias('FORTAI_LOG_FILE', 'LLAMA_ARG_LOG_FILE')
+        call import_environment_alias('FORTAI_LOG_COLORS', 'LLAMA_ARG_LOG_COLORS')
+        call import_environment_alias('FORTAI_LOG_VERBOSITY', 'LLAMA_ARG_LOG_VERBOSITY')
+        call import_environment_alias('FORTAI_SAMPLERS', 'LLAMA_ARG_SAMPLERS')
+        call import_environment_alias('FORTAI_SAMPLING_SEQ', 'LLAMA_ARG_SAMPLING_SEQ')
+        call import_environment_alias('FORTAI_TOP_N_SIGMA', 'LLAMA_ARG_TOP_N_SIGMA')
+        call import_environment_alias('FORTAI_XTC_PROBABILITY', 'LLAMA_ARG_XTC_PROBABILITY')
+        call import_environment_alias('FORTAI_XTC_THRESHOLD', 'LLAMA_ARG_XTC_THRESHOLD')
+        call import_environment_alias('FORTAI_TYPICAL_P', 'LLAMA_ARG_TYPICAL_P')
+        call import_environment_alias('FORTAI_DRY_MULTIPLIER', 'LLAMA_ARG_DRY_MULTIPLIER')
+        call import_environment_alias('FORTAI_DRY_BASE', 'LLAMA_ARG_DRY_BASE')
+        call import_environment_alias('FORTAI_DRY_ALLOWED_LENGTH', 'LLAMA_ARG_DRY_ALLOWED_LENGTH')
+        call import_environment_alias('FORTAI_DRY_PENALTY_LAST_N', 'LLAMA_ARG_DRY_PENALTY_LAST_N')
+        call import_environment_alias('FORTAI_DRY_SEQUENCE_BREAKER', 'LLAMA_ARG_DRY_SEQUENCE_BREAKER')
+        call import_environment_alias('FORTAI_ADAPTIVE_TARGET', 'LLAMA_ARG_ADAPTIVE_TARGET')
+        call import_environment_alias('FORTAI_ADAPTIVE_DECAY', 'LLAMA_ARG_ADAPTIVE_DECAY')
+        call import_environment_alias('FORTAI_DYNATEMP_RANGE', 'LLAMA_ARG_DYNATEMP_RANGE')
+        call import_environment_alias('FORTAI_DYNATEMP_EXP', 'LLAMA_ARG_DYNATEMP_EXP')
+        call import_environment_alias('FORTAI_MIROSTAT', 'LLAMA_ARG_MIROSTAT')
+        call import_environment_alias('FORTAI_MIROSTAT_LR', 'LLAMA_ARG_MIROSTAT_LR')
+        call import_environment_alias('FORTAI_MIROSTAT_ENT', 'LLAMA_ARG_MIROSTAT_ENT')
+        call import_environment_alias('FORTAI_LOGIT_BIAS', 'LLAMA_ARG_LOGIT_BIAS')
+        call import_environment_alias('FORTAI_GRAMMAR', 'LLAMA_ARG_GRAMMAR')
+        call import_environment_alias('FORTAI_GRAMMAR_FILE', 'LLAMA_ARG_GRAMMAR_FILE')
+        call import_environment_alias('FORTAI_JSON_SCHEMA', 'LLAMA_ARG_JSON_SCHEMA')
+        call import_environment_alias('FORTAI_JSON_SCHEMA_FILE', 'LLAMA_ARG_JSON_SCHEMA_FILE')
+        call import_environment_alias('FORTAI_POOLING', 'LLAMA_ARG_POOLING')
+        call import_environment_alias('FORTAI_TIMEOUT', 'LLAMA_ARG_TIMEOUT')
+        call import_environment_alias('FORTAI_SSE_PING_INTERVAL', 'LLAMA_ARG_SSE_PING_INTERVAL')
+        call import_environment_alias('FORTAI_CACHE_PROMPT', 'LLAMA_ARG_CACHE_PROMPT')
+        call import_environment_alias('FORTAI_KV_UNIFIED', 'LLAMA_ARG_KV_UNIFIED')
+        call import_environment_alias('FORTAI_CONT_BATCHING', 'LLAMA_ARG_CONT_BATCHING')
+        call import_environment_alias('FORTAI_REUSE_PORT', 'LLAMA_ARG_REUSE_PORT')
+        call import_environment_alias('FORTAI_STATIC_PATH', 'LLAMA_ARG_STATIC_PATH')
+        call import_environment_alias('FORTAI_CORS_ORIGINS', 'LLAMA_ARG_CORS_ORIGINS')
+        call import_environment_alias('FORTAI_CORS_METHODS', 'LLAMA_ARG_CORS_METHODS')
+        call import_environment_alias('FORTAI_CORS_HEADERS', 'LLAMA_ARG_CORS_HEADERS')
+        call import_environment_alias('FORTAI_CORS_CREDENTIALS', 'LLAMA_ARG_CORS_CREDENTIALS')
+        call import_environment_alias('FORTAI_API_PREFIX', 'LLAMA_ARG_API_PREFIX')
+        call import_environment_alias('FORTAI_UI_CONFIG', 'LLAMA_ARG_UI_CONFIG')
+        call import_environment_alias('FORTAI_UI_CONFIG_FILE', 'LLAMA_ARG_UI_CONFIG_FILE')
+        call import_environment_alias('FORTAI_ENDPOINT_PROPS', 'LLAMA_ARG_ENDPOINT_PROPS')
+        call import_environment_alias('FORTAI_ENDPOINT_SLOTS', 'LLAMA_ARG_ENDPOINT_SLOTS')
+        call import_environment_alias('FORTAI_EMBEDDINGS', 'LLAMA_ARG_EMBEDDINGS')
+        call import_environment_alias('FORTAI_RERANKING', 'LLAMA_ARG_RERANKING')
+        call import_environment_alias('FORTAI_CHAT_TEMPLATE', 'LLAMA_ARG_CHAT_TEMPLATE')
+        call import_environment_alias('FORTAI_CHAT_TEMPLATE_FILE', 'LLAMA_ARG_CHAT_TEMPLATE_FILE')
+        call import_environment_alias('FORTAI_SKIP_CHAT_PARSING', 'LLAMA_ARG_SKIP_CHAT_PARSING')
+        call import_environment_alias('FORTAI_PREFILL_ASSISTANT', 'LLAMA_ARG_PREFILL_ASSISTANT')
+        call import_environment_alias('FORTAI_OFFLINE', 'LLAMA_ARG_OFFLINE')
+        call import_environment_alias('FORTAI_LOG_PREFIX', 'LLAMA_ARG_LOG_PREFIX')
+        call import_environment_alias('FORTAI_BACKEND_SAMPLING', 'LLAMA_ARG_BACKEND_SAMPLING')
+        call import_environment_alias('FORTAI_CTX_CHECKPOINTS', 'LLAMA_ARG_CTX_CHECKPOINTS')
+        call import_environment_alias('FORTAI_CHECKPOINT_MIN_SPACING_NT', 'LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT')
+        call import_environment_alias('FORTAI_CACHE_IDLE_SLOTS', 'LLAMA_ARG_CACHE_IDLE_SLOTS')
+        call import_environment_alias('FORTAI_MMPROJ_URL', 'LLAMA_ARG_MMPROJ_URL')
+        call import_environment_alias('FORTAI_MMPROJ_AUTO', 'LLAMA_ARG_MMPROJ_AUTO')
+        call import_environment_alias('FORTAI_IMAGE_MIN_TOKENS', 'LLAMA_ARG_IMAGE_MIN_TOKENS')
+        call import_environment_alias('FORTAI_IMAGE_MAX_TOKENS', 'LLAMA_ARG_IMAGE_MAX_TOKENS')
+        call import_environment_alias('FORTAI_MTMD_BATCH_MAX_TOKENS', 'LLAMA_ARG_MTMD_BATCH_MAX_TOKENS')
+        call import_environment_alias('FORTAI_TAGS', 'LLAMA_ARG_TAGS')
+        call import_environment_alias('FORTAI_UI_MCP_PROXY', 'LLAMA_ARG_UI_MCP_PROXY')
+        call import_environment_alias('FORTAI_TOOLS', 'LLAMA_ARG_TOOLS')
+        call import_environment_alias('FORTAI_TOOLS_RUNTIME', 'LLAMA_ARG_TOOLS_RUNTIME')
+        call import_environment_alias('FORTAI_MCP_SERVERS_CONFIG', 'LLAMA_ARG_MCP_SERVERS_CONFIG')
+        call import_environment_alias('FORTAI_MCP_SERVERS_JSON', 'LLAMA_ARG_MCP_SERVERS_JSON')
+        call import_environment_alias('FORTAI_AGENT', 'LLAMA_ARG_AGENT')
+        call import_environment_alias('FORTAI_API_KEY_FILE', 'LLAMA_ARG_API_KEY_FILE')
+        call import_environment_alias('FORTAI_SSL_KEY_FILE', 'LLAMA_ARG_SSL_KEY_FILE')
+        call import_environment_alias('FORTAI_SSL_CERT_FILE', 'LLAMA_ARG_SSL_CERT_FILE')
+        call import_environment_alias('FORTAI_MODELS_DIR', 'LLAMA_ARG_MODELS_DIR')
+        call import_environment_alias('FORTAI_MODELS_PRESET', 'LLAMA_ARG_MODELS_PRESET')
+        call import_environment_alias('FORTAI_MODELS_MAX', 'LLAMA_ARG_MODELS_MAX')
+        call import_environment_alias('FORTAI_MODELS_AUTOLOAD', 'LLAMA_ARG_MODELS_AUTOLOAD')
+        call import_environment_alias('FORTAI_JINJA', 'LLAMA_ARG_JINJA')
+        call import_environment_alias('FORTAI_REASONING_BUDGET_MESSAGE', 'LLAMA_ARG_THINK_BUDGET_MESSAGE')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_N_GPU_LAYERS', 'LLAMA_ARG_N_GPU_LAYERS_DRAFT')
+        call import_environment_alias('FORTAI_DRAFT_MAX', 'LLAMA_ARG_DRAFT_MAX')
+        call import_environment_alias('FORTAI_DRAFT_MIN', 'LLAMA_ARG_DRAFT_MIN')
+        call import_environment_alias('FORTAI_NO_MMAP', 'LLAMA_ARG_NO_MMAP')
+        call import_environment_alias('FORTAI_LOG_PROMPTS_DIR', 'LLAMA_ARG_LOG_PROMPTS_DIR')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_HF', 'LLAMA_ARG_SPEC_DRAFT_HF_REPO')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_THREADS', 'LLAMA_ARG_SPEC_DRAFT_THREADS')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_THREADS_BATCH', 'LLAMA_ARG_SPEC_DRAFT_THREADS_BATCH')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_CPU_MASK', 'LLAMA_ARG_SPEC_DRAFT_CPU_MASK')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_CPU_RANGE', 'LLAMA_ARG_SPEC_DRAFT_CPU_RANGE')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_CPU_STRICT', 'LLAMA_ARG_SPEC_DRAFT_CPU_STRICT')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_PRIO', 'LLAMA_ARG_SPEC_DRAFT_PRIO')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_POLL', 'LLAMA_ARG_SPEC_DRAFT_POLL')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_CPU_MASK_BATCH', 'LLAMA_ARG_SPEC_DRAFT_CPU_MASK_BATCH')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_CPU_STRICT_BATCH', 'LLAMA_ARG_SPEC_DRAFT_CPU_STRICT_BATCH')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_PRIO_BATCH', 'LLAMA_ARG_SPEC_DRAFT_PRIO_BATCH')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_POLL_BATCH', 'LLAMA_ARG_SPEC_DRAFT_POLL_BATCH')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_N_CPU_MOE', 'LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_CPU_MOE', 'LLAMA_ARG_SPEC_DRAFT_CPU_MOE')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_N_MIN', 'LLAMA_ARG_SPEC_DRAFT_N_MIN')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_P_SPLIT', 'LLAMA_ARG_SPEC_DRAFT_P_SPLIT')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_P_MIN', 'LLAMA_ARG_SPEC_DRAFT_P_MIN')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_BACKEND_SAMPLING', 'LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_DEVICE', 'LLAMA_ARG_SPEC_DRAFT_DEVICE')
+        call import_environment_alias('FORTAI_SPEC_DRAFT_N_GPU_LAYERS', 'LLAMA_ARG_SPEC_DRAFT_N_GPU_LAYERS')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MOD_N_MIN', 'LLAMA_ARG_SPEC_NGRAM_MOD_N_MIN')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MOD_N_MAX', 'LLAMA_ARG_SPEC_NGRAM_MOD_N_MAX')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MOD_N_MATCH', 'LLAMA_ARG_SPEC_NGRAM_MOD_N_MATCH')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_SIMPLE_SIZE_N', 'LLAMA_ARG_SPEC_NGRAM_SIMPLE_SIZE_N')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_SIMPLE_SIZE_M', 'LLAMA_ARG_SPEC_NGRAM_SIMPLE_SIZE_M')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_SIMPLE_MIN_HITS', 'LLAMA_ARG_SPEC_NGRAM_SIMPLE_MIN_HITS')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MAP_K_SIZE_N', 'LLAMA_ARG_SPEC_NGRAM_MAP_K_SIZE_N')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MAP_K_SIZE_M', 'LLAMA_ARG_SPEC_NGRAM_MAP_K_SIZE_M')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MAP_K_MIN_HITS', 'LLAMA_ARG_SPEC_NGRAM_MAP_K_MIN_HITS')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MAP_K4V_SIZE_N', 'LLAMA_ARG_SPEC_NGRAM_MAP_K4V_SIZE_N')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MAP_K4V_SIZE_M', 'LLAMA_ARG_SPEC_NGRAM_MAP_K4V_SIZE_M')
+        call import_environment_alias('FORTAI_SPEC_NGRAM_MAP_K4V_MIN_HITS', 'LLAMA_ARG_SPEC_NGRAM_MAP_K4V_MIN_HITS')
+        call import_environment_alias('FORTAI_MODEL_VOCODER', 'LLAMA_ARG_MODEL_VOCODER')
         call import_ui_alias()
     end subroutine import_llama_environment
 
     subroutine import_environment_alias(target_name, source_name)
         character(len=*), intent(in) :: target_name, source_name
         character(len=4096) :: value
+        character(len=:), allocatable :: legacy_name
         integer :: length
 
         value = ''
@@ -502,6 +1101,22 @@ contains
         if (length > 0) return
         value = ''
         call get_environment_variable(source_name, value, length=length)
+        if (length <= 0) then
+            if (index(target_name, 'FORTAI_') == 1) then
+                if (len_trim(target_name) > 7) then
+                    legacy_name = 'LLAMACPP_' // target_name(8:)
+                    call get_environment_variable(legacy_name, value, length=length)
+                end if
+            end if
+        end if
+        if (length <= 0) then
+            if (index(source_name, 'LLAMA_ARG_') == 1) then
+                if (len_trim(source_name) > 10) then
+                    legacy_name = 'LLAMACPP_' // source_name(11:)
+                    call get_environment_variable(legacy_name, value, length=length)
+                end if
+            end if
+        end if
         if (length <= 0) return
         if (length > len(value)) return
         call set_environment(target_name, value(:length))
@@ -658,12 +1273,23 @@ contains
         text = argument%as_character()
     end subroutine argument_text_at
 
+    subroutine print_devices()
+        integer :: exit_status
+
+        ! Keep this query side-effect free and use the same CUDA visibility
+        ! rules as llama.cpp.  nvidia-smi is optional on CPU-only installs.
+        call execute_command_line('nvidia-smi -L', wait=.true., exitstat=exit_status)
+        if (exit_status /= 0) then
+            write(output_unit, '(a)') 'No CUDA devices available to FortAI.'
+        end if
+    end subroutine print_devices
+
     subroutine print_usage()
         write(output_unit, '(a)') 'fortai-server [options]'
         write(output_unit, '(a)') '  -m, --model PATH             GGUF model'
         write(output_unit, '(a)') '  --host HOST                  bind address (default 127.0.0.1)'
         write(output_unit, '(a)') '  --port PORT                  listen port (default 8080)'
-        write(output_unit, '(a)') '  -c, --ctx-size N             context size'
+        write(output_unit, '(a)') '  -c, --ctx-size N             context size (0=model default)'
         write(output_unit, '(a)') '  -t, --threads N              CPU threads'
         write(output_unit, '(a)') '  -ngl, --n-gpu-layers N       GPU layers (0=CPU)'
         write(output_unit, '(a)') '  --main-gpu N / -mg           primary GPU'
@@ -686,13 +1312,23 @@ contains
         write(output_unit, '(a)') '  --cache-reuse N              KV cache reuse threshold'
         write(output_unit, '(a)') '  --n-cpu-moe N                CPU MoE expert count'
         write(output_unit, '(a)') '  --mmproj PATH                multimodal projector'
+        write(output_unit, '(a)') '  --mmproj-device DEVICE       multimodal projector device'
         write(output_unit, '(a)') '  --mmproj-offload/--no-mmproj-offload'
+        write(output_unit, '(a)') '  --load-mode MODE / -lm       auto, none, mmap, mlock, mmap+mlock, or dio'
         write(output_unit, '(a)') '  --threads-http N             HTTP worker threads'
+        write(output_unit, '(a)') '  --api-prefix PREFIX          serve all endpoints below PREFIX'
+        write(output_unit, '(a)') '  --path PATH                  serve static files from PATH'
+        write(output_unit, '(a)') '  --cors-origins ORIGINS       CORS origin allow-list'
+        write(output_unit, '(a)') '  --cors-methods METHODS       CORS method allow-list'
+        write(output_unit, '(a)') '  --cors-headers HEADERS       CORS header allow-list'
+        write(output_unit, '(a)') '  --api-key KEY                Bearer key (also LLAMA_API_KEY)'
+        write(output_unit, '(a)') '  --api-key-file PATH          one Bearer key per line'
         write(output_unit, '(a)') '  --reasoning-budget N         thinking token budget'
         write(output_unit, '(a)') '  --chat-template-kwargs JSON  template defaults (JSON object)'
         write(output_unit, '(a)') '  --temp N                     default sampling temperature'
         write(output_unit, '(a)') '  --top-k N / --top-p N        default sampling cutoffs'
         write(output_unit, '(a)') '  --no-webui                   disable the embedded web UI'
+        write(output_unit, '(a)') '  All current llama.cpp server options and LLAMA_ARG_* aliases are accepted.'
     end subroutine print_usage
 
 end program fortai_server

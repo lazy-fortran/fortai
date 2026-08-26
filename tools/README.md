@@ -6,17 +6,19 @@ model loading and serving do not depend on a code-generation toolchain.
 
 `fortai-server` is the FortAI-native HTTP entrypoint. It serves the OpenAI
 compatible `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
-`/v1/models`, `/health`, read-only `/props`, `/metrics`, and the embedded `/` UI from the Fortran Qwen3.5 runtime; it never launches
+`/v1/models`, `/health`, `/props` (writable with `--props`), `/slots`, `/metrics`, and the embedded `/` UI from the Fortran Qwen3.5 runtime; it never launches
 `llama-server`. `tools/build_cuda_server.sh` builds the CUDA binary, while
 `fo build` builds the CPU diagnostic binary. Set `FORTAI_SERVER_BIN` only when
 selecting an already-built FortAI binary explicitly.
 
-The native CLI accepts the production llama.cpp profile controls (`--alias`/
-`-a`, `--parallel`/`-np`, `--tensor-split`/`-ts`, `--model-draft`/`-md`,
-`--spec-type`, `--flash-attn`/`-fa`, `--fit`/`-fit`,
-K/V cache types, batch/ubatch, cache budget/reuse, sampler defaults, reasoning
-budget, mmproj path/offload, `--ui`/`--no-ui`, and `--no-webui`) and mirrors their
-`LLAMA_ARG_*` and legacy `LLAMACPP_*` environment variables into `FORTAI_*`.
+The native CLI accepts the complete current `llama-server --help` option and
+alias surface, including model/GPU placement, split ratios, batching, KV and
+draft/MTP settings, sampling, reasoning, multimodal, static/UI, CORS,
+authentication, router, and speculative-decoding controls. Every documented
+`LLAMA_ARG_*` variable is normalized before model initialization; the local
+`LLAMACPP_*` names remain accepted for the existing systemd profile. Options
+whose execution is not part of the native Qwen runtime are retained in the
+effective configuration and exposed by `/health` rather than silently dropped.
 The production launcher's `--chat-template-kwargs` option is accepted as
 well; its JSON object is used as the native request default (including
 `preserve_thinking` and `enable_thinking`).
@@ -63,8 +65,8 @@ Split two-GPU Q4_K_XL serving uses the deterministic resident CUDA bridge by
 default when flash attention is enabled. Set
 `FORTAI_DISABLE_CUDA_Q4_DEVICE_PIPELINE=1` (or the compatibility spelling
 `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=0`) to select the host-boundary route.
-The bridge uses an explicit device fence for cross-stream hand-off on hosts
-without CUDA peer access. `FORTAI_TENSOR_SPLIT=a,b` (also accepted as
+The bridge uses a bounded producer-stream CUDA event ring for cross-stream
+hand-off on hosts without CUDA peer access. `FORTAI_TENSOR_SPLIT=a,b` (also accepted as
 `--tensor-split a,b`/`-ts a,b`) controls native Q4 byte placement across the two GPUs;
 fractions are normalized and invalid values fail initialization. `split-mode
 none` keeps native tensors on `main-gpu`; `layer`, `row`, and `tensor` select

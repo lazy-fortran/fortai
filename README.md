@@ -143,11 +143,12 @@ The model runner accepts a GGUF file, an initial Qwen tokenizer ID, a decode
 step count, and a context limit. The persistent model fetch manifest is in
 `.provenance/models.tsv`.
 
-The native server honors the same canonical `LLAMA_ARG_*` environment names as
-`llama-server` (and also accepts the corresponding `FORTAI_*` and legacy
-`LLAMACPP_*` names).  The launcher normalizes those settings before model
-initialization, including split mode, tensor fractions, draft/MTP cache types,
-reasoning controls, and server/UI switches.  The resident llama.cpp adapter
+The native server honors the complete current `llama-server --help` command-line
+and canonical `LLAMA_ARG_*` environment surface (and also accepts the
+corresponding `FORTAI_*` and legacy `LLAMACPP_*` names). The launcher normalizes
+those settings before model initialization, including split mode, tensor
+fractions, draft/MTP cache types, reasoning controls, HTTP/UI/CORS settings,
+and authentication. The resident llama.cpp adapter
 honors the corresponding `FORTAI_*`, `LLAMA_ARG_*`, and local service
 `LLAMACPP_*` settings for flash attention,
 batch/ubatch sizes, parallel sequence count, K/V cache types, KQV and generic
@@ -171,10 +172,13 @@ service is FortAI-owned: build
 it with `tools/build_cuda_server.sh` and launch
 `tools/fortai-server --model MODEL.gguf --port 8080`. It loads the model
 through the native Fortran Qwen3.5 runtime, initializes the FortAI CUDA
-backend, and serves `/`, `/health`, read-only `/props`, `/metrics`, `/v1/models`, `/v1/chat/completions`,
+backend, and serves `/`, `/health`, `/props` (read-only unless `--props` is enabled), `/slots`, `/metrics`, `/v1/models`, `/v1/chat/completions`,
 `/v1/completions`, and the OpenAI Responses-compatible `/v1/responses` wire
 API. The root endpoint is a small llama.cpp-style chat UI. The
 server never launches `llama-server` and reports `X-FortAI-Backend: fortai`.
+`--api-prefix`/`LLAMA_ARG_API_PREFIX` applies the configured base path to every
+endpoint (including the embedded UI), `--path` serves a safe static tree, and
+the C transport emits the configured CORS and Bearer-key policy.
 The native CLI accepts the production launcher's `--chat-template-kwargs`
 JSON object and applies its `enable_thinking`, `preserve_thinking`, and
 `reasoning_effort` values as request defaults, matching the corresponding
@@ -200,7 +204,8 @@ or message-array `input`, `instructions`, `reasoning.effort`, and streaming
 SSE events. Split two-GPU Q4_K_XL models use the deterministic resident CUDA
 bridge by default when flash attention is enabled; Q8 tensors stay on the
 primary CUDA context while Q4 tensors are split across the configured GPUs,
-avoiding invalid cross-context matvecs. Set
+avoiding invalid cross-context matvecs. A bounded producer-stream CUDA event
+ring handles the cross-context handoff on hosts without peer access. Set
 `FORTAI_DISABLE_CUDA_Q4_DEVICE_PIPELINE=1` (or the compatibility spelling
 `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=0`) to select the host-boundary route.
 Native `draft-mtp` keeps only the NextN verification head on the host; the

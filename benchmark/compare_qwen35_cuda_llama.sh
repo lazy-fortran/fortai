@@ -17,6 +17,14 @@ parallel="${FORTAI_LLAMA_PARALLEL:-1}"
 llama_server="${LLAMA_SERVER:-/home/ert/.local/bin/llama-server}"
 llama_library_dir="${LLAMA_LIBRARY_DIR:-/home/ert/.local/llama.cpp-b10566-cuda}"
 port="${LLAMA_PORT:-18092}"
+tensor_split="${FORTAI_LLAMA_TENSOR_SPLIT:-${FORTAI_TENSOR_SPLIT:-${LLAMACPP_TENSOR_SPLIT:-}}}"
+split_mode="${FORTAI_LLAMA_SPLIT_MODE:-${FORTAI_SPLIT_MODE:-${LLAMACPP_SPLIT_MODE:-}}}"
+flash_attn="${FORTAI_LLAMA_FLASH_ATTN:-${FORTAI_FLASH_ATTN:-${LLAMACPP_FLASH_ATTN:-}}}"
+cache_type_k="${FORTAI_LLAMA_CACHE_TYPE_K:-${FORTAI_CACHE_TYPE_K:-${LLAMACPP_CACHE_TYPE_K:-}}}"
+cache_type_v="${FORTAI_LLAMA_CACHE_TYPE_V:-${FORTAI_CACHE_TYPE_V:-${LLAMACPP_CACHE_TYPE_V:-}}}"
+batch_size="${FORTAI_LLAMA_BATCH:-${FORTAI_BATCH:-${LLAMACPP_BATCH:-2048}}}"
+ubatch_size="${FORTAI_LLAMA_UBATCH:-${FORTAI_UBATCH:-${LLAMACPP_UBATCH:-256}}}"
+fit_mode="${FORTAI_LLAMA_FIT:-${FORTAI_FIT:-${LLAMACPP_FIT:-off}}}"
 result_dir="$root_dir/benchmark/results"
 log_dir="$root_dir/benchmark/logs"
 mkdir -p "$result_dir" "$log_dir"
@@ -63,8 +71,21 @@ trap cleanup EXIT INT TERM
 if [[ -n "$llama_library_dir" ]]; then
     export LD_LIBRARY_PATH="$llama_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-CUDA_VISIBLE_DEVICES="$llama_visible_devices" "$llama_server" -m "$model_path" --host 127.0.0.1 \
-    --port "$port" -c "$context" --parallel "$parallel" -ngl 99 -t "$threads" -tb "$threads" --no-webui \
+llama_args=(
+    -m "$model_path" --host 127.0.0.1
+    --port "$port" -c "$context" -b "$batch_size" -ub "$ubatch_size" --parallel "$parallel" \
+    -ngl 99 -t "$threads" -tb "$threads" --no-webui -fit "$fit_mode"
+)
+if [[ -n "$tensor_split" ]]; then llama_args+=(--tensor-split "$tensor_split"); fi
+if [[ -n "$split_mode" ]]; then llama_args+=(--split-mode "$split_mode"); fi
+if [[ "$flash_attn" == "on" || "$flash_attn" == "true" || "$flash_attn" == "1" ]]; then
+    llama_args+=(--flash-attn on)
+elif [[ "$flash_attn" == "off" || "$flash_attn" == "false" || "$flash_attn" == "0" ]]; then
+    llama_args+=(--flash-attn off)
+fi
+if [[ -n "$cache_type_k" ]]; then llama_args+=(--cache-type-k "$cache_type_k"); fi
+if [[ -n "$cache_type_v" ]]; then llama_args+=(--cache-type-v "$cache_type_v"); fi
+CUDA_VISIBLE_DEVICES="$llama_visible_devices" "$llama_server" "${llama_args[@]}" \
     >"$llama_log" 2>&1 &
 server_pid=$!
 for attempt in $(seq 1 120); do

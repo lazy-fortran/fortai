@@ -18,9 +18,9 @@ module fortai_native_service
     logical, save :: service_mtp_sidecar_active = .false.
 
     type :: sampling_options_t
-        integer :: top_k = 20
+        integer :: top_k = 40
         real(real32) :: top_p = 0.95_real32
-        real(real32) :: min_p = 0.0_real32
+        real(real32) :: min_p = 0.05_real32
         real(real32) :: repeat_penalty = 1.0_real32
         real(real32) :: presence_penalty = 0.0_real32
         real(real32) :: frequency_penalty = 0.0_real32
@@ -186,6 +186,7 @@ contains
 
     logical function native_mtp_mode_requested()
         character(len=64) :: value
+        character(len=:), allocatable :: draft_path
         integer :: length
 
         native_mtp_mode_requested = .false.
@@ -214,7 +215,29 @@ contains
             length = min(length, len(value))
             native_mtp_mode_requested = trim(value(:length)) == 'draft-mtp'
         end if
+        if (.not. native_mtp_mode_requested) then
+            ! The production llama launcher selects MTP from a sidecar draft
+            ! path. Preserve that drop-in behavior when the native server is
+            ! launched directly and no explicit --spec-type was exported.
+            draft_path = configured_draft_path()
+            native_mtp_mode_requested = is_mtp_sidecar_path(draft_path)
+        end if
     end function native_mtp_mode_requested
+
+    logical function native_ignore_eos_requested()
+        character(len=32) :: value
+        integer :: length
+
+        native_ignore_eos_requested = .false.
+        value = ''
+        call get_environment_variable('FORTAI_IGNORE_EOS', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_IGNORE_EOS', value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        select case (trim(value(:length)))
+        case ('1', 'true', 'on', 'yes')
+            native_ignore_eos_requested = .true.
+        end select
+    end function native_ignore_eos_requested
 
     function configured_external_draft_path() result(path)
         character(len=:), allocatable :: path
@@ -407,7 +430,7 @@ contains
         integer :: i, j, generated_count, speculative_count
         real(real32) :: logit_sum, draft_logit_sum
         logical :: use_external_draft, use_native_mtp
-        logical :: stop_generation
+        logical :: stop_generation, ignore_eos
         type(status_t) :: stat, draft_stat
 
         options%top_k = top_k
@@ -473,6 +496,7 @@ contains
             .not. sampling_penalties_active(options)
         use_native_mtp = service_model%mtp_active .and. temperature == 0.0_real32 .and. &
             .not. sampling_penalties_active(options)
+        ignore_eos = native_ignore_eos_requested()
         if (use_external_draft) call service_draft_model%reset()
         current = -1_int64
         do i = 1, size(prompt_ids)
@@ -509,7 +533,7 @@ contains
         generated_count = 0
         do while (generated_count < max_tokens .and. size(prompt_ids) + generated_count < service_model%max_context)
             if (current < 0_int64) exit
-            if (service_tokenizer%is_stop(int(current, int32))) exit
+            if (.not. ignore_eos .and. service_tokenizer%is_stop(int(current, int32))) exit
             generated_count = generated_count + 1
             generated_ids(generated_count) = int(current, int32)
             sampling_history(size(prompt_ids) + generated_count) = int(current, int32)
@@ -532,7 +556,7 @@ contains
                 ! this preserves the ordinary one-token state machine while
                 ! allowing the preceding tokens to be emitted immediately.
                 do j = 1, speculative_count - 1
-                    if (service_tokenizer%is_stop(int(speculative_tokens(j), int32))) then
+                    if (.not. ignore_eos .and. service_tokenizer%is_stop(int(speculative_tokens(j), int32))) then
                         stop_generation = .true.
                         exit
                     end if

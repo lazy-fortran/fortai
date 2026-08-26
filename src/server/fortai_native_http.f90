@@ -36,6 +36,14 @@ module fortai_native_http
     public :: fortai_native_http_handle
     public :: fortai_native_http_json_integer_checked
 
+    interface
+        integer(c_int) function fortai_server_set_environment_http(name, value) &
+                bind(C, name='fortai_server_set_environment')
+            import c_char, c_int
+            character(kind=c_char), intent(in) :: name(*), value(*)
+        end function fortai_server_set_environment_http
+    end interface
+
 contains
 
     logical function finite_real32(value)
@@ -523,7 +531,7 @@ contains
         logical, intent(out) :: valid
         integer :: value
 
-        value = server_integer_default('FORTAI_MAX_TOKENS', 128)
+        value = server_integer_default('FORTAI_MAX_TOKENS', -1)
         valid = .true.
         if (responses) then
             if (json_key(text, 'max_output_tokens', 1) > 0) then
@@ -542,6 +550,7 @@ contains
             json_token_limit = 0
             return
         end if
+        if (value == -1) value = max_generation
         if (value <= 0 .or. value > max_generation) then
             valid = .false.
             json_token_limit = 0
@@ -1788,6 +1797,11 @@ contains
 
     function web_ui() result(page)
         type(string_t) :: page
+        type(string_t) :: api_prefix_json, api_prefix_text
+        character(len=:), allocatable :: api_prefix
+        api_prefix = server_api_prefix()
+        call api_prefix_text%set(api_prefix)
+        api_prefix_json = json_escape(api_prefix_text)
         call page%append('<!doctype html><html lang="en"><head><meta charset="utf-8">')
         call page%append('<meta name="viewport" content="width=device-width,initial-scale=1">')
         call page%append('<title>FortAI</title><style>')
@@ -1800,9 +1814,11 @@ contains
         call page%append('<div class=brand><span class=dot></span><div><h1>FortAI</h1><div class=sub>Native Qwen3.5 CUDA inference</div></div></div>')
         call page%append('<section id=chat class="chat"><div class="msg assistant"><div class=role>FortAI</div>Ready.</div></section>')
         call page%append('<form id=form><textarea id=input placeholder="Message FortAI…"></textarea><button id=send>Send</button></form><div id=status class=status>Connected to the FortAI-native server.</div></main><script>')
-        call page%append('const chat=document.querySelector("#chat"),input=document.querySelector("#input"),form=document.querySelector("#form"),send=document.querySelector("#send"),status=document.querySelector("#status"),messages=[];')
+        call page%append('const apiPrefix=')
+        call page%append_string(api_prefix_json)
+        call page%append(',chat=document.querySelector("#chat"),input=document.querySelector("#input"),form=document.querySelector("#form"),send=document.querySelector("#send"),status=document.querySelector("#status"),messages=[];')
         call page%append('function add(role,text){const el=document.createElement("div");el.className="msg "+role;const r=document.createElement("div");r.className="role";r.textContent=role==="user"?"You":"FortAI";const t=document.createElement("div");t.textContent=text;el.append(r,t);chat.append(el);chat.scrollTop=chat.scrollHeight;return t}')
-        call page%append('form.addEventListener("submit",async e=>{e.preventDefault();const text=input.value.trim();if(!text)return;input.value="";add("user",text);messages.push({role:"user",content:text});send.disabled=true;status.textContent="Generating…";const target=add("assistant","");try{const r=await fetch("/v1/chat/completions",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({model:"qwen",messages,max_tokens:512,stream:false,temperature:0})});const d=await r.json();if(!r.ok)throw Error(d.error?.message||"request failed");const m=d.choices?.[0]?.message||{};target.textContent=m.content||"";if(m.reasoning_content){const details=document.createElement("details"),summary=document.createElement("summary"),thought=document.createElement("div");details.className="thought";summary.textContent="Thinking";thought.textContent=m.reasoning_content;details.append(summary,thought);target.parentElement.insertBefore(details,target)}messages.push({role:"assistant",content:m.content||"",reasoning_content:m.reasoning_content||""});status.textContent="FortAI native CUDA"}catch(err){target.textContent="Error: "+err.message;status.textContent="Request failed"}finally{send.disabled=false;input.focus()}})</script></body></html>')
+        call page%append('form.addEventListener("submit",async e=>{e.preventDefault();const text=input.value.trim();if(!text)return;input.value="";add("user",text);messages.push({role:"user",content:text});send.disabled=true;status.textContent="Generating…";const target=add("assistant","");try{const r=await fetch(apiPrefix+"/v1/chat/completions",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({model:"qwen",messages,max_tokens:512,stream:false,temperature:0})});const d=await r.json();if(!r.ok)throw Error(d.error?.message||"request failed");const m=d.choices?.[0]?.message||{};target.textContent=m.content||"";if(m.reasoning_content){const details=document.createElement("details"),summary=document.createElement("summary"),thought=document.createElement("div");details.className="thought";summary.textContent="Thinking";thought.textContent=m.reasoning_content;details.append(summary,thought);target.parentElement.insertBefore(details,target)}messages.push({role:"assistant",content:m.content||"",reasoning_content:m.reasoning_content||""});status.textContent="FortAI native CUDA"}catch(err){target.textContent="Error: "+err.message;status.textContent="Request failed"}finally{send.disabled=false;input.focus()}})</script></body></html>')
     end function web_ui
 
     subroutine parse_http_request(request, method, path, body, okay)
@@ -2304,10 +2320,24 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         path_value = path%as_character()
+        call apply_api_prefix(path_value)
         if (path_value == '/metrics' .and. method%as_character() /= 'POST') then
             call metrics_body(result, cuda); status = 200_c_int
             call copy_result(result, 'text/plain; version=0.0.4', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        if (method%as_character() == 'GET' .and. len_trim(server_text_default('FORTAI_STATIC_PATH', '')) > 0) then
+            block
+                character(len=64) :: static_mime
+                logical :: static_found
+                call server_static_file(path_value, result, static_mime, static_found)
+                if (static_found) then
+                    status = 200_c_int
+                    call copy_result(result, static_mime(:len_trim(static_mime)), response, response_capacity, response_length, &
+                        content_type, content_type_capacity, fortai_native_http_handle)
+                    return
+                end if
+            end block
         end if
         if (path_value == '/' .or. path_value == '/ui' .or. path_value == '/index.html') then
             if (.not. server_web_ui_enabled()) then
@@ -2344,6 +2374,28 @@ contains
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
+        if (path_value == '/props' .and. method%as_character() == 'POST') then
+            if (.not. server_boolean_default('FORTAI_ENDPOINT_PROPS', .false.)) then
+                call error_body(404, 'props endpoint disabled', result); status = 404_c_int
+            else if (.not. server_props_update(body%as_character(), result)) then
+                status = 400_c_int
+            else
+                call server_props_json(model_text, model_path_text, result); status = 200_c_int
+            end if
+            call result%append(char(10))
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
+        if (path_value == '/slots' .and. method%as_character() == 'GET') then
+            if (.not. server_boolean_default('FORTAI_ENDPOINT_SLOTS', .true.)) then
+                call error_body(404, 'slots endpoint disabled', result); status = 404_c_int
+            else
+                call server_slots_json(result); status = 200_c_int
+            end if
+            call result%append(char(10))
+            call copy_result(result, 'application/json', response, response_capacity, response_length, &
+                content_type, content_type_capacity, fortai_native_http_handle); return
+        end if
         if ((path_value == '/v1/models' .or. index(path_value, '/v1/models/') == 1) .and. &
             method%as_character() /= 'POST') then
             call result%append('{"object":"list","data":[{"id":'); result = append_json(result, model_text)
@@ -2368,7 +2420,7 @@ contains
             call copy_result(result, 'application/json', response, response_capacity, response_length, &
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
-        temperature = json_real(body%as_character(), 'temperature', server_real_default('FORTAI_TEMPERATURE', 0.0_real32), &
+        temperature = json_real(body%as_character(), 'temperature', server_real_default('FORTAI_TEMPERATURE', 0.8_real32), &
             temperature_valid)
         if (.not. temperature_valid .or. .not. finite_real32(temperature) .or. temperature < 0.0_real32) then
             call error_body(400, 'temperature must be a finite non-negative number', result); status = 400_c_int
@@ -2376,12 +2428,16 @@ contains
                 content_type, content_type_capacity, fortai_native_http_handle); return
         end if
         seed = json_int64(body%as_character(), 'seed', server_int64_default('FORTAI_SEED', 0_int64))
+        ! llama.cpp treats -1 as a request for a fresh random seed.  The
+        ! native service uses zero for that policy; preserve deterministic
+        ! positive seeds while translating the sentinel at the API boundary.
+        if (seed < 0_int64) seed = 0_int64
         top_k = fortai_native_http_json_integer_checked(body%as_character(), 'top_k', &
-            server_integer_default('FORTAI_TOP_K', 20), top_k_valid)
+            server_integer_default('FORTAI_TOP_K', 40), top_k_valid)
         repeat_last_n = fortai_native_http_json_integer_checked(body%as_character(), 'repeat_last_n', &
             server_integer_default('FORTAI_REPEAT_LAST_N', 64), repeat_last_n_valid, -1)
         top_p = json_real(body%as_character(), 'top_p', server_real_default('FORTAI_TOP_P', 0.95_real32), top_p_valid)
-        min_p = json_real(body%as_character(), 'min_p', server_real_default('FORTAI_MIN_P', 0.0_real32), min_p_valid)
+        min_p = json_real(body%as_character(), 'min_p', server_real_default('FORTAI_MIN_P', 0.05_real32), min_p_valid)
         repeat_penalty = json_real(body%as_character(), 'repeat_penalty', &
             server_real_default('FORTAI_REPEAT_PENALTY', 1.0_real32), repeat_penalty_valid)
         presence_penalty = json_real(body%as_character(), 'presence_penalty', &
@@ -2818,6 +2874,234 @@ contains
         end if
     end function server_web_ui_enabled
 
+    function server_api_prefix() result(prefix)
+        character(len=:), allocatable :: prefix
+        character(len=:), allocatable :: configured
+        integer :: last
+
+        configured = server_text_default('FORTAI_API_PREFIX', '')
+        if (len_trim(configured) == 0) then
+            allocate(character(len=0) :: prefix)
+            return
+        end if
+        configured = trim(configured)
+        if (configured(1:1) /= '/') configured = '/' // configured
+        last = len(configured)
+        do while (last > 1 .and. configured(last:last) == '/')
+            last = last - 1
+        end do
+        if (last < len(configured)) configured = configured(:last)
+        allocate(character(len=len(configured)) :: prefix)
+        prefix = configured
+    end function server_api_prefix
+
+    subroutine apply_api_prefix(path_value)
+        character(len=:), allocatable, intent(inout) :: path_value
+        character(len=:), allocatable :: prefix
+
+        prefix = server_api_prefix()
+        if (len(prefix) == 0) return
+        if (path_value == prefix) then
+            path_value = '/'
+        else if (len(path_value) > len(prefix) .and. index(path_value, prefix // '/') == 1) then
+            path_value = path_value(len(prefix) + 1:)
+        else
+            ! Keep the normal 404 path for requests outside the configured
+            ! prefix without allocating a second error response here.
+            path_value = '/__fortai_api_prefix_mismatch__'
+        end if
+    end subroutine apply_api_prefix
+
+    subroutine server_static_file(path_value, result, mime, found)
+        character(len=*), intent(in) :: path_value
+        type(string_t), intent(out) :: result
+        character(len=*), intent(out) :: mime
+        logical, intent(out) :: found
+        character(len=:), allocatable :: root, relative, file_name, bytes
+        integer :: unit, ios
+        integer(int64) :: file_size
+        logical :: exists
+
+        call result%clear()
+        mime = 'application/octet-stream'
+        found = .false.
+        if (len(path_value) == 0 .or. path_value(1:1) /= '/') return
+        if (index(path_value, '..') > 0) return
+        root = server_text_default('FORTAI_STATIC_PATH', '')
+        if (len_trim(root) == 0) return
+        relative = path_value
+        if (relative == '/') relative = '/index.html'
+        root = trim(root)
+        if (root(len(root):len(root)) == '/') then
+            if (len(relative) > 1) then
+                file_name = root // relative(2:)
+            else
+                file_name = root // 'index.html'
+            end if
+        else
+            file_name = root // relative
+        end if
+        file_size = 0_int64
+        inquire(file=file_name, exist=exists, size=file_size)
+        if (.not. exists .or. file_size < 0_int64 .or. file_size > 64_int64 * 1024_int64 * 1024_int64) return
+        if (file_size == 0_int64) then
+            call result%set('')
+        else
+            allocate(character(len=int(file_size)) :: bytes)
+            open(newunit=unit, file=file_name, status='old', action='read', access='stream', form='unformatted', iostat=ios)
+            if (ios /= 0) then
+                deallocate(bytes)
+                return
+            end if
+            read(unit, iostat=ios) bytes
+            close(unit)
+            if (ios /= 0) then
+                deallocate(bytes)
+                return
+            end if
+            call result%set(bytes)
+            deallocate(bytes)
+        end if
+        if (index(path_value, '.html') > 0 .or. index(path_value, '.htm') > 0) then
+            mime = 'text/html; charset=utf-8'
+        else if (index(path_value, '.css') > 0) then
+            mime = 'text/css; charset=utf-8'
+        else if (index(path_value, '.js') > 0) then
+            mime = 'application/javascript; charset=utf-8'
+        else if (index(path_value, '.json') > 0) then
+            mime = 'application/json'
+        else if (index(path_value, '.txt') > 0 .or. index(path_value, '.md') > 0) then
+            mime = 'text/plain; charset=utf-8'
+        else if (index(path_value, '.svg') > 0) then
+            mime = 'image/svg+xml'
+        else if (index(path_value, '.png') > 0) then
+            mime = 'image/png'
+        else if (index(path_value, '.jpg') > 0 .or. index(path_value, '.jpeg') > 0) then
+            mime = 'image/jpeg'
+        else if (index(path_value, '.ico') > 0) then
+            mime = 'image/x-icon'
+        end if
+        found = .true.
+    end subroutine server_static_file
+
+    subroutine server_slots_json(result)
+        type(string_t), intent(out) :: result
+        character(len=64) :: number
+        integer :: slots
+
+        slots = max(1, server_integer_default('FORTAI_PARALLEL', 1))
+        call result%set('{"slots":[{"id":0,"state":0,"n_ctx":')
+        write(number, '(i0)') fortai_native_service_context_size()
+        call result%append(trim(number))
+        call result%append(',"is_processing":false,"prompt_tokens":0,"tokens":0}],"total_slots":')
+        write(number, '(i0)') slots
+        call result%append(trim(number))
+        call result%append('}')
+    end subroutine server_slots_json
+
+    logical function server_props_update(text, result)
+        character(len=*), intent(in) :: text
+        type(string_t), intent(out) :: result
+
+        server_props_update = .false.
+        call result%clear()
+        if (json_top_level_key(text, 'temperature') > 0) then
+            if (.not. update_real_property(text, 'temperature', 'FORTAI_TEMPERATURE', 0.0_real32, huge(0.0_real32))) then
+                call error_body(400, 'invalid temperature property', result)
+                return
+            end if
+        end if
+        if (json_top_level_key(text, 'top_p') > 0) then
+            if (.not. update_real_property(text, 'top_p', 'FORTAI_TOP_P', 0.0_real32, 1.0_real32)) then
+                call error_body(400, 'invalid top_p property', result)
+                return
+            end if
+        end if
+        if (json_top_level_key(text, 'min_p') > 0) then
+            if (.not. update_real_property(text, 'min_p', 'FORTAI_MIN_P', 0.0_real32, 1.0_real32)) then
+                call error_body(400, 'invalid min_p property', result)
+                return
+            end if
+        end if
+        if (json_top_level_key(text, 'repeat_penalty') > 0) then
+            if (.not. update_real_property(text, 'repeat_penalty', 'FORTAI_REPEAT_PENALTY', tiny(1.0_real32), &
+                    huge(0.0_real32))) then
+                call error_body(400, 'invalid repeat_penalty property', result)
+                return
+            end if
+        end if
+        if (json_top_level_key(text, 'presence_penalty') > 0) then
+            if (.not. update_real_property(text, 'presence_penalty', 'FORTAI_PRESENCE_PENALTY', -huge(0.0_real32), &
+                    huge(0.0_real32))) then
+                call error_body(400, 'invalid presence_penalty property', result)
+                return
+            end if
+        end if
+        if (json_top_level_key(text, 'frequency_penalty') > 0) then
+            if (.not. update_real_property(text, 'frequency_penalty', 'FORTAI_FREQUENCY_PENALTY', -huge(0.0_real32), &
+                    huge(0.0_real32))) then
+                call error_body(400, 'invalid frequency_penalty property', result)
+                return
+            end if
+        end if
+        if (json_top_level_key(text, 'top_k') > 0) then
+            if (.not. update_integer_property(text, 'top_k', 'FORTAI_TOP_K', 0, max_generation)) then
+                call error_body(400, 'invalid top_k property', result)
+                return
+            end if
+        end if
+        if (json_top_level_key(text, 'repeat_last_n') > 0) then
+            if (.not. update_integer_property(text, 'repeat_last_n', 'FORTAI_REPEAT_LAST_N', -1, max_generation)) then
+                call error_body(400, 'invalid repeat_last_n property', result)
+                return
+            end if
+        end if
+        server_props_update = .true.
+    end function server_props_update
+
+    logical function update_real_property(text, key, environment, minimum, maximum)
+        character(len=*), intent(in) :: text, key, environment
+        real(real32), intent(in) :: minimum, maximum
+        real(real32) :: value
+        logical :: valid
+        character(len=64) :: encoded
+
+        value = json_real(text, key, minimum, valid)
+        update_real_property = valid .and. finite_real32(value) .and. value >= minimum .and. value <= maximum
+        if (.not. update_real_property) return
+        write(encoded, '(es24.16)') value
+        update_real_property = set_http_environment(environment, trim(encoded))
+    end function update_real_property
+
+    logical function update_integer_property(text, key, environment, minimum, maximum)
+        character(len=*), intent(in) :: text, key, environment
+        integer, intent(in) :: minimum, maximum
+        integer :: value
+        logical :: valid
+        character(len=64) :: encoded
+
+        value = fortai_native_http_json_integer_checked(text, key, minimum, valid, minimum)
+        update_integer_property = valid .and. value >= minimum .and. value <= maximum
+        if (.not. update_integer_property) return
+        write(encoded, '(i0)') value
+        update_integer_property = set_http_environment(environment, trim(encoded))
+    end function update_integer_property
+
+    logical function set_http_environment(name, value)
+        character(len=*), intent(in) :: name, value
+        type(string_t) :: name_text, value_text
+        character(kind=c_char), allocatable :: cname(:), cvalue(:)
+        integer(c_int) :: status
+
+        call name_text%set(name)
+        call value_text%set(value)
+        allocate(cname(name_text%length() + 1), cvalue(value_text%length() + 1))
+        call name_text%to_c(cname, size(cname))
+        call value_text%to_c(cvalue, size(cvalue))
+        status = fortai_server_set_environment_http(cname, cvalue)
+        set_http_environment = status == 0_c_int
+    end function set_http_environment
+
     subroutine metrics_body(result, cuda)
         type(string_t), intent(out) :: result
         integer(c_int), intent(in) :: cuda
@@ -2877,6 +3161,8 @@ contains
         call append_setting(result, 'chat_template_kwargs', 'FORTAI_CHAT_TEMPLATE_KWARGS', '{}', .true.)
         call append_setting(result, 'mmproj', 'FORTAI_MMPROJ', '', .true.)
         call append_setting(result, 'mmproj_offload', 'FORTAI_MMPROJ_OFFLOAD', 'true', .false.)
+        call append_setting(result, 'mmproj_device', 'MTMD_BACKEND_DEVICE', 'auto', .true.)
+        call append_setting(result, 'load_mode', 'FORTAI_LOAD_MODE', 'auto', .true.)
         call append_setting(result, 'fit', 'FORTAI_FIT', 'auto', .true.)
         call append_setting(result, 'cache_ram', 'FORTAI_CACHE_RAM', '0', .false.)
         call append_setting(result, 'cache_reuse', 'FORTAI_CACHE_REUSE', '0', .false.)
@@ -2885,15 +3171,29 @@ contains
         call append_setting(result, 'no_context_shift', 'FORTAI_NO_CONTEXT_SHIFT', 'false', .false.)
         call append_setting(result, 'metrics', 'FORTAI_METRICS', 'false', .false.)
         call append_setting(result, 'log_timestamps', 'FORTAI_LOG_TIMESTAMPS', 'false', .false.)
-        call append_setting(result, 'temperature', 'FORTAI_TEMPERATURE', '0', .false.)
-        call append_setting(result, 'top_k', 'FORTAI_TOP_K', '20', .false.)
+        call append_setting(result, 'temperature', 'FORTAI_TEMPERATURE', '0.8', .false.)
+        call append_setting(result, 'top_k', 'FORTAI_TOP_K', '40', .false.)
         call append_setting(result, 'top_p', 'FORTAI_TOP_P', '0.95', .false.)
-        call append_setting(result, 'min_p', 'FORTAI_MIN_P', '0', .false.)
+        call append_setting(result, 'min_p', 'FORTAI_MIN_P', '0.05', .false.)
         call append_setting(result, 'repeat_penalty', 'FORTAI_REPEAT_PENALTY', '1', .false.)
         call append_setting(result, 'presence_penalty', 'FORTAI_PRESENCE_PENALTY', '0', .false.)
         call append_setting(result, 'frequency_penalty', 'FORTAI_FREQUENCY_PENALTY', '0', .false.)
         call append_setting(result, 'repeat_last_n', 'FORTAI_REPEAT_LAST_N', '64', .false.)
         call append_setting(result, 'reasoning_format', 'FORTAI_REASONING_FORMAT', 'auto', .true.)
+        call append_setting(result, 'static_path', 'FORTAI_STATIC_PATH', '', .true.)
+        call append_setting(result, 'api_prefix', 'FORTAI_API_PREFIX', '', .true.)
+        call append_setting(result, 'cors_origins', 'FORTAI_CORS_ORIGINS', '*', .true.)
+        call append_setting(result, 'cors_methods', 'FORTAI_CORS_METHODS', 'GET, POST, DELETE, OPTIONS', .true.)
+        call append_setting(result, 'cors_headers', 'FORTAI_CORS_HEADERS', '*', .true.)
+        call append_setting(result, 'cors_credentials', 'FORTAI_CORS_CREDENTIALS', 'true', .false.)
+        call append_setting(result, 'tools', 'FORTAI_TOOLS', '', .true.)
+        call append_setting(result, 'tools_runtime', 'FORTAI_TOOLS_RUNTIME', '', .true.)
+        call append_setting(result, 'mcp_servers_config', 'FORTAI_MCP_SERVERS_CONFIG', '', .true.)
+        call append_setting(result, 'mcp_servers_json', 'FORTAI_MCP_SERVERS_JSON', '', .true.)
+        call append_setting(result, 'embedding', 'FORTAI_EMBEDDINGS', 'false', .false.)
+        call append_setting(result, 'reranking', 'FORTAI_RERANKING', 'false', .false.)
+        call append_setting(result, 'endpoint_props', 'FORTAI_ENDPOINT_PROPS', 'false', .false.)
+        call append_setting(result, 'endpoint_slots', 'FORTAI_ENDPOINT_SLOTS', 'true', .false.)
         call append_setting(result, 'no_webui', 'FORTAI_NO_WEBUI', 'false', .false.)
         call result%append('}')
     end subroutine server_settings_json
@@ -2916,7 +3216,11 @@ contains
         call result%append(',"model_path":')
         result = append_json(result, model_path)
         call result%append(',"modalities":{"vision":false,"video":false,"audio":false}')
-        call result%append(',"endpoint_slots":false,"endpoint_props":false,"endpoint_metrics":')
+        call result%append(',"endpoint_slots":')
+        call result%append_logical(server_boolean_default('FORTAI_ENDPOINT_SLOTS', .true.))
+        call result%append(',"endpoint_props":')
+        call result%append_logical(server_boolean_default('FORTAI_ENDPOINT_PROPS', .false.))
+        call result%append(',"endpoint_metrics":')
         call result%append_logical(server_boolean_default('FORTAI_METRICS', .false.))
         call result%append(',"ui":')
         call result%append_logical(server_web_ui_enabled())
