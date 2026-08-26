@@ -290,7 +290,11 @@ contains
         call stat%clear()
         service_mtp_sidecar_active = .false.
         if (len_trim(path) == 0) return
-        call sidecar%open(trim(path), stat)
+        ! Keep the sidecar payload in owned storage before transferring the
+        ! selected blk.64 tensors into the target model.  The target GGUF may
+        ! be mmap-backed, but closing a separately mapped sidecar must never
+        ! leave dangling tensor pointers in the service model.
+        call sidecar%open(trim(path), stat, .false.)
         if (.not. stat%is_ok()) return
         if (.not. allocated(sidecar%tensors)) then
             call stat%set(FORTAI_INVALID, 'MTP sidecar has no tensors')
@@ -322,7 +326,7 @@ contains
                 call stat%set(FORTAI_INVALID, 'MTP sidecar tensor shape differs from target: ' // trim(tensor_name))
                 exit
             end if
-            if (.not. allocated(sidecar%tensors(i)%bytes)) then
+            if (.not. associated(sidecar%tensors(i)%bytes)) then
                 call stat%set(FORTAI_INVALID, 'MTP sidecar tensor has no data: ' // trim(tensor_name))
                 exit
             end if
@@ -330,7 +334,17 @@ contains
                 call stat%set(FORTAI_INVALID, 'MTP sidecar tensor byte count is inconsistent: ' // trim(tensor_name))
                 exit
             end if
-            call move_alloc(sidecar%tensors(i)%bytes, service_model%file%tensors(target_index)%bytes)
+            if (associated(service_model%file%tensors(target_index)%bytes)) then
+                if (service_model%file%tensors(target_index)%bytes_mapped) then
+                    nullify(service_model%file%tensors(target_index)%bytes)
+                else
+                    deallocate(service_model%file%tensors(target_index)%bytes)
+                end if
+            end if
+            service_model%file%tensors(target_index)%bytes => sidecar%tensors(i)%bytes
+            service_model%file%tensors(target_index)%bytes_mapped = .false.
+            nullify(sidecar%tensors(i)%bytes)
+            sidecar%tensors(i)%bytes_mapped = .false.
             service_model%file%tensors(target_index)%value_type = sidecar%tensors(i)%value_type
             service_model%file%tensors(target_index)%byte_count = sidecar%tensors(i)%byte_count
             if (allocated(service_model%file%tensors(target_index)%decoded_values)) &

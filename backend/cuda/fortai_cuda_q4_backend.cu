@@ -68,12 +68,15 @@ struct fortai_cuda_q4_group_plan {
 };
 
 struct fortai_cuda_q4_context {
-    static constexpr int event_slots = 128;
+    /* A decode traverses hundreds of quantized projections.  Keep enough
+     * reusable events in flight that the normal same-device path never has
+     * to wait on the host merely to recycle an event. */
+    static constexpr int event_slots = 1024;
     ggml_backend_t devices[2] = {nullptr, nullptr};
     ggml_backend_t cpu = nullptr;
     int device_ids[2] = {0, 0};
     cudaStream_t consumer_stream[2] = {nullptr, nullptr};
-    cudaEvent_t producer_event[2][event_slots] = {};
+    ggml_backend_event_t producer_event[2][event_slots] = {};
     unsigned producer_event_index[2] = {0, 0};
     void *bridge_activation[2] = {nullptr, nullptr};
     void *bridge_output[2] = {nullptr, nullptr};
@@ -82,6 +85,22 @@ struct fortai_cuda_q4_context {
     std::vector<unsigned char> host_bridge;
     std::vector<fortai_cuda_q4_group_plan> group_plans;
 };
+
+/* ggml_backend_event_t is intentionally opaque in the public API.  The CUDA
+ * backend stores the native event handle in its context field; keep this
+ * tiny layout local so we can record on FortAI's producer stream and then use
+ * the public ggml backend event-wait/record operations for the scheduler
+ * stream.  It is the same two-field layout used by ggml-backend-impl.h. */
+struct fortai_ggml_backend_event_layout {
+    ggml_backend_dev_t device;
+    void *context;
+};
+
+static cudaEvent_t fortai_cuda_event_handle(ggml_backend_event_t event) {
+    if (event == nullptr) return nullptr;
+    return reinterpret_cast<cudaEvent_t>(
+        static_cast<fortai_ggml_backend_event_layout *>(static_cast<void *>(event))->context);
+}
 
 /* Keep the externally rebound edge pointers stable for the lifetime of the
  * context.  GGML-CUDA may retain a CUDA-graph executable for a per-weight
@@ -125,16 +144,18 @@ static int fortai_cuda_q4_consumer_slot(const fortai_cuda_q4_context *context, i
 }
 
 static int fortai_cuda_q4_next_event(fortai_cuda_q4_context *context, int slot,
-    cudaEvent_t events[][fortai_cuda_q4_context::event_slots], unsigned indices[2],
-    cudaEvent_t *event) {
+    ggml_backend_event_t events[][fortai_cuda_q4_context::event_slots], unsigned indices[2],
+    ggml_backend_event_t *event) {
     if (context == nullptr || slot < 0 || slot > 1 || event == nullptr) return FORTAI_CUDA_INVALID;
     if (cudaSetDevice(context->device_ids[slot]) != cudaSuccess)
         return FORTAI_CUDA_RUNTIME_ERROR;
     const unsigned index = indices[slot]++ % fortai_cuda_q4_context::event_slots;
     *event = events[slot][index];
-    const cudaError_t query = cudaEventQuery(*event);
+    if (*event == nullptr) return FORTAI_CUDA_RUNTIME_ERROR;
+    const cudaError_t query = cudaEventQuery(fortai_cuda_event_handle(*event));
     if (query == cudaErrorNotReady) {
-        if (cudaEventSynchronize(*event) != cudaSuccess) return FORTAI_CUDA_RUNTIME_ERROR;
+        if (cudaEventSynchronize(fortai_cuda_event_handle(*event)) != cudaSuccess)
+            return FORTAI_CUDA_RUNTIME_ERROR;
     } else if (query != cudaSuccess) {
         return FORTAI_CUDA_RUNTIME_ERROR;
     }
@@ -142,21 +163,43 @@ static int fortai_cuda_q4_next_event(fortai_cuda_q4_context *context, int slot,
 }
 
 /* GGML may use several internal streams for a graph.  The attached FortAI
- * stream is the producer of the activation consumed by Q4.  Wait only for
- * that producer stream; a device-wide synchronize would also stall unrelated
- * work on the second board.  The graph is host-synchronized before its output
- * is handed back, so no post-graph device fence is required. */
+ * stream is the producer of the activation consumed by Q4.  Queue a backend
+ * event wait rather than synchronizing the host; a device-wide synchronize
+ * would also stall unrelated work on the second board. */
 static int fortai_cuda_q4_prepare_input(fortai_cuda_q4_context *context, int device) {
     const int slot = fortai_cuda_q4_consumer_slot(context, device);
     if (slot < 0) return FORTAI_CUDA_INVALID;
     if (context->consumer_stream[slot] == nullptr) return FORTAI_CUDA_OK;
-    cudaEvent_t producer_event = nullptr;
+    ggml_backend_event_t producer_event = nullptr;
     if (fortai_cuda_q4_next_event(context, slot, context->producer_event,
             context->producer_event_index, &producer_event) != FORTAI_CUDA_OK)
         return FORTAI_CUDA_RUNTIME_ERROR;
     if (cudaSetDevice(device) != cudaSuccess ||
-        cudaEventRecord(producer_event, context->consumer_stream[slot]) != cudaSuccess ||
-        cudaEventSynchronize(producer_event) != cudaSuccess)
+        cudaEventRecord(fortai_cuda_event_handle(producer_event), context->consumer_stream[slot]) != cudaSuccess)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    /* Queue a device-side dependency on GGML's own stream.  The old path
+     * synchronized this event on the host, which serialized every Q4
+     * projection behind the preceding Q8 operation. */
+    ggml_backend_event_wait(context->devices[slot], producer_event);
+    return FORTAI_CUDA_OK;
+}
+
+static int fortai_cuda_q4_publish_output(fortai_cuda_q4_context *context,
+    ggml_backend_t backend, int device) {
+    const int slot = fortai_cuda_q4_consumer_slot(context, device);
+    if (slot < 0) return FORTAI_CUDA_INVALID;
+    if (context->consumer_stream[slot] == nullptr) return FORTAI_CUDA_OK;
+    ggml_backend_event_t output_event = nullptr;
+    if (fortai_cuda_q4_next_event(context, slot, context->producer_event,
+            context->producer_event_index, &output_event) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    /* The graph and the event use the same GGML stream.  Once recorded, the
+     * downstream Fortran stream can wait without a host-visible scheduler
+     * barrier, preserving the dependency for the next native CUDA op. */
+    ggml_backend_event_record(output_event, backend);
+    if (cudaSetDevice(device) != cudaSuccess ||
+        cudaStreamWaitEvent(context->consumer_stream[slot],
+            fortai_cuda_event_handle(output_event), 0) != cudaSuccess)
         return FORTAI_CUDA_RUNTIME_ERROR;
     return FORTAI_CUDA_OK;
 }
@@ -191,7 +234,9 @@ int fortai_cuda_q4_context_create(int first_device, int second_device,
     for (int slot = 0; slot < 2; ++slot) {
         cudaSetDevice(created->device_ids[slot]);
         for (int event = 0; event < fortai_cuda_q4_context::event_slots; ++event) {
-            if (cudaEventCreateWithFlags(&created->producer_event[slot][event], cudaEventDisableTiming) != cudaSuccess) {
+            created->producer_event[slot][event] = ggml_backend_event_new(
+                ggml_backend_get_device(created->devices[slot]));
+            if (created->producer_event[slot][event] == nullptr) {
                 fortai_cuda_q4_context_destroy(created);
                 return FORTAI_CUDA_RUNTIME_ERROR;
             }
@@ -206,7 +251,8 @@ int fortai_cuda_q4_context_destroy(fortai_cuda_q4_context * context) {
     for (int i = 0; i < 2; ++i) {
         cudaSetDevice(context->device_ids[i]);
         for (int event = 0; event < fortai_cuda_q4_context::event_slots; ++event) {
-            if (context->producer_event[i][event] != nullptr) cudaEventDestroy(context->producer_event[i][event]);
+            if (context->producer_event[i][event] != nullptr)
+                ggml_backend_event_free(context->producer_event[i][event]);
         }
         cudaFree(context->bridge_activation[i]);
         cudaFree(context->bridge_output[i]);
@@ -522,11 +568,17 @@ int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
     const bool remote = weights->device != primary_device;
     if (fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK)
         return FORTAI_CUDA_RUNTIME_ERROR;
+
     int bridge_slot = -1;
     void *activation_ptr = const_cast<void *>(device_activation);
     void *output_ptr = device_output;
     if (remote) {
         if (weights->device != context->device_ids[1]) return FORTAI_CUDA_INVALID;
+        /* Host staging is synchronous and cannot observe a dependency queued
+         * on the producer stream.  Finish that stream before reading it. */
+        if (context->consumer_stream[0] != nullptr &&
+            cudaStreamSynchronize(context->consumer_stream[0]) != cudaSuccess)
+            return FORTAI_CUDA_RUNTIME_ERROR;
         bridge_slot = 1;
         int code = fortai_cuda_q4_ensure_bridge(context, bridge_slot, activation_bytes, output_bytes);
         if (code != FORTAI_CUDA_OK) return code;
@@ -545,7 +597,10 @@ int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
     weights->activation->data = activation_ptr;
     weights->output->data = output_ptr;
     enum ggml_status status = ggml_backend_graph_compute_async(weights->backend, weights->graph);
-    if (status == GGML_STATUS_SUCCESS)
+    if (status == GGML_STATUS_SUCCESS && !remote &&
+        fortai_cuda_q4_publish_output(context, weights->backend, weights->device) != FORTAI_CUDA_OK)
+        status = GGML_STATUS_FAILED;
+    if (status == GGML_STATUS_SUCCESS && remote)
         ggml_backend_synchronize(weights->backend);
     restore_edges();
     if (status == GGML_STATUS_SUCCESS && remote) {
@@ -600,6 +655,18 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
     }
 
     if (fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+
+    bool has_remote = false;
+    for (int i = 0; i < count; ++i) {
+        if (weights[i]->device != primary_device) {
+            has_remote = true;
+            break;
+        }
+    }
+    if (has_remote && context->consumer_stream[0] != nullptr &&
+        cudaSetDevice(primary_device) == cudaSuccess &&
+        cudaStreamSynchronize(context->consumer_stream[0]) != cudaSuccess)
         return FORTAI_CUDA_RUNTIME_ERROR;
 
     bool done[3] = {false, false, false};
@@ -661,7 +728,10 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
             }
         };
         enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
-        if (status == GGML_STATUS_SUCCESS) ggml_backend_synchronize(plan->backend);
+        if (status == GGML_STATUS_SUCCESS && !remote &&
+            fortai_cuda_q4_publish_output(context, plan->backend, device) != FORTAI_CUDA_OK)
+            status = GGML_STATUS_FAILED;
+        if (status == GGML_STATUS_SUCCESS && remote) ggml_backend_synchronize(plan->backend);
         if (status != GGML_STATUS_SUCCESS) {
             restore_edges();
             return FORTAI_CUDA_RUNTIME_ERROR;

@@ -227,6 +227,11 @@ module fortai_qwen35_cpu
         type(cuda_q4_context_t) :: cuda_q4
         type(cuda_q4_weights_t), allocatable :: cuda_q4_weights(:)
         integer, allocatable :: cuda_q4_weight_device(:)
+        ! Placement of the long-context attention state.  Q4 weights follow
+        ! the requested tensor split, while the much larger KV state is
+        ! assigned per layer so a full primary device does not force the
+        ! remaining layers back to host execution.
+        logical, allocatable :: cuda_attention_on_second_layer(:)
         type(c_ptr), allocatable :: cuda_attn_norm(:)
         type(c_ptr), allocatable :: cuda_post_norm(:)
         type(c_ptr) :: cuda_x = c_null_ptr
@@ -680,7 +685,7 @@ contains
         type(status_t) :: cleanup_stat
         integer :: i, j, rows, width, q4_device, q4_second_device, q8_second_device
         integer(int64) :: q4_bytes(2)
-        logical :: have_q4, q4_split, second_context_requested
+        logical :: have_q4, q4_split, second_context_requested, attention_created
         logical :: tensor_split_custom
         real(real64) :: tensor_split_fraction(2), tensor_split_sum
         character(len=8) :: resident_env
@@ -740,6 +745,7 @@ contains
             deallocate(self%cuda_q4_weights)
         end if
         if (allocated(self%cuda_q4_weight_device)) deallocate(self%cuda_q4_weight_device)
+        if (allocated(self%cuda_attention_on_second_layer)) deallocate(self%cuda_attention_on_second_layer)
         call self%cuda_q4%destroy(cleanup_stat)
         self%cuda_enabled = .false.
         self%cuda_q4_resident = .false.
@@ -946,6 +952,8 @@ contains
                 return
             end if
         end if
+        allocate(self%cuda_attention_on_second_layer(size(self%layers)))
+        self%cuda_attention_on_second_layer = .false.
         do i = 1, size(self%layers)
             if (.not. self%layers(i)%recurrent) cycle
             if (all_q8_recurrent_weights(self, i)) then
@@ -1007,24 +1015,58 @@ contains
                     self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
                     self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
                     self%norm_epsilon, cleanup_stat, self%cache_key_q8, self%cache_value_q8)
-            else if (cuda_attention_on_second(self, i)) then
-                call self%layers(i)%cuda_attention%create_state(self%cuda_second, &
-                    self%file%tensors(self%layers(i)%q_norm)%bytes, &
-                    int(size(self%file%tensors(self%layers(i)%q_norm)%bytes), c_size_t), &
-                    self%file%tensors(self%layers(i)%k_norm)%bytes, &
-                    int(size(self%file%tensors(self%layers(i)%k_norm)%bytes), c_size_t), &
-                    self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
-                    self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
-                    self%norm_epsilon, cleanup_stat, self%cache_key_q8, self%cache_value_q8)
             else
-                call self%layers(i)%cuda_attention%create_state(self%cuda, &
-                    self%file%tensors(self%layers(i)%q_norm)%bytes, &
-                    int(size(self%file%tensors(self%layers(i)%q_norm)%bytes), c_size_t), &
-                    self%file%tensors(self%layers(i)%k_norm)%bytes, &
-                    int(size(self%file%tensors(self%layers(i)%k_norm)%bytes), c_size_t), &
-                    self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
-                    self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
-                    self%norm_epsilon, cleanup_stat, self%cache_key_q8, self%cache_value_q8)
+                attention_created = .false.
+                ! An explicit split-attention request is a placement
+                ! preference, not a requirement: if the second device cannot
+                ! allocate this state, retain the primary-device fallback.
+                if (cuda_attention_split_requested(self, i)) then
+                    if (c_associated(self%cuda_second%handle)) then
+                        call self%layers(i)%cuda_attention%create_state(self%cuda_second, &
+                            self%file%tensors(self%layers(i)%q_norm)%bytes, &
+                            int(size(self%file%tensors(self%layers(i)%q_norm)%bytes), c_size_t), &
+                            self%file%tensors(self%layers(i)%k_norm)%bytes, &
+                            int(size(self%file%tensors(self%layers(i)%k_norm)%bytes), c_size_t), &
+                            self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
+                            self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
+                            self%norm_epsilon, cleanup_stat, self%cache_key_q8, self%cache_value_q8)
+                        if (cleanup_stat%is_ok()) then
+                            self%cuda_attention_on_second_layer(i) = .true.
+                            attention_created = .true.
+                        end if
+                    end if
+                end if
+                if (.not. attention_created) then
+                    call self%layers(i)%cuda_attention%create_state(self%cuda, &
+                        self%file%tensors(self%layers(i)%q_norm)%bytes, &
+                        int(size(self%file%tensors(self%layers(i)%q_norm)%bytes), c_size_t), &
+                        self%file%tensors(self%layers(i)%k_norm)%bytes, &
+                        int(size(self%file%tensors(self%layers(i)%k_norm)%bytes), c_size_t), &
+                        self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
+                        self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
+                        self%norm_epsilon, cleanup_stat, self%cache_key_q8, self%cache_value_q8)
+                    if (cleanup_stat%is_ok()) attention_created = .true.
+                end if
+                ! Allocation failure is normally device-local.  Retry on the
+                ! second configured GPU so the resident pipeline can keep all
+                ! layers on CUDA at the production context length.
+                if (.not. attention_created .and. c_associated(self%cuda_second%handle)) then
+                    call self%layers(i)%cuda_attention%create_state(self%cuda_second, &
+                        self%file%tensors(self%layers(i)%q_norm)%bytes, &
+                        int(size(self%file%tensors(self%layers(i)%q_norm)%bytes), c_size_t), &
+                        self%file%tensors(self%layers(i)%k_norm)%bytes, &
+                        int(size(self%file%tensors(self%layers(i)%k_norm)%bytes), c_size_t), &
+                        self%attention_heads, self%attention_heads_kv, self%attention_head_size, &
+                        self%value_length, int(self%max_context), self%rope_dimension, self%rope_base, &
+                        self%norm_epsilon, cleanup_stat, self%cache_key_q8, self%cache_value_q8)
+                    if (cleanup_stat%is_ok()) then
+                        self%cuda_attention_on_second_layer(i) = .true.
+                        attention_created = .true.
+                    end if
+                end if
+                ! Keep the existing host fallback for genuinely unsupported
+                ! attention shapes or when both GPUs are out of memory.
+                if (.not. attention_created) call cleanup_stat%clear()
             end if
             if (.not. cleanup_stat%is_ok()) call cleanup_stat%clear()
         end do
@@ -1256,12 +1298,26 @@ contains
                 self%file%tensors(self%layers(i)%post_norm)%bytes, hidden_bytes, stat)
             if (.not. stat%is_ok()) return
         end do
+        ! All weight and normalization uploads are asynchronous.  Complete
+        ! both Q8 streams before asking the file mapping to discard resident
+        ! pages; CUDA must never be handed a page that MADV_DONTNEED can
+        ! reclaim while a DMA transfer is in flight.
+        call self%cuda%synchronize(stat)
+        if (.not. stat%is_ok()) return
+        if (c_associated(self%cuda_second%handle)) then
+            call self%cuda_second%synchronize(stat)
+            if (.not. stat%is_ok()) return
+        end if
         self%cuda_device_pipeline = .true.
         ! GGML Q4 operations use their own CUDA scheduler stream.  Keep the
         ! resident mixed-quant pipeline deterministic; a graph capture of the
         ! Q8 stream cannot capture work submitted to that second scheduler.
         if (self%cuda_q4_resident) self%cuda_graph_enabled = .false.
         call release_host_attention_caches(self)
+        ! Device-resident base weights no longer need physical host pages.
+        ! Keep the token embedding because Q4 get-rows remains on the
+        ! validated host path, and keep any non-mapped MTP sidecar tensors.
+        call self%file%evict_mapped_payloads(self%token_embedding)
     end subroutine setup_cuda_device_pipeline
 
     subroutine release_host_attention_caches(self)
@@ -1369,6 +1425,7 @@ contains
             deallocate(self%cuda_q4_weights)
         end if
         if (allocated(self%cuda_q4_weight_device)) deallocate(self%cuda_q4_weight_device)
+        if (allocated(self%cuda_attention_on_second_layer)) deallocate(self%cuda_attention_on_second_layer)
         call self%cuda_q4%destroy(cuda_stat)
         call self%cuda_second%destroy(cuda_stat)
         call self%cuda%destroy(cuda_stat)
@@ -2668,7 +2725,7 @@ contains
         cuda_attention_device_ready = .true.
     end function cuda_attention_device_ready
 
-    logical function cuda_attention_on_second(self, layer_index)
+    logical function cuda_attention_split_requested(self, layer_index)
         class(qwen35_cpu_model_t), intent(in) :: self
         integer, intent(in) :: layer_index
         integer :: indices(4), i
@@ -2676,7 +2733,7 @@ contains
         character(len=16) :: split_attention_value
         integer :: split_attention_length
 
-        cuda_attention_on_second = .false.
+        cuda_attention_split_requested = .false.
         if (.not. self%cuda_q4_split .or. .not. allocated(self%cuda_q4_weight_device)) return
         split_attention_value = ''
         call get_environment_variable('FORTAI_CUDA_Q4_SPLIT_ATTENTION', split_attention_value, &
@@ -2709,7 +2766,17 @@ contains
         ! primary stream, so alternating full-attention layers keeps the
         ! q8_0 KV allocation balanced even when a layer's four projections
         ! straddle the requested tensor split.
-        cuda_attention_on_second = mod(layer_index / 4, 2) == 0 .and. c_associated(self%cuda_second%handle)
+        cuda_attention_split_requested = mod(layer_index / 4, 2) == 0 .and. c_associated(self%cuda_second%handle)
+    end function cuda_attention_split_requested
+
+    logical function cuda_attention_on_second(self, layer_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: layer_index
+
+        cuda_attention_on_second = .false.
+        if (.not. allocated(self%cuda_attention_on_second_layer)) return
+        if (layer_index <= 0 .or. layer_index > size(self%cuda_attention_on_second_layer)) return
+        cuda_attention_on_second = self%cuda_attention_on_second_layer(layer_index)
     end function cuda_attention_on_second
 
     logical function cuda_recurrent_projection_ready(self, layer)

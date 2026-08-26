@@ -159,6 +159,13 @@ profile. Qwen3.8-style embedded NextN/MTP heads are also bound by the native
 Fortran Qwen3.5 runtime. Set `FORTAI_NATIVE_MTP=1` (or
 `FORTAI_SPEC_TYPE=draft-mtp`) to enable the native MTP path; a configured
 head-only draft whose name contains `mtp` enables the same path automatically.
+GGUF tensor payloads use a read-only file mapping by default (`--load-mode
+auto`/`mmap`), matching llama.cpp's demand-paged ownership model and avoiding a
+second heap copy during startup. `--load-mode none` (or `--no-mmap`) selects
+the explicit read-copy fallback for diagnostics. After a successful
+device-resident CUDA setup, file-backed pages for uploaded weights are
+discarded while the CPU embedding and any host-controlled MTP tensors remain
+available.
 It keeps greedy target output exact and uses the CUDA-resident target pipeline
 whenever the KV allocation fits, with a host-controlled NextN verification
 handoff. The
@@ -210,8 +217,10 @@ ring handles the cross-context handoff on hosts without peer access. Set
 `FORTAI_ENABLE_CUDA_Q4_DEVICE_PIPELINE=0`) to select the host-boundary route.
 Native `draft-mtp` keeps only the NextN verification head on the host; the
 target decode remains resident when the configured context fits in VRAM. If a
-single large attention KV allocation cannot fit, FortAI retains the other
-resident layers and crosses an explicit host boundary only for that layer.
+single large attention KV allocation cannot fit on the primary GPU, FortAI
+retries the configured second GPU and records the per-layer placement. It
+retains the other resident layers and crosses an explicit host boundary only
+when both devices reject that layer's allocation.
 Multimodal
 projector paths are accepted and surfaced in `/health`; image-token execution
 is not yet part of the native Qwen runtime. A standalone `--model-draft` is

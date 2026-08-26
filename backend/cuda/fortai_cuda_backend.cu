@@ -1145,7 +1145,14 @@ extern "C" int fortai_cuda_q8_context_create(int device,
 extern "C" int fortai_cuda_memory_info(int device, size_t *free_bytes,
     size_t *total_bytes) {
     if (device < 0 || !free_bytes || !total_bytes) return FORTAI_CUDA_INVALID;
-    if (cudaSetDevice(device) != cudaSuccess) return FORTAI_CUDA_RUNTIME_ERROR;
+    /* The model runner probes the optional second board before creating its
+     * primary context.  An absent ordinal must not leave a sticky CUDA error
+     * for the first subsequent kernel launch on a valid device. */
+    const cudaError_t set_error = cudaSetDevice(device);
+    if (set_error != cudaSuccess) {
+        (void) cudaGetLastError();
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     const cudaError_t error = cudaMemGetInfo(free_bytes, total_bytes);
     return error == cudaSuccess ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
 }
@@ -1243,7 +1250,11 @@ extern "C" int fortai_cuda_q8_weights_upload(fortai_cuda_q8_context *context,
     if (error == cudaSuccess)
         error = cudaMemcpyAsync(created->impl.device_data, host_weights, expected,
             cudaMemcpyHostToDevice, context->impl.stream);
-    if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+    /* Uploads are queued on the context stream.  Callers submit the complete
+     * weight set before the one-time context fence in the model setup path;
+     * keeping that fence out of this per-tensor routine removes an O(tensor
+     * count) host round-trip from large GGUF loads while preserving stream
+     * ordering for every subsequent matvec. */
     if (error != cudaSuccess) {
         cudaFree(created->impl.device_data);
         delete created;
@@ -1764,7 +1775,9 @@ extern "C" int fortai_cuda_qwen35_recurrent_create(fortai_cuda_q8_context *conte
             static_cast<size_t>(conv_kernel - 1) * conv_size * sizeof(float), context->impl.stream);
         if (error == cudaSuccess) error = cudaMemsetAsync(created->impl.gdn_state, 0,
             static_cast<size_t>(value_heads) * head_size * head_size * sizeof(float), context->impl.stream);
-        if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+        /* State initialization is queued on the context stream.  The model
+         * setup path performs one fence after all layers are created; a
+         * per-layer synchronize here needlessly serializes large GGUF loads. */
         if (error != cudaSuccess) {
             free_recurrent_device_buffers(&created->impl);
             delete created;
@@ -1827,7 +1840,9 @@ extern "C" int fortai_cuda_qwen35_recurrent_create_state(
         static_cast<size_t>(conv_kernel - 1) * conv_size * sizeof(float), context->impl.stream);
     if (error == cudaSuccess) error = cudaMemsetAsync(created->impl.gdn_state, 0,
         static_cast<size_t>(value_heads) * head_size * head_size * sizeof(float), context->impl.stream);
-    if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+    /* The caller fences the complete model setup once all recurrent states
+     * have been created.  Keep initialization stream-ordered without a
+     * host round-trip for every layer. */
     if (error != cudaSuccess) {
         free_recurrent_device_buffers(&created->impl);
         delete created;
@@ -2187,7 +2202,8 @@ extern "C" int fortai_cuda_qwen35_attention_create(
             static_cast<void *>(created->impl.value_cache);
         error = cudaMemsetAsync(cache, 0, bytes, context->impl.stream);
     }
-    if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+    /* Attention state uploads and cache clears are ordered on this context's
+     * stream; setup performs the single completion fence after all layers. */
     if (error != cudaSuccess) {
         free_attention_device_buffers(&created->impl);
         delete created;
@@ -2273,7 +2289,9 @@ extern "C" int fortai_cuda_qwen35_attention_create_state(
             static_cast<void *>(created->impl.value_cache);
         error = cudaMemsetAsync(cache, 0, bytes, context->impl.stream);
     }
-    if (error == cudaSuccess) error = cudaStreamSynchronize(context->impl.stream);
+    /* Do not fence each attention state during model construction.  All
+     * subsequent operations use the same stream and setup synchronizes it
+     * once after the complete resident graph is assembled. */
     if (error != cudaSuccess) {
         free_attention_device_buffers(&created->impl);
         delete created;

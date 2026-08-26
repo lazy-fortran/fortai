@@ -1,11 +1,40 @@
 module fortai_gguf_runtime
-    use, intrinsic :: iso_c_binding, only: c_float, c_int, c_int8_t, c_int64_t, c_size_t
+    use, intrinsic :: iso_c_binding, only: c_associated, c_char, c_f_pointer, c_float, c_int, c_int8_t, &
+        c_int64_t, c_null_char, c_null_ptr, c_ptr, c_size_t
     use, intrinsic :: iso_fortran_env, only: int8, int16, int32, int64, real32, real64
     use fortai_status, only: FORTAI_INVALID, FORTAI_IO_ERROR, FORTAI_UNSUPPORTED, status_t
     implicit none
     private
 
     interface
+        function fortai_gguf_mmap_file(path, size_out) bind(C, name='fortai_gguf_mmap_file') result(mapping)
+            import c_char, c_ptr, c_size_t
+            character(kind=c_char), intent(in) :: path(*)
+            integer(c_size_t), intent(out) :: size_out
+            type(c_ptr) :: mapping
+        end function fortai_gguf_mmap_file
+
+        function fortai_gguf_mmap_slice(mapping, offset, size, mapped_size) &
+                bind(C, name='fortai_gguf_mmap_slice') result(slice)
+            import c_ptr, c_size_t
+            type(c_ptr), value, intent(in) :: mapping
+            integer(c_size_t), value, intent(in) :: offset, size, mapped_size
+            type(c_ptr) :: slice
+        end function fortai_gguf_mmap_slice
+
+        subroutine fortai_gguf_munmap_file(mapping, size) bind(C, name='fortai_gguf_munmap_file')
+            import c_ptr, c_size_t
+            type(c_ptr), value, intent(in) :: mapping
+            integer(c_size_t), value, intent(in) :: size
+        end subroutine fortai_gguf_munmap_file
+
+        integer(c_int) function fortai_gguf_mmap_evict(mapping, offset, size, mapped_size) &
+                bind(C, name='fortai_gguf_mmap_evict')
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value, intent(in) :: mapping
+            integer(c_size_t), value, intent(in) :: offset, size, mapped_size
+        end function fortai_gguf_mmap_evict
+
         function fortai_q8_dot(weights, quantized, scales, row, block_count) &
                 bind(C, name='fortai_q8_dot') result(value)
             import c_float, c_int8_t, c_int64_t
@@ -145,7 +174,8 @@ module fortai_gguf_runtime
         integer(int32) :: value_type = -1_int32
         integer(int64) :: file_offset = 0_int64
         integer(int64) :: byte_count = 0_int64
-        integer(int8), allocatable :: bytes(:)
+        integer(int8), pointer, contiguous :: bytes(:) => null()
+        logical :: bytes_mapped = .false.
         real(real32), allocatable :: decoded_values(:)
     contains
         procedure :: dot => gguf_tensor_dot
@@ -165,6 +195,9 @@ module fortai_gguf_runtime
         integer(int64) :: alignment = 32_int64
         type(gguf_meta_t), allocatable :: metadata(:)
         type(gguf_tensor_t), allocatable :: tensors(:)
+        type(c_ptr) :: mapped_base = c_null_ptr
+        integer(c_size_t) :: mapped_size = 0_c_size_t
+        logical :: mapped = .false.
     contains
         procedure :: close => gguf_file_close
         procedure :: find_meta => gguf_file_find_meta
@@ -172,6 +205,7 @@ module fortai_gguf_runtime
         procedure :: meta_int => gguf_file_meta_int
         procedure :: meta_real => gguf_file_meta_real
         procedure :: open => gguf_file_open
+        procedure :: evict_mapped_payloads => gguf_file_evict_mapped_payloads
     end type gguf_file_t
 
     public :: gguf_fp16_to_real, gguf_quant_cache_clear
@@ -183,13 +217,51 @@ contains
         call fortai_ggml_quant_cache_clear()
     end subroutine gguf_quant_cache_clear
 
-    subroutine gguf_file_open(self, path, stat)
+    logical function gguf_mmap_requested()
+        character(len=32) :: value
+        integer :: length
+
+        ! mmap is the default because it avoids a second heap copy of a GGUF
+        ! and lets the OS fault model pages in on demand.  Keep an explicit
+        ! copy path for diagnostics and for callers that need mutable bytes.
+        gguf_mmap_requested = .true.
+        value = ''
+        call get_environment_variable('FORTAI_LOAD_MODE', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_LOAD_MODE', value, length=length)
+        if (length > 0) then
+            select case (trim(value(:min(length, len(value)))))
+            case ('none', 'dio', 'copy')
+                gguf_mmap_requested = .false.
+            case ('auto', 'mmap', 'mmap+mlock', 'mlock')
+                gguf_mmap_requested = .true.
+            end select
+        end if
+        value = ''
+        call get_environment_variable('FORTAI_NO_MMAP', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_NO_MMAP', value, length=length)
+        if (length > 0) then
+            select case (trim(value(:min(length, len(value)))))
+            case ('1', 'true', 'on', 'yes')
+                gguf_mmap_requested = .false.
+            case ('0', 'false', 'off', 'no')
+                gguf_mmap_requested = .true.
+            end select
+        end if
+    end function gguf_mmap_requested
+
+    subroutine gguf_file_open(self, path, stat, mmap_payload)
         class(gguf_file_t), intent(inout) :: self
         character(len=*), intent(in) :: path
         type(status_t), intent(out) :: stat
+        logical, intent(in), optional :: mmap_payload
         character(len=4) :: magic
         integer(int32) :: i, j, io_status, unit, value_type, rank32
         integer(int64) :: count, elements, position
+        integer :: path_length
+        integer(c_size_t) :: mapped_size_c, tensor_offset_c
+        character(kind=c_char), allocatable :: cpath(:)
+        type(c_ptr) :: tensor_slice
+        logical :: use_mmap
 
         call self%close()
         call stat%clear()
@@ -262,14 +334,45 @@ contains
 
         inquire (unit=unit, pos=position)
         self%data_start = align_up(position - 1_int64, self%alignment)
+        use_mmap = gguf_mmap_requested()
+        if (present(mmap_payload)) use_mmap = mmap_payload
+        if (use_mmap) then
+            path_length = len_trim(path)
+            if (path_length > 0) then
+                allocate(cpath(path_length + 1))
+                do i = 1, path_length
+                    cpath(i) = path(i:i)
+                end do
+                cpath(path_length + 1) = c_null_char
+                self%mapped_base = fortai_gguf_mmap_file(cpath, mapped_size_c)
+                deallocate(cpath)
+                if (c_associated(self%mapped_base)) then
+                    self%mapped_size = mapped_size_c
+                    self%mapped = .true.
+                end if
+            end if
+        end if
         do i = 1, int(self%tensor_count)
-            allocate (self%tensors(i)%bytes(self%tensors(i)%byte_count))
-            read (unit, pos=self%data_start + self%tensors(i)%file_offset + 1_int64, &
-                iostat=io_status) self%tensors(i)%bytes
-            if (io_status /= 0) then
-                close (unit)
-                call stat%set(FORTAI_IO_ERROR, 'could not read GGUF tensor data')
-                return
+            self%tensors(i)%bytes_mapped = .false.
+            tensor_offset_c = int(self%data_start + self%tensors(i)%file_offset, c_size_t)
+            if (self%mapped .and. self%tensors(i)%byte_count <= int(huge(0), int64)) then
+                tensor_slice = fortai_gguf_mmap_slice(self%mapped_base, tensor_offset_c, &
+                    int(self%tensors(i)%byte_count, c_size_t), self%mapped_size)
+                if (c_associated(tensor_slice)) then
+                    call c_f_pointer(tensor_slice, self%tensors(i)%bytes, &
+                        [int(self%tensors(i)%byte_count)])
+                    self%tensors(i)%bytes_mapped = .true.
+                end if
+            end if
+            if (.not. self%tensors(i)%bytes_mapped) then
+                allocate (self%tensors(i)%bytes(self%tensors(i)%byte_count))
+                read (unit, pos=self%data_start + self%tensors(i)%file_offset + 1_int64, &
+                    iostat=io_status) self%tensors(i)%bytes
+                if (io_status /= 0) then
+                    close (unit)
+                    call stat%set(FORTAI_IO_ERROR, 'could not read GGUF tensor data')
+                    return
+                end if
             end if
             call decode_small_tensor(self%tensors(i))
         end do
@@ -282,7 +385,14 @@ contains
 
         if (allocated(self%tensors)) then
             do i = 1, size(self%tensors)
-                if (allocated(self%tensors(i)%bytes)) deallocate (self%tensors(i)%bytes)
+                if (associated(self%tensors(i)%bytes)) then
+                    if (self%tensors(i)%bytes_mapped) then
+                        nullify(self%tensors(i)%bytes)
+                    else
+                        deallocate (self%tensors(i)%bytes)
+                    end if
+                end if
+                self%tensors(i)%bytes_mapped = .false.
                 if (allocated(self%tensors(i)%decoded_values)) &
                     deallocate (self%tensors(i)%decoded_values)
                 if (allocated(self%tensors(i)%shape)) deallocate (self%tensors(i)%shape)
@@ -307,11 +417,33 @@ contains
             end do
             deallocate (self%metadata)
         end if
+        if (self%mapped) call fortai_gguf_munmap_file(self%mapped_base, self%mapped_size)
+        self%mapped_base = c_null_ptr
+        self%mapped_size = 0_c_size_t
+        self%mapped = .false.
         self%version = 0_int32
         self%tensor_count = 0_int64
         self%metadata_count = 0_int64
         self%data_start = 0_int64
     end subroutine gguf_file_close
+
+    subroutine gguf_file_evict_mapped_payloads(self, keep_index)
+        class(gguf_file_t), intent(in) :: self
+        integer, intent(in), optional :: keep_index
+        integer :: i, keep
+        integer(c_int) :: code
+        integer(c_size_t) :: tensor_offset
+
+        if (.not. self%mapped .or. .not. c_associated(self%mapped_base)) return
+        keep = 0
+        if (present(keep_index)) keep = keep_index
+        do i = 1, size(self%tensors)
+            if (i == keep .or. .not. self%tensors(i)%bytes_mapped) cycle
+            tensor_offset = int(self%data_start + self%tensors(i)%file_offset, c_size_t)
+            code = fortai_gguf_mmap_evict(self%mapped_base, tensor_offset, &
+                int(self%tensors(i)%byte_count, c_size_t), self%mapped_size)
+        end do
+    end subroutine gguf_file_evict_mapped_payloads
 
     integer function gguf_file_find_meta(self, key)
         class(gguf_file_t), intent(in) :: self
@@ -382,7 +514,7 @@ contains
         real(real32), allocatable :: decoded(:)
 
         gguf_tensor_value = 0.0_real32
-        if (.not. allocated(self%bytes)) return
+        if (.not. associated(self%bytes)) return
         if (index < 1_int64 .or. index > tensor_elements(self%shape)) return
         if (allocated(self%decoded_values)) then
             gguf_tensor_value = self%decoded_values(index)
