@@ -1,7 +1,9 @@
 program fortai_server
     use, intrinsic :: iso_c_binding, only: c_char, c_int
-    use, intrinsic :: iso_fortran_env, only: error_unit, output_unit
+    use, intrinsic :: iso_fortran_env, only: error_unit, output_unit, int32
     use fortai_native_service, only: fortai_native_service_close, fortai_native_service_init
+    use fortai_status, only: status_t
+    use fortai_whisper_service, only: fortai_whisper_service_close, fortai_whisper_service_init
     use fortai_string, only: string_t
     implicit none
 
@@ -36,11 +38,12 @@ program fortai_server
     end interface
 
     type(server_config_t) :: config
-    logical :: okay, show_help, show_version, show_devices, show_cache_list, show_completion
+    logical :: okay, show_help, show_version, show_devices, show_cache_list, show_completion, whisper_mode
     integer(c_int) :: status, vocab, layers
     integer :: require_cuda
     character(kind=c_char), allocatable :: cmodel(:), chost(:)
     character(len=32) :: number
+    type(status_t) :: whisper_status
 
     call parse_arguments(config, okay, show_help, show_version, show_devices, show_cache_list, show_completion)
     if (show_help) then
@@ -71,6 +74,7 @@ program fortai_server
     if (config%threads <= 0) config%threads = int(fortai_server_online_cpus())
     if (config%threads <= 0) config%threads = 1
     call configure_environment(config)
+    whisper_mode = is_whisper_model_path(config%model%as_character())
 
     allocate(cmodel(config%model%length() + 1), chost(config%host%length() + 1))
     call config%model%to_c(cmodel, size(cmodel))
@@ -81,17 +85,31 @@ program fortai_server
         ' alias=' // config%alias%as_character() // &
         ' host=' // config%host%as_character() // ' port=' // trim(int_text(config%port)) // &
         ' threads=' // trim(int_text(config%threads)) // ' gpu_layers=' // trim(number)
-    status = fortai_native_service_init(cmodel, int(config%context_size, c_int), int(config%threads, c_int), &
-        int(config%gpu_layers, c_int), int(config%main_gpu, c_int), int(require_cuda, c_int), vocab, layers)
-    if (status /= 0_c_int) then
-        write(error_unit, '(a)') 'fortai-server: FortAI model context creation failed'
-        error stop 1
+    if (whisper_mode) then
+        call fortai_whisper_service_init(config%model%as_character(), config%gpu_layers > 0, &
+            int(config%main_gpu, int32), whisper_flash_enabled(), int(config%threads, int32), whisper_status)
+        if (.not. whisper_status%is_ok()) then
+            write(error_unit, '(a)') 'fortai-server: native Whisper initialization failed: ' // whisper_status%message
+            error stop 1
+        end if
+        write(error_unit, '(a)') 'FORTAI_SERVER_READY=1 backend=fortai-whisper'
+    else
+        status = fortai_native_service_init(cmodel, int(config%context_size, c_int), int(config%threads, c_int), &
+            int(config%gpu_layers, c_int), int(config%main_gpu, c_int), int(require_cuda, c_int), vocab, layers)
+        if (status /= 0_c_int) then
+            write(error_unit, '(a)') 'fortai-server: FortAI model context creation failed'
+            error stop 1
+        end if
+        write(error_unit, '(a)') 'FORTAI_SERVER_READY=1 vocab=' // trim(int_text(int(vocab))) // &
+            ' layers=' // trim(int_text(int(layers)))
     end if
-    write(error_unit, '(a)') 'FORTAI_SERVER_READY=1 vocab=' // trim(int_text(int(vocab))) // &
-        ' layers=' // trim(int_text(int(layers)))
     status = fortai_http_transport_run(chost, int(config%port, c_int), cmodel, &
         int(merge(1, 0, config%gpu_layers > 0), c_int))
-    call fortai_native_service_close()
+    if (whisper_mode) then
+        call fortai_whisper_service_close()
+    else
+        call fortai_native_service_close()
+    end if
     if (status /= 0_c_int) error stop 1
 
 contains
@@ -1265,6 +1283,53 @@ contains
         character(len=32) :: text
         write(text, '(i0)') value
     end function int_text
+
+    logical function is_whisper_model_path(path)
+        character(len=*), intent(in) :: path
+        character(len=:), allocatable :: lowered
+        integer :: i, code, n, suffix_length
+
+        lowered = trim(path)
+        do i = 1, len(lowered)
+            code = iachar(lowered(i:i))
+            if (code >= iachar('A') .and. code <= iachar('Z')) lowered(i:i) = achar(code + 32)
+        end do
+        is_whisper_model_path = .false.
+        do n = 1, 2
+            if (n == 1) then
+                suffix_length = 4
+                if (len(lowered) >= suffix_length) then
+                    if (lowered(len(lowered)-suffix_length+1:) == '.bin') is_whisper_model_path = .true.
+                end if
+            else
+                suffix_length = 5
+                if (len(lowered) >= suffix_length) then
+                    if (lowered(len(lowered)-suffix_length+1:) == '.ggml') is_whisper_model_path = .true.
+                end if
+            end if
+        end do
+    end function is_whisper_model_path
+
+    logical function whisper_flash_enabled()
+        character(len=64) :: raw
+        integer :: length, i, code
+
+        raw = ''
+        call get_environment_variable('FORTAI_FLASH_ATTN', raw, length=length)
+        if (length <= 0) then
+            call get_environment_variable('LLAMACPP_FLASH_ATTN', raw, length=length)
+        end if
+        whisper_flash_enabled = .true.
+        if (length <= 0 .or. length > len(raw)) return
+        do i = 1, length
+            code = iachar(raw(i:i))
+            if (code >= iachar('A') .and. code <= iachar('Z')) raw(i:i) = achar(code + 32)
+        end do
+        select case (trim(raw(:length)))
+        case ('0', 'off', 'false', 'no', 'disabled')
+            whisper_flash_enabled = .false.
+        end select
+    end function whisper_flash_enabled
 
     subroutine argument_text_at(index, text)
         integer, intent(in) :: index

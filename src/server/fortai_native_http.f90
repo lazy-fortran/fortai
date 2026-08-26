@@ -13,6 +13,7 @@ module fortai_native_http
         fortai_native_service_mtp_active, fortai_native_service_external_draft_active, &
         fortai_native_service_mtp_sidecar_active, fortai_native_service_device_pipeline, &
         fortai_native_service_context_size
+    use fortai_whisper_service, only: fortai_whisper_http_handle
     use fortai_string, only: string_t
     implicit none
     private
@@ -2548,8 +2549,8 @@ contains
         logical :: temperature_valid, max_tokens_valid
         logical :: top_p_valid, min_p_valid, repeat_penalty_valid, presence_penalty_valid
         logical :: frequency_penalty_valid, top_k_valid, repeat_last_n_valid, sampling_valid
-        logical :: prompt_array
-        character(len=:), allocatable :: path_value
+        logical :: prompt_array, whisper_model
+        character(len=:), allocatable :: path_value, model_path
         character(len=:), allocatable :: reasoning_format, reasoning_effort
         integer :: reasoning_budget
 
@@ -2560,6 +2561,13 @@ contains
         request_count = request_count + 1_int64
         call request_text%from_c(request, int(request_length))
         call model_path_text%from_c(model)
+        model_path = model_path_text%as_character()
+        whisper_model = is_whisper_model_path(model_path)
+        if (whisper_model) then
+            fortai_native_http_handle = fortai_whisper_http_handle(request, request_length, model, cuda, response, &
+                response_capacity, response_length, status, content_type, content_type_capacity)
+            return
+        end if
         model_text = model_path_text
         call server_model_id(model_text)
         call parse_http_request(request_text, method, path, body, okay)
@@ -3710,6 +3718,30 @@ contains
         call string_to_c_literal(mime, content_type, int(content_type_capacity))
         code = 0_c_int
     end subroutine copy_result
+
+    logical function is_whisper_model_path(path)
+        character(len=*), intent(in) :: path
+        character(len=:), allocatable :: lowered
+        integer :: n
+
+        lowered = path
+        do n = 1, len(lowered)
+            if (iachar(lowered(n:n)) >= iachar('A') .and. iachar(lowered(n:n)) <= iachar('Z')) then
+                lowered(n:n) = achar(iachar(lowered(n:n)) + 32)
+            end if
+        end do
+        is_whisper_model_path = ends_with(lowered, '.bin') .or. ends_with(lowered, '.ggml')
+    contains
+        logical function ends_with(value, suffix)
+            character(len=*), intent(in) :: value, suffix
+            integer :: value_length, suffix_length
+
+            value_length = len_trim(value)
+            suffix_length = len(suffix)
+            ends_with = value_length >= suffix_length
+            if (ends_with) ends_with = value(value_length - suffix_length + 1:value_length) == suffix
+        end function ends_with
+    end function is_whisper_model_path
 
     subroutine string_to_c_literal(text, output, capacity)
         character(len=*), intent(in) :: text

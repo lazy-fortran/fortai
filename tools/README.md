@@ -8,8 +8,17 @@ model loading and serving do not depend on a code-generation toolchain.
 compatible `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
 `/v1/models`, `/tokenize`, `/detokenize`, `/apply-template`, `/health`, `/props` (writable with `--props`), `/slots`, `/metrics`, and the embedded `/` UI from the Fortran Qwen3.5 runtime; it never launches
 `llama-server`. `tools/build_cuda_server.sh` builds the CUDA binary, while
-`fo build` builds the CPU diagnostic binary. Set `FORTAI_SERVER_BIN` only when
-selecting an already-built FortAI binary explicitly.
+`tools/build_native.sh` builds and tests the CPU diagnostic binary (set
+`FORTAI_GGML_PREFIX` when GGML is installed outside its default prefix). Set
+`FORTAI_SERVER_BIN` only when selecting an already-built FortAI binary
+explicitly.
+
+The same binary also auto-detects legacy Whisper `ggml-*.bin` models and serves
+native `/v1/audio/transcriptions` and `/v1/audio/translations` requests. Use a
+PCM16 WAV body or a multipart upload (`file`/`audio` plus optional
+`language`, `task`, `temperature`, `seed`, and `max_tokens` fields). This path
+implements the audio frontend, tokenizer, encoder, decoder, and HTTP handling
+in FortAI; it does not launch or link `whisper.cpp`/`libwhisper`.
 
 The native CLI accepts the complete current `llama-server --help` option and
 alias surface, including model/GPU placement, split ratios, batching, KV and

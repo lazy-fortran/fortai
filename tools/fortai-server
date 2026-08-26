@@ -10,7 +10,7 @@ if [[ ! -x "$server_path" ]]; then
     server_path="$root_dir/build/fo/bin/fortai_server"
 fi
 if [[ ! -x "$server_path" ]]; then
-    echo "FortAI native server is not built; run tools/build_cuda_server.sh (CUDA) or fo build (CPU)" >&2
+    echo "FortAI native server is not built; run tools/build_cuda_server.sh (CUDA) or tools/build_native.sh (CPU)" >&2
     exit 127
 fi
 

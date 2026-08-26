@@ -15,6 +15,9 @@ program test_fortai_smoke
     use fortai_qwen35_mtp, only: qwen35_mtp_available
     use fortai_qwen35_vision, only: qwen35_vision_available
     use fortai_native_http, only: fortai_native_http_json_integer_checked
+    use fortai_whisper_audio_io, only: whisper_wav_decode
+    use fortai_whisper_tokenizer, only: WHISPER_TOKEN_BEG, WHISPER_TOKEN_EOT, WHISPER_TOKEN_NOT, &
+        WHISPER_TOKEN_SOT, WHISPER_TOKEN_TRANSCRIBE, WHISPER_TOKEN_TRANSLATE, whisper_language_token
     use fortai_sampler, only: sampler_t
     use fortai_speculative, only: speculative_t
     use fortai_status, only: status_t
@@ -75,6 +78,8 @@ program test_fortai_smoke
     call test_flash_attention_kernel(failures)
     call test_gdn_kernel(failures)
     call test_silu_kernel(failures)
+    call test_whisper_wav(failures)
+    call test_whisper_token_ids(failures)
     if (failures > 0) error stop 1
     print '(a)', 'FortAI smoke tests passed'
 
@@ -105,6 +110,83 @@ contains
             failures = failures + 1
         end if
     end subroutine require
+
+    subroutine test_whisper_wav(failures)
+        integer, intent(inout) :: failures
+        character(len=52) :: raw
+        real(real32), allocatable :: samples(:)
+        real(real32), parameter :: expected(4) = [-1.0_real32, -0.5_real32, 0.0_real32, 0.5_real32]
+        type(status_t) :: stat
+
+        raw = repeat(achar(0), len(raw))
+        raw(1:4) = 'RIFF'
+        call wav_put_u32(raw, 5, 44_int32)
+        raw(9:12) = 'WAVE'
+        raw(13:16) = 'fmt '
+        call wav_put_u32(raw, 17, 16_int32)
+        call wav_put_u16(raw, 21, 1_int32)
+        call wav_put_u16(raw, 23, 1_int32)
+        call wav_put_u32(raw, 25, 16000_int32)
+        call wav_put_u32(raw, 29, 32000_int32)
+        call wav_put_u16(raw, 33, 2_int32)
+        call wav_put_u16(raw, 35, 16_int32)
+        raw(37:40) = 'data'
+        call wav_put_u32(raw, 41, 8_int32)
+        call wav_put_u16(raw, 45, -32768_int32)
+        call wav_put_u16(raw, 47, -16384_int32)
+        call wav_put_u16(raw, 49, 0_int32)
+        call wav_put_u16(raw, 51, 16384_int32)
+        call whisper_wav_decode(raw, samples, stat)
+        call require(stat%is_ok(), 'native WAV PCM16 decode status', failures)
+        call require(size(samples) == size(expected), 'native WAV sample count', failures)
+        if (size(samples) == size(expected)) then
+            call require(maxval(abs(samples - expected)) < 1.0e-6_real32, &
+                'native WAV PCM16 normalization', failures)
+        end if
+        call wav_put_u16(raw, 21, 3_int32)
+        call whisper_wav_decode(raw, samples, stat)
+        call require(.not. stat%is_ok(), 'native WAV rejects non-PCM codec', failures)
+    end subroutine test_whisper_wav
+
+    subroutine test_whisper_token_ids(failures)
+        integer, intent(inout) :: failures
+        type(status_t) :: stat
+
+        call require(WHISPER_TOKEN_EOT == 50257_int32, 'Whisper EOT token id', failures)
+        call require(WHISPER_TOKEN_SOT == 50258_int32, 'Whisper SOT token id', failures)
+        call require(WHISPER_TOKEN_TRANSLATE == 50359_int32, 'Whisper translate token id', failures)
+        call require(WHISPER_TOKEN_TRANSCRIBE == 50360_int32, 'Whisper transcribe token id', failures)
+        call require(WHISPER_TOKEN_NOT == 50364_int32, 'Whisper no-timestamps token id', failures)
+        call require(WHISPER_TOKEN_BEG == 50365_int32, 'Whisper timestamp token id', failures)
+        call require(whisper_language_token('en', stat) == 50259_int32 .and. stat%is_ok(), &
+            'Whisper English language token id', failures)
+        call require(whisper_language_token('EN', stat) == 50259_int32 .and. stat%is_ok(), &
+            'Whisper language ids are case-insensitive', failures)
+    end subroutine test_whisper_token_ids
+
+    subroutine wav_put_u16(raw, position, value)
+        character(len=*), intent(inout) :: raw
+        integer, intent(in) :: position
+        integer(int32), intent(in) :: value
+        integer(int32) :: bits
+
+        bits = iand(value, int(z'ffff', int32))
+        raw(position:position) = achar(iand(bits, int(z'ff', int32)))
+        raw(position + 1:position + 1) = achar(iand(ishft(bits, -8), int(z'ff', int32)))
+    end subroutine wav_put_u16
+
+    subroutine wav_put_u32(raw, position, value)
+        character(len=*), intent(inout) :: raw
+        integer, intent(in) :: position
+        integer(int32), intent(in) :: value
+        integer(int32) :: bits
+
+        bits = value
+        raw(position:position) = achar(iand(bits, int(z'ff', int32)))
+        raw(position + 1:position + 1) = achar(iand(ishft(bits, -8), int(z'ff', int32)))
+        raw(position + 2:position + 2) = achar(iand(ishft(bits, -16), int(z'ff', int32)))
+        raw(position + 3:position + 3) = achar(iand(ishft(bits, -24), int(z'ff', int32)))
+    end subroutine wav_put_u32
 
     subroutine test_tensor(failures)
         integer, intent(inout) :: failures

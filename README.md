@@ -51,14 +51,16 @@ plan.
 
 ## Build and test
 
-Requirements are a Fortran 2018 compiler and the local Lazy Fortran `fo`
-driver (which invokes fpm-compatible project builds).
+Requirements are a Fortran 2018 compiler, the local Lazy Fortran `fo`
+driver, and the GGML backend libraries (set `FORTAI_GGML_PREFIX` when they
+are outside the default installation).
 
 ```bash
-fo build
-fo test
-fo exec --no-build fortai --version
+tools/build_native.sh
 ```
+
+The build script supplies the direct GGML CPU/CUDA link set to both the build
+and behavioral test targets; use it for reproducible local validation.
 
 For the native CPU candidate build:
 
@@ -255,6 +257,44 @@ independent CUDA/CPU trace oracle. With native CUDA selected, q8_0 K/V stays
 device-resident, including full-context streaming softmax, whenever the
 resident allocation fits; the host cache is retained for the host-boundary
 fallback and the MTP verification head.
+
+### Native Whisper large-v3-turbo
+
+Legacy Whisper `ggml-*.bin` files are loaded and executed by FortAI's native
+Fortran model, audio frontend, tokenizer, decoder, and HTTP service. The
+low-level GGML tensor/device ABI is used only as a backend primitive; no
+`libwhisper`, `whisper.cpp`, or subprocess is involved. The same
+`fortai-server` binary selects this path automatically from the `.bin` model
+suffix:
+
+```bash
+tools/build_cuda_server.sh
+CUDA_VISIBLE_DEVICES=1 tools/fortai-server \
+  --model /home/ert/.local/share/voxtype/models/ggml-large-v3-turbo.bin \
+  --port 8427 --gpu-layers all --flash-attn on
+```
+
+`--gpu-layers 0` selects the CPU backend; `--main-gpu` and
+`CUDA_VISIBLE_DEVICES` follow the same device-selection rules as the existing
+server. `/`, `/ui`, `/health`, `/v1/health`, `/models`, `/v1/models`, and
+`/metrics` are available, together with OpenAI-compatible
+`/v1/audio/transcriptions` and `/v1/audio/translations` (direct PCM16 WAV or
+`multipart/form-data` uploads). Multipart `language`, `task`, `temperature`,
+`seed`, and `max_tokens` fields are honored. JSON output is escaped by the
+native `string_t` path, and invalid limits, temperatures, languages, codecs,
+or truncated WAV data fail explicitly. Only PCM16 WAV is currently
+supported; compressed codecs are intentionally rejected rather than silently
+decoded by an external library.
+
+The model loader uses one selected CUDA device by default, matching the
+production Whisper profile where the other GPU is reserved for the language
+model. `memory_bytes` in `/health` and `fortai_whisper_memory_bytes` in
+`/metrics` expose the native resident model, encoder, and decoder-cache
+accounting. The native frontend and decoder were checked against an
+independently built whisper.cpp CPU oracle on the same large-v3-turbo file;
+first-token logits agree within the reference FP16/FP32 rounding envelope,
+and the GPU route is exercised independently of the protected language-model
+service.
 
 Benchmark results, logs, and perf data stay machine-local under
 `benchmark/results`, `benchmark/logs`, and `benchmark/profiles`; the scripts

@@ -12,7 +12,7 @@ ggml_prefix=${FORTAI_GGML_PREFIX:-/home/ert/.local/llama.cpp-upstream-main-65091
 # escape hatch for callers using a matching host compiler.
 native_flags="${FORTAI_NATIVE_FLAGS:--O3 -march=native -mtune=native -funroll-loops -fopenmp -ffast-math -fno-math-errno -fno-lto}"
 allow_lto=${FORTAI_ALLOW_LTO:-0}
-link_flags="${native_flags// -flto/} -fno-plt"
+link_flags="${native_flags// -flto/} -fno-plt -L${ggml_prefix}/lib -Wl,-rpath,${ggml_prefix}/lib -lggml-cpu -lggml-cuda -lggml -lggml-base -lpthread -ldl"
 log_file="$out_dir/fortai_cuda_qwen35_fo-build.log"
 inputs_file="$out_dir/fortai_cuda_qwen35.inputs"
 
