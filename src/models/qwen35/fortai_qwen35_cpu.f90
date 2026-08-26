@@ -10,6 +10,8 @@ module fortai_qwen35_cpu
     use fortai_backend_cuda, only: cuda_qwen35_silu_product_device
     use fortai_backend_cuda, only: cuda_q4_context_t, cuda_q4_weights_t, cuda_q4_matvec_host, &
         cuda_q4_matvec_host_pair, cuda_q4_matvec_host_triplet, cuda_q4_matvec_device, &
+        cuda_q4_matvec_device_swiglu, cuda_q4_matvec_device_swiglu_remote_output, &
+        cuda_q4_matvec_device_swiglu_down, &
         cuda_q4_matvec_device_pair, cuda_q4_matvec_device_triplet, cuda_q4_matvec_device_group_remote_output, &
         cuda_q4_matvec_device_remote_input, cuda_q4_embedding_device
     use fortai_backend_cuda, only: cuda_qwen35_attention_t, cuda_qwen35_recurrent_t
@@ -890,7 +892,12 @@ contains
                 if (is_host_lookup_q4_tensor(self, i)) cycle
                 q4_layer_number = 0
                 if (layer_split_mode .and. q4_split) q4_layer_number = q4_tensor_layer(i)
-                if (q4_layer_number > 0) then
+                ! The token lookup is on the critical path of every decode.
+                ! Keep an untied Q4 embedding on the primary board so its
+                ! get-rows kernel can feed the resident stream directly.
+                if (i == self%token_embedding) then
+                    q4_device = 0
+                else if (q4_layer_number > 0) then
                     ! Match llama.cpp's layer split: tensor_split is a
                     ! normalized cumulative boundary over layer_count + 1
                     ! entries (the final entry is the output layer).  All
@@ -900,6 +907,20 @@ contains
                         real(q4_split_layer_count, real64)
                     q4_device = 1
                     if (q4_layer_position < tensor_split_fraction(1)) q4_device = 0
+                    ! At short context the primary board has enough headroom
+                    ! to keep recurrent projections beside the native GDN
+                    ! state.  This avoids a PCIe round trip for qkv/gate on
+                    ! every recurrent layer; long-context placement retains
+                    ! the split to protect KV-cache capacity.
+                    if (self%max_context <= 32768_int64 .and. &
+                        q4_recurrent_projection_tensor(self, i)) q4_device = 0
+                    ! A mixed Q4/Q8 attention block cannot keep its Q/K/V/O
+                    ! projections and attention state on the remote board:
+                    ! the Q8 member would otherwise force a full QKV host
+                    ! round trip.  Keep all quantized members of that block
+                    ! on the primary board, matching llama.cpp's whole-layer
+                    ! placement while avoiding an avoidable PCIe boundary.
+                    if (q4_attention_tensor_mixed(self, i)) q4_device = 0
                 else if (layer_split_mode .and. q4_split .and. i == self%output) then
                     q4_layer_position = real(self%layer_count, real64) / &
                         real(q4_split_layer_count, real64)
@@ -2354,14 +2375,13 @@ contains
         if (self%file%tensors(self%token_embedding)%value_type == GGML_TYPE_Q8_0) then
             call cuda_qwen35_embedding_device(self%cuda, self%cuda_weights(self%token_embedding), &
                 int(token_id, c_int64_t), device_output, output_elements, stat)
+        else if (self%cuda_q4_resident .and. allocated(self%cuda_q4_weights) .and. &
+                c_associated(self%cuda_q4_weights(self%token_embedding)%handle)) then
+            call cuda_q4_embedding_device(self%cuda_q4, self%cuda_q4_weights(self%token_embedding), &
+                int(token_id, c_int64_t), device_output, output_elements, stat)
         else if (self%cuda_q4_resident) then
-            ! GGML's auxiliary get-rows graph can rebind the shared quantized
-            ! weight allocation when it is first materialized.  That leaves
-            ! the resident Q4 embedding result undefined on some CUDA/ggml
-            ! combinations (the first decoded token then collapses to a
-            ! repeated low-id argmax).  Keep this tiny lookup on the verified
-            ! Fortran GGUF path and upload only the resulting hidden vector;
-            ! all subsequent matrix products remain device-resident.
+            ! MTP-only Q4 sidecars remain host-backed; the main token
+            ! embedding takes the resident get-rows path above.
             call self%file%tensors(self%token_embedding)%get_row(token_id + 1_int64, self%x, stat)
             if (.not. stat%is_ok()) return
             call self%cuda%upload_real(device_output, self%x, stat)
@@ -2383,11 +2403,25 @@ contains
             c_associated(self%cuda_second%handle) .and. cuda_q4_on_second(self, self%layers(layer_index)%ffn_gate) .and. &
             cuda_q4_on_second(self, self%layers(layer_index)%ffn_up) .and. &
             cuda_q4_on_second(self, self%layers(layer_index)%ffn_down) .and. &
+            c_associated(self%cuda_ffn_gate_device_second)) then
+            ! Keep a remote Q4 FFN on the second device.  The specialized
+            ! gate/up and down graphs share one scheduler boundary; only the
+            ! input and final hidden vector cross the bridge.
+            call cuda_q4_matvec_device_swiglu_down(self%cuda_q4, &
+                self%cuda_q4_weights(self%layers(layer_index)%ffn_gate), &
+                self%cuda_q4_weights(self%layers(layer_index)%ffn_up), &
+                self%cuda_q4_weights(self%layers(layer_index)%ffn_down), &
+                self%cuda_normalized, hidden_elements, self%cuda_hidden, hidden_elements, stat)
+            return
+        end if
+        if (self%cuda_q4_resident .and. self%cuda_q4_split .and. self%cuda_q4_group_enabled .and. &
+            c_associated(self%cuda_second%handle) .and. cuda_q4_on_second(self, self%layers(layer_index)%ffn_gate) .and. &
+            cuda_q4_on_second(self, self%layers(layer_index)%ffn_up) .and. &
+            cuda_q4_on_second(self, self%layers(layer_index)%ffn_down) .and. &
             c_associated(self%cuda_ffn_gate_device_second) .and. c_associated(self%cuda_ffn_up_device_second)) then
-            ! Keep a remote Q4 FFN entirely on the second device.  The
-            ! grouped gate/up call performs one activation bridge; SiLU and
-            ! the down projection then stay remote until the final hidden
-            ! vector is copied back to the primary stream.
+            ! Q4_XL may deliberately use different quantizers for gate and up.
+            ! Keep the grouped resident path for that fallback while preserving
+            ! the same single activation bridge and remote down projection.
             call cuda_q4_matvec_device_group_remote_output(self%cuda_q4, &
                 self%cuda_q4_weights(self%layers(layer_index)%ffn_gate), &
                 self%cuda_q4_weights(self%layers(layer_index)%ffn_up), &
@@ -2410,13 +2444,67 @@ contains
                 hidden_elements, self%cuda_hidden, hidden_elements, stat)
             return
         end if
-        call cuda_device_matvec_pair(self, self%layers(layer_index)%ffn_gate, self%layers(layer_index)%ffn_up, &
-            self%cuda_normalized, hidden_elements, self%cuda_ffn_gate_device, ffn_elements, &
-            self%cuda_ffn_up_device, ffn_elements, stat)
-        if (.not. stat%is_ok()) return
-        call cuda_qwen35_silu_product_device(self%cuda, self%cuda_ffn_gate_device, &
-            self%cuda_ffn_up_device, ffn_elements, stat)
-        if (.not. stat%is_ok()) return
+        if (is_q4_xl_type(self%file%tensors(self%layers(layer_index)%ffn_gate)%value_type) .and. &
+            is_q4_xl_type(self%file%tensors(self%layers(layer_index)%ffn_up)%value_type) .and. &
+            is_q4_xl_type(self%file%tensors(self%layers(layer_index)%ffn_down)%value_type) .and. &
+            self%cuda_q4_resident .and. self%cuda_q4_group_enabled) then
+            if (allocated(self%cuda_q4_weights)) then
+                if (c_associated(self%cuda_q4_weights(self%layers(layer_index)%ffn_gate)%handle) .and. &
+                    c_associated(self%cuda_q4_weights(self%layers(layer_index)%ffn_up)%handle) .and. &
+                    c_associated(self%cuda_q4_weights(self%layers(layer_index)%ffn_down)%handle) .and. &
+                    (cuda_q4_on_second(self, self%layers(layer_index)%ffn_gate) .eqv. &
+                    cuda_q4_on_second(self, self%layers(layer_index)%ffn_up)) .and. &
+                    (cuda_q4_on_second(self, self%layers(layer_index)%ffn_gate) .eqv. &
+                    cuda_q4_on_second(self, self%layers(layer_index)%ffn_down))) then
+                    call cuda_q4_matvec_device_swiglu_down(self%cuda_q4, &
+                        self%cuda_q4_weights(self%layers(layer_index)%ffn_gate), &
+                        self%cuda_q4_weights(self%layers(layer_index)%ffn_up), &
+                        self%cuda_q4_weights(self%layers(layer_index)%ffn_down), self%cuda_normalized, &
+                        hidden_elements, self%cuda_hidden, hidden_elements, stat)
+                    return
+                end if
+            end if
+        end if
+        if (is_q4_xl_type(self%file%tensors(self%layers(layer_index)%ffn_gate)%value_type) .and. &
+            is_q4_xl_type(self%file%tensors(self%layers(layer_index)%ffn_up)%value_type) .and. &
+            self%cuda_q4_resident .and. self%cuda_q4_group_enabled) then
+            if (allocated(self%cuda_q4_weights)) then
+                if (c_associated(self%cuda_q4_weights(self%layers(layer_index)%ffn_gate)%handle) .and. &
+                    c_associated(self%cuda_q4_weights(self%layers(layer_index)%ffn_up)%handle) .and. &
+                    (cuda_q4_on_second(self, self%layers(layer_index)%ffn_gate) .eqv. &
+                    cuda_q4_on_second(self, self%layers(layer_index)%ffn_up))) then
+                    call cuda_q4_matvec_device_swiglu(self%cuda_q4, &
+                        self%cuda_q4_weights(self%layers(layer_index)%ffn_gate), &
+                        self%cuda_q4_weights(self%layers(layer_index)%ffn_up), self%cuda_normalized, hidden_elements, &
+                        self%cuda_ffn_gate_device, ffn_elements, stat)
+                    if (.not. stat%is_ok()) return
+                else
+                    call cuda_device_matvec_pair(self, self%layers(layer_index)%ffn_gate, &
+                        self%layers(layer_index)%ffn_up, self%cuda_normalized, hidden_elements, &
+                        self%cuda_ffn_gate_device, ffn_elements, self%cuda_ffn_up_device, ffn_elements, stat)
+                    if (.not. stat%is_ok()) return
+                    call cuda_qwen35_silu_product_device(self%cuda, self%cuda_ffn_gate_device, &
+                        self%cuda_ffn_up_device, ffn_elements, stat)
+                    if (.not. stat%is_ok()) return
+                end if
+            else
+                call cuda_device_matvec_pair(self, self%layers(layer_index)%ffn_gate, &
+                    self%layers(layer_index)%ffn_up, self%cuda_normalized, hidden_elements, &
+                    self%cuda_ffn_gate_device, ffn_elements, self%cuda_ffn_up_device, ffn_elements, stat)
+                if (.not. stat%is_ok()) return
+                call cuda_qwen35_silu_product_device(self%cuda, self%cuda_ffn_gate_device, &
+                    self%cuda_ffn_up_device, ffn_elements, stat)
+                if (.not. stat%is_ok()) return
+            end if
+        else
+            call cuda_device_matvec_pair(self, self%layers(layer_index)%ffn_gate, self%layers(layer_index)%ffn_up, &
+                self%cuda_normalized, hidden_elements, self%cuda_ffn_gate_device, ffn_elements, &
+                self%cuda_ffn_up_device, ffn_elements, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_qwen35_silu_product_device(self%cuda, self%cuda_ffn_gate_device, &
+                self%cuda_ffn_up_device, ffn_elements, stat)
+            if (.not. stat%is_ok()) return
+        end if
         call cuda_device_matvec(self, self%layers(layer_index)%ffn_down, self%cuda_ffn_gate_device, &
             ffn_elements, self%cuda_hidden, hidden_elements, stat)
     end subroutine forward_ffn_device
@@ -2788,14 +2876,8 @@ contains
 
         is_host_lookup_q4_tensor = .false.
         if (tensor_index <= 0 .or. tensor_index > size(self%file%tensors)) return
-        ! The resident pipeline intentionally performs the tiny token lookup
-        ! through the validated GGUF path.  Do not upload an untied embedding
-        ! (or an MTP embedding) just to satisfy a readiness check.  A tied
-        ! output must stay resident because it is also the LM-head matvec.
-        if (tensor_index == self%token_embedding .and. self%output /= self%token_embedding) then
-            is_host_lookup_q4_tensor = .true.
-            return
-        end if
+        ! MTP sidecar embeddings are host-only; the target token embedding is
+        ! uploaded even when untied so decode can use the Q4 get-rows kernel.
         if (self%mtp_embed_tokens > 0 .and. tensor_index == self%mtp_embed_tokens .and. &
             tensor_index /= self%output) is_host_lookup_q4_tensor = .true.
     end function is_host_lookup_q4_tensor
@@ -2843,6 +2925,23 @@ contains
             end do
         end if
     end function q4_layer_for_tensor
+
+    logical function q4_recurrent_projection_tensor(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+        integer :: layer_number
+
+        q4_recurrent_projection_tensor = .false.
+        if (.not. allocated(self%layers)) return
+        do layer_number = 1, size(self%layers)
+            if (.not. self%layers(layer_number)%recurrent) cycle
+            if (tensor_index == self%layers(layer_number)%attn_qkv .or. &
+                tensor_index == self%layers(layer_number)%attn_gate) then
+                q4_recurrent_projection_tensor = .true.
+                return
+            end if
+        end do
+    end function q4_recurrent_projection_tensor
 
     logical function all_q8_recurrent_weights(self, layer_index)
         class(qwen35_cpu_model_t), intent(in) :: self
@@ -2926,7 +3025,7 @@ contains
         class(qwen35_cpu_model_t), intent(in) :: self
         integer, intent(in) :: layer_index
         integer :: indices(4), i
-        logical :: has_q4, split_attention_enabled
+        logical :: all_q4, split_attention_enabled
         character(len=16) :: split_attention_value
         character(len=128) :: tensor_split_value
         integer :: split_attention_length, tensor_split_length, tensor_split_status
@@ -2957,12 +3056,17 @@ contains
         if (self%layers(layer_index)%recurrent) return
         indices = [self%layers(layer_index)%attn_q, self%layers(layer_index)%attn_k, &
             self%layers(layer_index)%attn_v, self%layers(layer_index)%attn_out]
-        has_q4 = .false.
+        all_q4 = .true.
         do i = 1, size(indices)
             if (indices(i) <= 0 .or. indices(i) > size(self%file%tensors)) return
-            if (is_q4_xl_type(self%file%tensors(indices(i))%value_type)) has_q4 = .true.
+            if (.not. is_q4_xl_type(self%file%tensors(indices(i))%value_type)) all_q4 = .false.
         end do
-        if (.not. has_q4) return
+        ! At short contexts the primary board has ample KV headroom and
+        ! keeping mixed Q4/Q8 projections together avoids an unnecessary
+        ! QKV/workspace bridge.  At production long context the KV state is
+        ! the dominant allocation; allow mixed blocks to move their state to
+        ! the remote board so both cards remain within their VRAM budgets.
+        if (.not. all_q4 .and. self%max_context <= 32768_int64) return
         tensor_split_fraction = 0.5_real64
         tensor_split_value = ''
         call get_environment_variable('FORTAI_TENSOR_SPLIT', tensor_split_value, length=tensor_split_length)
@@ -2989,6 +3093,36 @@ contains
         if (layer_index <= 0 .or. layer_index > size(self%cuda_attention_on_second_layer)) return
         cuda_attention_on_second = self%cuda_attention_on_second_layer(layer_index)
     end function cuda_attention_on_second
+
+    logical function q4_attention_tensor_mixed(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+        integer :: layer_index, i
+        integer :: indices(4)
+        logical :: all_q4
+
+        q4_attention_tensor_mixed = .false.
+        if (.not. allocated(self%layers)) return
+        do layer_index = 1, size(self%layers)
+            if (self%layers(layer_index)%recurrent) cycle
+            indices = [self%layers(layer_index)%attn_q, self%layers(layer_index)%attn_k, &
+                self%layers(layer_index)%attn_v, self%layers(layer_index)%attn_out]
+            if (.not. any(indices == tensor_index)) cycle
+            all_q4 = .true.
+            do i = 1, size(indices)
+                if (indices(i) <= 0) then
+                    all_q4 = .false.
+                    exit
+                end if
+                if (.not. is_q4_xl_type(self%file%tensors(indices(i))%value_type)) then
+                    all_q4 = .false.
+                    exit
+                end if
+            end do
+            q4_attention_tensor_mixed = .not. all_q4
+            return
+        end do
+    end function q4_attention_tensor_mixed
 
     logical function cuda_recurrent_projection_ready(self, layer)
         class(qwen35_cpu_model_t), intent(in) :: self

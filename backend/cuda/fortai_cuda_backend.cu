@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <new>
 #include <vector>
 
@@ -32,6 +33,11 @@ struct fortai_cuda_q8_context_impl {
     size_t scratch_output_bytes = 0;
     float *scratch_aux = nullptr;
     size_t scratch_aux_bytes = 0;
+    /* Fortran allocatables are pageable.  Reusing one pinned staging buffer
+     * avoids CUDA's per-call pageable registration in the logits/activation
+     * download path while keeping the public ABI unchanged. */
+    void *download_host = nullptr;
+    size_t download_host_bytes = 0;
     int *position = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
@@ -233,6 +239,25 @@ static cudaError_t ensure_aux_scratch(fortai_cuda_q8_context_impl *context, size
     context->scratch_aux = nullptr;
     error = cudaMalloc(reinterpret_cast<void **>(&context->scratch_aux), bytes);
     if (error == cudaSuccess) context->scratch_aux_bytes = bytes;
+    return error;
+}
+
+static cudaError_t ensure_download_host(fortai_cuda_q8_context_impl *context, size_t bytes) {
+    if (bytes <= context->download_host_bytes && context->download_host != nullptr)
+        return cudaSuccess;
+    /* A resize cannot race an earlier transfer because the public download
+     * operation is host-synchronous; still fence the stream for robustness if
+     * a larger output is introduced by a future caller. */
+    cudaError_t error = cudaStreamSynchronize(context->stream);
+    if (error != cudaSuccess) return error;
+    if (context->download_host != nullptr) {
+        error = cudaFreeHost(context->download_host);
+        if (error != cudaSuccess) return error;
+    }
+    context->download_host = nullptr;
+    context->download_host_bytes = 0;
+    error = cudaHostAlloc(&context->download_host, bytes, cudaHostAllocPortable);
+    if (error == cudaSuccess) context->download_host_bytes = bytes;
     return error;
 }
 
@@ -536,82 +561,189 @@ __global__ void qwen_recurrent_l2_normalize(float *values, int slices, int lengt
     float epsilon) {
     const int slice = static_cast<int>(blockIdx.x);
     if (slice >= slices) return;
-    extern __shared__ double partial[];
-    const int lane = static_cast<int>(threadIdx.x);
-    double sum = 0.0;
-    for (int i = lane; i < length; i += blockDim.x) {
-        const double value = static_cast<double>(values[slice * length + i]);
-        sum += value * value;
+    __shared__ float partial[4];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    float sum = 0.0f;
+    for (int i = tid; i < length; i += blockDim.x) {
+        const float value = values[slice * length + i];
+        sum = fmaf(value, value, sum);
     }
-    partial[lane] = sum;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0) partial[warp] = sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) partial[lane] += partial[lane + stride];
-        __syncthreads();
+    sum = lane < 4 ? partial[lane] : 0.0f;
+    if (warp == 0) {
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane == 0) partial[0] = sum;
     }
-    const float inverse = static_cast<float>(1.0 / fmax(sqrt(partial[0]), static_cast<double>(epsilon)));
-    for (int i = lane; i < length; i += blockDim.x)
+    __syncthreads();
+    float norm = sqrtf(partial[0]);
+    if (norm < epsilon) norm = epsilon;
+    const float inverse = 1.0f / norm;
+    for (int i = tid; i < length; i += blockDim.x)
         values[slice * length + i] *= inverse;
 }
 
-__global__ void qwen_recurrent_gdn_rows(const float *qkv, const float *gate,
-    const float *alpha, const float *beta, const float *ssm_a, const float *ssm_dt,
+/* One block owns four rows of one GDN head.  Each warp carries one complete
+ * row, so the delta update, state write, and output dot product are completed
+ * in one launch without the old one-block-per-row scheduling overhead.  The
+ * row-major state layout is intentional: it is the layout used by the CPU
+ * oracle and by the public state inspection helpers. */
+__global__ void qwen_recurrent_gdn_fused(const float *qkv, const float *alpha,
+    const float *beta, const float *ssm_a, const float *ssm_dt,
     float *state, float *output, int state_size, int key_heads, int value_heads,
     int head_size) {
-    const int row_index = static_cast<int>(blockIdx.x);
+    const int row_index = static_cast<int>(blockIdx.x * blockDim.y + threadIdx.y);
     const int lane = static_cast<int>(threadIdx.x);
     const int head = row_index / head_size;
     const int row = row_index % head_size;
-    if (head >= value_heads || lane >= 32) return;
+    if (head >= value_heads || row >= head_size || lane >= 32) return;
     const int key_head = head % key_heads;
-    const int q_offset = key_head * head_size;
-    const int k_offset = state_size * key_heads + key_head * head_size;
+    const int q_offset = key_head * state_size;
+    const int k_offset = state_size * key_heads + key_head * state_size;
     const int v_offset = 2 * state_size * key_heads + head * head_size;
     const float decay = expf(ssm_a[head] * qwen_softplus(alpha[head] + ssm_dt[head]));
     const float beta_value = qwen_sigmoid(beta[head]);
-    float *head_state = state + head * head_size * head_size;
+    float *state_row = state + static_cast<size_t>(head) * head_size * head_size +
+        static_cast<size_t>(row) * head_size;
     float key_dot = 0.0f;
-    for (int column = lane; column < head_size; column += 32) {
-        const int index = row * head_size + column;
-        const float decayed = head_state[index] * decay;
-        head_state[index] = decayed;
-        key_dot += decayed * qkv[k_offset + column];
+    for (int col = lane; col < head_size; col += 32) {
+        const float entry = state_row[col] * decay;
+        state_row[col] = entry;
+        key_dot = fmaf(entry, qkv[k_offset + col], key_dot);
     }
-    for (int offset = 16; offset; offset >>= 1)
+    for (int offset = 16; offset > 0; offset >>= 1)
         key_dot += __shfl_down_sync(0xffffffffu, key_dot, offset);
-    key_dot = __shfl_sync(0xffffffffu, key_dot, 0);
-    __shared__ float row_delta;
-    if (lane == 0) row_delta = (qkv[v_offset + row] - key_dot) * beta_value;
-    __syncthreads();
+    const float delta = (qkv[v_offset + row] - key_dot) * beta_value;
+    const float shared_delta = __shfl_sync(0xffffffffu, delta, 0);
     float query_dot = 0.0f;
-    for (int column = lane; column < head_size; column += 32) {
-        const int index = row * head_size + column;
-        const float updated = head_state[index] + row_delta * qkv[k_offset + column];
-        head_state[index] = updated;
-        query_dot += updated * qkv[q_offset + column];
+    for (int col = lane; col < head_size; col += 32) {
+        const float entry = state_row[col] + shared_delta * qkv[k_offset + col];
+        state_row[col] = entry;
+        query_dot = fmaf(entry, qkv[q_offset + col], query_dot);
     }
-    for (int offset = 16; offset; offset >>= 1)
+    for (int offset = 16; offset > 0; offset >>= 1)
         query_dot += __shfl_down_sync(0xffffffffu, query_dot, offset);
-    if (lane == 0) output[row_index] = query_dot / sqrtf(static_cast<float>(head_size));
+    if (lane == 0)
+        output[row_index] = query_dot * rsqrtf(static_cast<float>(head_size));
 }
 
-__global__ void qwen_recurrent_gdn_normalize(float *output, const float *gate,
+/* The production Qwen3.5 model uses a 128-wide recurrent head.  Keep a
+ * shape-specialized launch alongside the metadata-driven kernel above: the
+ * 3-D grid makes the head/column coordinates free, and the compile-time
+ * width lets nvcc unroll the four row lanes exactly like llama.cpp's
+ * gated_delta_net kernel.  The device state remains row-major (the same
+ * layout as the CPU oracle), so this is an execution-only optimization. */
+template <int HeadSize>
+__global__ void qwen_recurrent_gdn_fused_fixed(const float *qkv, const float *alpha,
+    const float *beta, const float *ssm_a, const float *ssm_dt,
+    float *state, float *output, int state_size, int key_heads, int value_heads) {
+    constexpr int warp_size = 32;
+    constexpr int rows_per_lane = HeadSize / warp_size;
+    const int head = static_cast<int>(blockIdx.x);
+    const int column = static_cast<int>(blockIdx.z * blockDim.y + threadIdx.y);
+    const int lane = static_cast<int>(threadIdx.x);
+    if (head >= value_heads || column >= HeadSize || lane >= warp_size) return;
+
+    const int key_head = head % key_heads;
+    const int q_offset = key_head * state_size;
+    const int k_offset = state_size * key_heads + key_head * state_size;
+    const int v_offset = 2 * state_size * key_heads + head * HeadSize;
+    const float decay = expf(ssm_a[head] * qwen_softplus(alpha[head] + ssm_dt[head]));
+    const float beta_value = qwen_sigmoid(beta[head]);
+    float *state_row = state + static_cast<size_t>(head) * HeadSize * HeadSize +
+        static_cast<size_t>(column) * HeadSize;
+    float state_shard[rows_per_lane];
+
+#pragma unroll
+    for (int row = 0; row < rows_per_lane; ++row) {
+        const int index = row * warp_size + lane;
+        state_shard[row] = state_row[index];
+    }
+
+    float key_dot = 0.0f;
+#pragma unroll
+    for (int row = 0; row < rows_per_lane; ++row) {
+        const int index = row * warp_size + lane;
+        /* The reference kernel forms the decayed state before both the key
+         * reduction and the delta update.  Do that once in registers, rather
+         * than reloading the value after its global store. */
+        state_shard[row] = __fmul_rn(state_shard[row], decay);
+        key_dot = fmaf(state_shard[row], qkv[k_offset + index], key_dot);
+    }
+#pragma unroll
+    for (int offset = warp_size / 2; offset > 0; offset >>= 1)
+        key_dot += __shfl_down_sync(0xffffffffu, key_dot, offset);
+    const float delta = (qkv[v_offset + column] - key_dot) * beta_value;
+    const float shared_delta = __shfl_sync(0xffffffffu, delta, 0);
+
+    float query_dot = 0.0f;
+#pragma unroll
+    for (int row = 0; row < rows_per_lane; ++row) {
+        const int index = row * warp_size + lane;
+        /* Keep the delta update's rounding identical to the metadata-driven
+         * kernel.  The decayed state is already in the register from the key
+         * reduction above. */
+        state_shard[row] = fmaf(shared_delta, qkv[k_offset + index], state_shard[row]);
+        query_dot = fmaf(state_shard[row], qkv[q_offset + index], query_dot);
+    }
+#pragma unroll
+    for (int offset = warp_size / 2; offset > 0; offset >>= 1)
+        query_dot += __shfl_down_sync(0xffffffffu, query_dot, offset);
+    if (lane == 0)
+        output[head * HeadSize + column] = query_dot * rsqrtf(static_cast<float>(HeadSize));
+
+#pragma unroll
+    for (int row = 0; row < rows_per_lane; ++row) {
+        const int index = row * warp_size + lane;
+        state_row[index] = state_shard[row];
+    }
+}
+
+static void launch_qwen_recurrent_gdn_fused(const float *qkv, const float *alpha,
+    const float *beta, const float *ssm_a, const float *ssm_dt,
+    float *state, float *output, int state_size, int key_heads, int value_heads,
+    int head_size, cudaStream_t stream) {
+    if (state_size == 128 && head_size == 128) {
+        qwen_recurrent_gdn_fused_fixed<128><<<
+            dim3(static_cast<unsigned>(value_heads), 1, 32), dim3(32, 4, 1), 0, stream>>>(
+            qkv, alpha, beta, ssm_a, ssm_dt, state, output, state_size, key_heads, value_heads);
+    } else {
+        qwen_recurrent_gdn_fused<<<
+            (value_heads * head_size + 3) / 4, dim3(32, 4, 1), 0, stream>>>(
+            qkv, alpha, beta, ssm_a, ssm_dt, state, output, state_size,
+            key_heads, value_heads, head_size);
+    }
+}
+
+__global__ void qwen_recurrent_gdn_norm_gate(float *output, const float *gate,
     const float *ssm_norm, int value_heads, int head_size, float norm_epsilon) {
     const int head = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
-    if (head >= value_heads || tid >= head_size) return;
-    extern __shared__ double reduction[];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    __shared__ float partial[4];
     const int offset = head * head_size + tid;
-    const double value = static_cast<double>(output[offset]);
-    reduction[tid] = value * value;
+    const float value = tid < head_size ? output[offset] : 0.0f;
+    float sum = value * value;
+    for (int delta = 16; delta > 0; delta >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, delta);
+    if (lane == 0) partial[warp] = sum;
     __syncthreads();
-    for (int stride = head_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) reduction[tid] += reduction[tid + stride];
-        __syncthreads();
+    sum = lane < 4 ? partial[lane] : 0.0f;
+    if (warp == 0) {
+        for (int delta = 16; delta > 0; delta >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, delta);
+        if (lane == 0) partial[0] = sum;
     }
-    const float inverse = static_cast<float>(1.0 / sqrt(
-        reduction[0] / static_cast<double>(head_size) + static_cast<double>(norm_epsilon)));
-    output[offset] = output[offset] * inverse * ssm_norm[tid] * qwen_silu(gate[offset]);
+    __syncthreads();
+    const float inverse = rsqrtf(partial[0] / static_cast<float>(head_size) + norm_epsilon);
+    if (tid < head_size)
+        output[offset] = value * inverse * ssm_norm[tid] * qwen_silu(gate[offset]);
 }
 
 __global__ void qwen_quantize_q8(const float *input, int8_t *output, int blocks) {
@@ -665,34 +797,35 @@ __global__ void qwen_add_float(const float *left, const float *right, float *out
     if (index < elements) output[index] = left[index] + right[index];
 }
 
-__global__ void qwen_rms_norm_float(const float *input, const float *weights,
-    float *output, int elements, float epsilon) {
-    /* The hidden width is normally 8k--32k.  A double shared-memory tree
-     * made every RMS norm a serialized ~12 us kernel on Ada; a warp shuffle
-     * reduction keeps the same one-block launch but uses the hardware's
-     * native FP32 path, matching llama.cpp's RMS implementation. */
-    __shared__ float norm_partial[8];
-    const int lane = static_cast<int>(threadIdx.x);
-    const int warp = lane >> 5;
-    const int lane_in_warp = lane & 31;
+__global__ void qwen_rms_norm_float(const float *__restrict__ input,
+    const float *__restrict__ weights, float *__restrict__ output,
+    int elements, float epsilon) {
+    /* Hidden vectors are 5,120 elements on the production Qwen3.5 model.
+     * Matching llama.cpp's 1,024-thread reduction gives every warp only a
+     * handful of contiguous values and avoids the long per-thread loop in the
+     * former 256-thread kernel. */
+    __shared__ float norm_partial[32];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
     float sum = 0.0f;
-    for (int index = lane; index < elements; index += blockDim.x) {
+    for (int index = tid; index < elements; index += blockDim.x) {
         const float value = input[index];
         sum = fmaf(value, value, sum);
     }
     for (int offset = 16; offset > 0; offset >>= 1)
         sum += __shfl_down_sync(0xffffffffu, sum, offset);
-    if (lane_in_warp == 0) norm_partial[warp] = sum;
+    if (lane == 0) norm_partial[warp] = sum;
     __syncthreads();
     if (warp == 0) {
-        sum = lane_in_warp < 8 ? norm_partial[lane_in_warp] : 0.0f;
+        sum = lane < 32 ? norm_partial[lane] : 0.0f;
         for (int offset = 16; offset > 0; offset >>= 1)
             sum += __shfl_down_sync(0xffffffffu, sum, offset);
-        if (lane_in_warp == 0) norm_partial[0] = sum;
+        if (lane == 0) norm_partial[0] = sum;
     }
     __syncthreads();
     const float inverse = 1.0f / sqrtf(norm_partial[0] / static_cast<float>(elements) + epsilon);
-    for (int index = lane; index < elements; index += blockDim.x)
+    for (int index = tid; index < elements; index += blockDim.x)
         output[index] = input[index] * inverse * weights[index];
 }
 
@@ -1177,6 +1310,7 @@ extern "C" int fortai_cuda_q8_context_destroy(fortai_cuda_q8_context *context) {
     cudaFree(context->impl.scratch_raw);
     cudaFree(context->impl.scratch_output);
     cudaFree(context->impl.scratch_aux);
+    cudaFreeHost(context->impl.download_host);
     cudaEventDestroy(context->impl.start);
     cudaEventDestroy(context->impl.stop);
     cudaStreamDestroy(context->impl.stream);
@@ -1330,12 +1464,14 @@ extern "C" int fortai_cuda_q8_device_buffer_download(fortai_cuda_q8_context *con
     void *host_data, const void *device_buffer, size_t bytes) {
     if (!context || !device_buffer || !host_data || bytes == 0) return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);
-    const cudaError_t error = cudaMemcpyAsync(host_data, device_buffer, bytes,
+    cudaError_t error = ensure_download_host(&context->impl, bytes);
+    if (error == cudaSuccess) error = cudaMemcpyAsync(context->impl.download_host, device_buffer, bytes,
         cudaMemcpyDeviceToHost, context->impl.stream);
     if (error == cudaSuccess) {
         const cudaError_t sync = cudaStreamSynchronize(context->impl.stream);
         if (sync != cudaSuccess)
             return fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "device download", sync);
+        std::memcpy(host_data, context->impl.download_host, bytes);
     }
     return error == cudaSuccess ? FORTAI_CUDA_OK :
         fail(&context->impl, FORTAI_CUDA_RUNTIME_ERROR, "device download", error);
@@ -1462,7 +1598,7 @@ extern "C" int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *contex
         elements > static_cast<size_t>(INT32_MAX) || epsilon <= 0.0f)
         return FORTAI_CUDA_INVALID;
     cudaSetDevice(context->impl.device);
-    qwen_rms_norm_float<<<1, 256, 0, context->impl.stream>>>(
+    qwen_rms_norm_float<<<1, 1024, 0, context->impl.stream>>>(
         static_cast<const float *>(device_input), static_cast<const float *>(device_weights),
         static_cast<float *>(device_output), static_cast<int>(elements), epsilon);
     const cudaError_t error = cudaGetLastError();
@@ -1939,23 +2075,22 @@ extern "C" int fortai_cuda_qwen35_recurrent_run(fortai_cuda_qwen35_recurrent *la
     }
     if (error == cudaSuccess) {
         const int slices = 2 * layer->impl.key_heads;
-        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(double), context->stream>>>(
+        qwen_recurrent_l2_normalize<<<slices, 128, 4 * sizeof(float), context->stream>>>(
             layer->impl.qkv_output, slices, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        qwen_recurrent_gdn_rows<<<layer->impl.value_heads * layer->impl.head_size,
-            32, sizeof(float), context->stream>>>(
-            layer->impl.qkv_output, layer->impl.gate_output, layer->impl.alpha_output,
+        launch_qwen_recurrent_gdn_fused(
+            layer->impl.qkv_output, layer->impl.alpha_output,
             layer->impl.beta_output, layer->impl.ssm_a, layer->impl.ssm_dt,
             layer->impl.gdn_state, layer->impl.gdn_output,
             layer->impl.state_size, layer->impl.key_heads, layer->impl.value_heads,
-            layer->impl.head_size);
+            layer->impl.head_size, context->stream);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
-            static_cast<size_t>(layer->impl.head_size) * sizeof(double), context->stream>>>(
+        qwen_recurrent_gdn_norm_gate<<<layer->impl.value_heads, 128,
+            4 * sizeof(float), context->stream>>>(
             layer->impl.gdn_output, layer->impl.gate_output, layer->impl.ssm_norm,
             layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
@@ -2023,23 +2158,22 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_device(
     }
     if (error == cudaSuccess) {
         const int slices = 2 * layer->impl.key_heads;
-        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(double), context->stream>>>(
+        qwen_recurrent_l2_normalize<<<slices, 128, 4 * sizeof(float), context->stream>>>(
             layer->impl.qkv_output, slices, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        qwen_recurrent_gdn_rows<<<layer->impl.value_heads * layer->impl.head_size,
-            32, sizeof(float), context->stream>>>(
-            layer->impl.qkv_output, layer->impl.gate_output, layer->impl.alpha_output,
+        launch_qwen_recurrent_gdn_fused(
+            layer->impl.qkv_output, layer->impl.alpha_output,
             layer->impl.beta_output, layer->impl.ssm_a, layer->impl.ssm_dt,
             layer->impl.gdn_state, layer->impl.gdn_output,
             layer->impl.state_size, layer->impl.key_heads, layer->impl.value_heads,
-            layer->impl.head_size);
+            layer->impl.head_size, context->stream);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
-            static_cast<size_t>(layer->impl.head_size) * sizeof(double), context->stream>>>(
+        qwen_recurrent_gdn_norm_gate<<<layer->impl.value_heads, 128,
+            4 * sizeof(float), context->stream>>>(
             layer->impl.gdn_output, layer->impl.gate_output, layer->impl.ssm_norm,
             layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
@@ -2082,22 +2216,22 @@ extern "C" int fortai_cuda_qwen35_recurrent_run_core_device(
     error = cudaGetLastError();
     if (error == cudaSuccess) {
         const int slices = 2 * layer->impl.key_heads;
-        qwen_recurrent_l2_normalize<<<slices, 128, 128 * sizeof(double), context->stream>>>(
+        qwen_recurrent_l2_normalize<<<slices, 128, 4 * sizeof(float), context->stream>>>(
             static_cast<float *>(device_qkv), slices, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        qwen_recurrent_gdn_rows<<<layer->impl.value_heads * layer->impl.head_size,
-            32, sizeof(float), context->stream>>>(static_cast<const float *>(device_qkv),
-            static_cast<const float *>(device_gate), static_cast<const float *>(device_alpha),
+        launch_qwen_recurrent_gdn_fused(static_cast<const float *>(device_qkv),
+            static_cast<const float *>(device_alpha),
             static_cast<const float *>(device_beta), layer->impl.ssm_a, layer->impl.ssm_dt,
             layer->impl.gdn_state, layer->impl.gdn_output, layer->impl.state_size,
-            layer->impl.key_heads, layer->impl.value_heads, layer->impl.head_size);
+            layer->impl.key_heads, layer->impl.value_heads, layer->impl.head_size,
+            context->stream);
         error = cudaGetLastError();
     }
     if (error == cudaSuccess) {
-        qwen_recurrent_gdn_normalize<<<layer->impl.value_heads, layer->impl.head_size,
-            static_cast<size_t>(layer->impl.head_size) * sizeof(double), context->stream>>>(
+        qwen_recurrent_gdn_norm_gate<<<layer->impl.value_heads, 128,
+            4 * sizeof(float), context->stream>>>(
             layer->impl.gdn_output, static_cast<const float *>(device_gate), layer->impl.ssm_norm,
             layer->impl.value_heads, layer->impl.head_size, layer->impl.norm_epsilon);
         error = cudaGetLastError();

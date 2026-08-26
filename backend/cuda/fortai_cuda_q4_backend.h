@@ -55,6 +55,26 @@ int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights *weights, const void *device_activation,
     size_t activation_elements, void *device_output, size_t output_elements);
 
+/* Execute the Q4 gate/up projections and SwiGLU activation as one GGML-CUDA
+ * fused graph.  The result is returned on the primary device (or directly on
+ * the weight device for the remote-output variant below). */
+int fortai_cuda_q4_matvec_device_swiglu(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *gate_weights,
+    const fortai_cuda_q4_weights *up_weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements);
+int fortai_cuda_q4_matvec_device_swiglu_remote_output(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *gate_weights,
+    const fortai_cuda_q4_weights *up_weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements);
+/* Keep the specialized gate/up and down graphs on one GGML-CUDA stream so a
+ * resident FFN crosses between the native and Q4 schedulers only once. */
+int fortai_cuda_q4_matvec_device_swiglu_down(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *gate_weights,
+    const fortai_cuda_q4_weights *up_weights,
+    const fortai_cuda_q4_weights *down_weights, const void *device_activation,
+    size_t activation_elements, void *device_output, size_t output_elements);
+
+
 /* Execute up to three projections that consume the same resident activation.
  * The implementation builds one cached GGML graph per participating device;
  * remote weights use one peer activation copy for the whole group. */

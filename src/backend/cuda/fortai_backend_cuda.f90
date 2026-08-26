@@ -93,6 +93,9 @@ module fortai_backend_cuda
     public :: cuda_q4_matvec_host_pair
     public :: cuda_q4_matvec_host_triplet
     public :: cuda_q4_matvec_device
+    public :: cuda_q4_matvec_device_swiglu
+    public :: cuda_q4_matvec_device_swiglu_remote_output
+    public :: cuda_q4_matvec_device_swiglu_down
     public :: cuda_q4_matvec_device_pair
     public :: cuda_q4_matvec_device_triplet
     public :: cuda_q4_matvec_device_group_remote_output
@@ -275,6 +278,33 @@ module fortai_backend_cuda
             integer(c_size_t), value :: activation_elements, output_elements
             integer(c_int) :: code
         end function c_q4_matvec_device
+
+        function c_q4_matvec_device_swiglu(context, gate_weights, up_weights, device_activation, &
+                activation_elements, device_output, output_elements) &
+                bind(C, name='fortai_cuda_q4_matvec_device_swiglu') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, gate_weights, up_weights, device_activation, device_output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int) :: code
+        end function c_q4_matvec_device_swiglu
+
+        function c_q4_matvec_device_swiglu_remote_output(context, gate_weights, up_weights, device_activation, &
+                activation_elements, device_output, output_elements) &
+                bind(C, name='fortai_cuda_q4_matvec_device_swiglu_remote_output') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, gate_weights, up_weights, device_activation, device_output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int) :: code
+        end function c_q4_matvec_device_swiglu_remote_output
+
+        function c_q4_matvec_device_swiglu_down(context, gate_weights, up_weights, down_weights, device_activation, &
+                activation_elements, device_output, output_elements) &
+                bind(C, name='fortai_cuda_q4_matvec_device_swiglu_down') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, gate_weights, up_weights, down_weights, device_activation, device_output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int) :: code
+        end function c_q4_matvec_device_swiglu_down
 
         function c_q4_matvec_device_group(context, weights, device_activation, activation_elements, &
                 device_outputs, output_elements, count) bind(C, name='fortai_cuda_q4_matvec_device_group') &
@@ -870,6 +900,72 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA Q4 resident matvec failed')
     end subroutine cuda_q4_matvec_device
+
+    subroutine cuda_q4_matvec_device_swiglu(context, gate_weights, up_weights, device_activation, &
+            activation_elements, device_output, output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: gate_weights, up_weights
+        type(c_ptr), intent(in) :: device_activation, device_output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(gate_weights%handle) .or. &
+            .not. c_associated(up_weights%handle) .or. .not. c_associated(device_activation) .or. &
+            .not. c_associated(device_output)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 fused SwiGLU arguments')
+            return
+        end if
+        code = c_q4_matvec_device_swiglu(context%handle, gate_weights%handle, up_weights%handle, &
+            device_activation, activation_elements, device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 fused SwiGLU matvec failed')
+    end subroutine cuda_q4_matvec_device_swiglu
+
+    subroutine cuda_q4_matvec_device_swiglu_remote_output(context, gate_weights, up_weights, device_activation, &
+            activation_elements, device_output, output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: gate_weights, up_weights
+        type(c_ptr), intent(in) :: device_activation, device_output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(gate_weights%handle) .or. &
+            .not. c_associated(up_weights%handle) .or. .not. c_associated(device_activation) .or. &
+            .not. c_associated(device_output)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 fused remote SwiGLU arguments')
+            return
+        end if
+        code = c_q4_matvec_device_swiglu_remote_output(context%handle, gate_weights%handle, &
+            up_weights%handle, device_activation, activation_elements, device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 fused remote SwiGLU matvec failed')
+    end subroutine cuda_q4_matvec_device_swiglu_remote_output
+
+    subroutine cuda_q4_matvec_device_swiglu_down(context, gate_weights, up_weights, down_weights, device_activation, &
+            activation_elements, device_output, output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: gate_weights, up_weights, down_weights
+        type(c_ptr), intent(in) :: device_activation, device_output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(gate_weights%handle) .or. &
+            .not. c_associated(up_weights%handle) .or. .not. c_associated(down_weights%handle) .or. &
+            .not. c_associated(device_activation) .or. .not. c_associated(device_output)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 fused SwiGLU/down arguments')
+            return
+        end if
+        code = c_q4_matvec_device_swiglu_down(context%handle, gate_weights%handle, up_weights%handle, &
+            down_weights%handle, device_activation, activation_elements, device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 fused SwiGLU/down matvec failed')
+    end subroutine cuda_q4_matvec_device_swiglu_down
 
     subroutine cuda_q4_matvec_device_pair(context, first_weights, second_weights, device_activation, &
             activation_elements, first_output, first_output_elements, second_output, second_output_elements, stat)
