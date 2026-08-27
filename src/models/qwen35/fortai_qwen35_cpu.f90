@@ -2378,13 +2378,19 @@ contains
         type(c_ptr), intent(in) :: device_output
         integer(c_size_t), intent(in) :: output_elements
         type(status_t), intent(out) :: stat
+        logical :: q4_embedding_ready
 
         call stat%clear()
+        q4_embedding_ready = .false.
+        if (self%cuda_q4_resident) then
+            if (allocated(self%cuda_q4_weights)) then
+                q4_embedding_ready = c_associated(self%cuda_q4_weights(self%token_embedding)%handle)
+            end if
+        end if
         if (self%file%tensors(self%token_embedding)%value_type == GGML_TYPE_Q8_0) then
             call cuda_qwen35_embedding_device(self%cuda, self%cuda_weights(self%token_embedding), &
                 int(token_id, c_int64_t), device_output, output_elements, stat)
-        else if (self%cuda_q4_resident .and. allocated(self%cuda_q4_weights) .and. &
-                c_associated(self%cuda_q4_weights(self%token_embedding)%handle)) then
+        else if (q4_embedding_ready) then
             call cuda_q4_embedding_device(self%cuda_q4, self%cuda_q4_weights(self%token_embedding), &
                 int(token_id, c_int64_t), device_output, output_elements, stat)
         else if (self%cuda_q4_resident) then

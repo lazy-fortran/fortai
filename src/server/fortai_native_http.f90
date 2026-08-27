@@ -5,7 +5,7 @@ module fortai_native_http
     !! templating, response serialization, and the web UI live here so they
     !! share the same growable string_t implementation as the runtime.
     use, intrinsic :: iso_c_binding, only: c_char, c_int, c_null_char
-    use, intrinsic :: iso_fortran_env, only: int32, int64, real32
+    use, intrinsic :: iso_fortran_env, only: int32, int64, real32, real64
     use fortai_native_service, only: fortai_native_service_complete_text_sampling, &
         fortai_native_service_tokenize, fortai_native_service_detokenize, fortai_native_service_token_piece, &
         fortai_native_service_default_thinking, fortai_native_service_supports_preserve_thinking, &
@@ -13,7 +13,9 @@ module fortai_native_http
         fortai_native_service_mtp_active, fortai_native_service_external_draft_active, &
         fortai_native_service_mtp_sidecar_active, fortai_native_service_device_pipeline, &
         fortai_native_service_context_size, fortai_native_service_cache_reuse_supported, &
-        fortai_native_service_cache_reuse_active, fortai_native_service_cache_reuse_count
+        fortai_native_service_cache_reuse_active, fortai_native_service_cache_reuse_count, &
+        fortai_native_service_last_prompt_ms, fortai_native_service_last_generation_ms, &
+        fortai_native_service_last_prompt_tokens, fortai_native_service_last_generation_tokens
     use fortai_whisper_service, only: fortai_whisper_http_handle
     use fortai_string, only: string_t
     implicit none
@@ -2156,6 +2158,51 @@ contains
         okay = .true.
     end subroutine parse_http_request
 
+    subroutine append_json_real(output, value)
+        type(string_t), intent(inout) :: output
+        real(real64), intent(in) :: value
+        character(len=64) :: number
+
+        write(number, '(f0.3)') value
+        call output%append(trim(adjustl(number)))
+    end subroutine append_json_real
+
+    subroutine append_timings(output, prompt_tokens, generation_tokens)
+        type(string_t), intent(inout) :: output
+        integer, intent(in) :: prompt_tokens, generation_tokens
+        real(real64) :: prompt_ms, generation_ms, prompt_rate, generation_rate
+        integer(int64) :: measured_prompt_tokens, measured_generation_tokens
+
+        prompt_ms = max(0.0_real64, fortai_native_service_last_prompt_ms())
+        generation_ms = max(0.0_real64, fortai_native_service_last_generation_ms())
+        measured_prompt_tokens = max(0_int64, fortai_native_service_last_prompt_tokens())
+        measured_generation_tokens = max(0_int64, fortai_native_service_last_generation_tokens())
+        if (measured_prompt_tokens == 0_int64 .and. prompt_tokens > 0 .and. prompt_ms > 0.0_real64) then
+            measured_prompt_tokens = int(prompt_tokens, int64)
+        end if
+        if (measured_generation_tokens == 0_int64 .and. generation_tokens > 0 .and. generation_ms > 0.0_real64) then
+            measured_generation_tokens = int(generation_tokens, int64)
+        end if
+        prompt_rate = 0.0_real64
+        generation_rate = 0.0_real64
+        if (prompt_ms > 0.0_real64) prompt_rate = 1000.0_real64 * real(measured_prompt_tokens, real64) / prompt_ms
+        if (generation_ms > 0.0_real64) generation_rate = &
+            1000.0_real64 * real(measured_generation_tokens, real64) / generation_ms
+        call output%append('"timings":{"prompt_n":')
+        call output%append_int(int(measured_prompt_tokens))
+        call output%append(',"prompt_ms":')
+        call append_json_real(output, prompt_ms)
+        call output%append(',"prompt_per_second":')
+        call append_json_real(output, prompt_rate)
+        call output%append(',"predicted_n":')
+        call output%append_int(int(measured_generation_tokens))
+        call output%append(',"predicted_ms":')
+        call append_json_real(output, generation_ms)
+        call output%append(',"predicted_per_second":')
+        call append_json_real(output, generation_rate)
+        call output%append('}')
+    end subroutine append_timings
+
     integer function unix_timestamp()
         integer, parameter :: days_in_month(12) = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
         integer :: calendar(8), year, month, day, leap_days
@@ -2248,7 +2295,9 @@ contains
             else
                 call response%append('"stop"')
             end if
-            call response%append('}],"fortai_backend":"fortai"}')
+            call response%append('}],')
+            call append_timings(response, prompt_tokens, tokens)
+            call response%append(',"fortai_backend":"fortai"}')
             call response%append(char(10)); call response%append(char(10))
             call response%append('data: [DONE]'); call response%append(char(10)); call response%append(char(10))
             return
@@ -2293,7 +2342,9 @@ contains
             call response%append(',"completion_tokens":')
             call response%append_int(tokens); call response%append(',"total_tokens":')
             call response%append_int(prompt_tokens + tokens)
-            call response%append('},"fortai_backend":"fortai"}'); call response%append(char(10))
+            call response%append('},')
+            call append_timings(response, prompt_tokens, tokens)
+            call response%append(',"fortai_backend":"fortai"}'); call response%append(char(10))
         else
             call response%append(',"choices":[{"index":0,"text":')
             call response%append_string(text_json)
@@ -2302,7 +2353,9 @@ contains
             call response%append(',"completion_tokens":')
             call response%append_int(tokens); call response%append(',"total_tokens":')
             call response%append_int(prompt_tokens + tokens)
-            call response%append('},"fortai_backend":"fortai"}'); call response%append(char(10))
+            call response%append('},')
+            call append_timings(response, prompt_tokens, tokens)
+            call response%append(',"fortai_backend":"fortai"}'); call response%append(char(10))
         end if
     end subroutine completion_body
 
@@ -2415,7 +2468,9 @@ contains
         call response%append_int(tokens)
         call response%append(',"total_tokens":')
         call response%append_int(prompt_tokens + tokens)
-        call response%append('},"store":false,"fortai_backend":"fortai"}')
+        call response%append('},"store":false,')
+        call append_timings(response, prompt_tokens, tokens)
+        call response%append(',"fortai_backend":"fortai"}')
     end function response_json
 
     subroutine append_sse_event(response, event_name, payload)

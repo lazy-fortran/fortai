@@ -1,6 +1,6 @@
 module fortai_native_service
     use, intrinsic :: iso_c_binding, only: c_char, c_int, c_null_char
-    use, intrinsic :: iso_fortran_env, only: error_unit, int32, int64, real32
+    use, intrinsic :: iso_fortran_env, only: error_unit, int32, int64, real32, real64
     use fortai_gguf_runtime, only: gguf_file_t
     use fortai_native_tokenizer, only: fortai_native_tokenizer_t
     use fortai_qwen35_cpu, only: qwen35_cpu_model_t
@@ -29,6 +29,10 @@ module fortai_native_service
     logical, save :: service_ready = .false.
     logical, save :: service_external_draft_active = .false.
     logical, save :: service_mtp_sidecar_active = .false.
+    real(real64), save :: service_last_prompt_ms = 0.0_real64
+    real(real64), save :: service_last_generation_ms = 0.0_real64
+    integer(int64), save :: service_last_prompt_tokens = 0_int64
+    integer(int64), save :: service_last_generation_tokens = 0_int64
 
     type :: sampling_options_t
         integer :: top_k = 40
@@ -61,6 +65,10 @@ module fortai_native_service
     public :: fortai_native_service_cache_reuse_supported
     public :: fortai_native_service_cache_reuse_active
     public :: fortai_native_service_cache_reuse_count
+    public :: fortai_native_service_last_prompt_ms
+    public :: fortai_native_service_last_generation_ms
+    public :: fortai_native_service_last_prompt_tokens
+    public :: fortai_native_service_last_generation_tokens
 
 contains
 
@@ -177,6 +185,10 @@ contains
         service_ready = .false.
         service_external_draft_active = .false.
         service_mtp_sidecar_active = .false.
+        service_last_prompt_ms = 0.0_real64
+        service_last_generation_ms = 0.0_real64
+        service_last_prompt_tokens = 0_int64
+        service_last_generation_tokens = 0_int64
     end subroutine fortai_native_service_close
 
     logical function fortai_native_service_default_thinking()
@@ -233,6 +245,22 @@ contains
         fortai_native_service_cache_reuse_count = 0_int64
         if (service_cache_valid) fortai_native_service_cache_reuse_count = int(service_cache_count, int64)
     end function fortai_native_service_cache_reuse_count
+
+    real(real64) function fortai_native_service_last_prompt_ms()
+        fortai_native_service_last_prompt_ms = service_last_prompt_ms
+    end function fortai_native_service_last_prompt_ms
+
+    real(real64) function fortai_native_service_last_generation_ms()
+        fortai_native_service_last_generation_ms = service_last_generation_ms
+    end function fortai_native_service_last_generation_ms
+
+    integer(int64) function fortai_native_service_last_prompt_tokens()
+        fortai_native_service_last_prompt_tokens = service_last_prompt_tokens
+    end function fortai_native_service_last_prompt_tokens
+
+    integer(int64) function fortai_native_service_last_generation_tokens()
+        fortai_native_service_last_generation_tokens = service_last_generation_tokens
+    end function fortai_native_service_last_generation_tokens
 
     logical function fortai_native_service_tokenize(text, add_special, parse_special, ids)
         character(len=*), intent(in) :: text
@@ -537,6 +565,8 @@ contains
         integer(int64) :: draft_next_token
         integer(int64) :: speculative_tokens(32)
         integer(int64) :: random_state
+        integer(int64) :: prompt_clock_start, prompt_clock_end
+        integer(int64) :: generation_clock_start, generation_clock_end, clock_rate
         integer :: i, j, generated_count, speculative_count, prompt_start, state_count, cache_count
         real(real32) :: logit_sum, draft_logit_sum
         logical :: use_external_draft, use_native_mtp
@@ -557,6 +587,10 @@ contains
         token_count = 0
         if (present(prompt_token_count)) prompt_token_count = 0
         call output_text%clear()
+        service_last_prompt_ms = 0.0_real64
+        service_last_generation_ms = 0.0_real64
+        service_last_prompt_tokens = 0_int64
+        service_last_generation_tokens = 0_int64
         if (.not. service_ready) return
         if (max_tokens <= 0) return
         if (.not. finite_real32(temperature)) return
@@ -682,6 +716,7 @@ contains
                 end if
             end if
         end if
+        call system_clock(count=prompt_clock_start, count_rate=clock_rate)
         do i = prompt_start, size(prompt_ids)
             if (temperature > 0.0_real32) then
                 call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat, &
@@ -725,7 +760,16 @@ contains
                 end if
             end if
         end do
+        call system_clock(count=prompt_clock_end)
+        if (clock_rate > 0_int64) then
+            service_last_prompt_ms = 1000.0_real64 * real(prompt_clock_end - prompt_clock_start, real64) / &
+                real(clock_rate, real64)
+        end if
+        if (prompt_start <= size(prompt_ids)) then
+            service_last_prompt_tokens = int(size(prompt_ids) - prompt_start + 1, int64)
+        end if
         generated_count = 0
+        call system_clock(count=generation_clock_start)
         do while (generated_count < max_tokens .and. size(prompt_ids) + generated_count < service_model%max_context)
             if (current < 0_int64) exit
             if (.not. ignore_eos .and. service_tokenizer%is_stop(int(current, int32))) exit
@@ -815,6 +859,12 @@ contains
                 end if
             end if
         end do
+        call system_clock(count=generation_clock_end)
+        if (clock_rate > 0_int64) then
+            service_last_generation_ms = 1000.0_real64 * real(generation_clock_end - generation_clock_start, real64) / &
+                real(clock_rate, real64)
+        end if
+        service_last_generation_tokens = int(generated_count, int64)
         if (generated_count > 0) then
             block
                 character(len=:), allocatable :: decoded

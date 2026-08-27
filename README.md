@@ -22,6 +22,51 @@ insufficient. The workload-specific speed gate remains explicit. A separate
 compatibility smoke remains available as an independent upstream llama.cpp
 oracle.
 
+## Measured serving
+
+The following direct OpenAI-compatible requests were measured on 2026-08-27
+with CUDA 13.3 and two RTX 5060 Ti (16 GiB) cards. Qwen3.8-27B
+`UD-Q4_K_XL` used the production split (`0.57,0.43`), 14 compute threads,
+`batch=2048`, `ubatch=256`, q8 K/V, flash attention, and eight greedy output
+tokens. Every row used a fresh prompt prefix, so the resident prefix cache
+could not affect the result. The payload is the one sent by OpenCode; these
+are model timings from the response, not full CLI orchestration time.
+
+| Prompt tokens (FortAI / llama.cpp) | FortAI prefill (tok/s) | llama.cpp prefill (tok/s) | FortAI generation (tok/s) | llama.cpp generation (tok/s) |
+|---:|---:|---:|---:|---:|
+| 157 / 159 | 18.2 | 185.3 | 19.4 | 22.8 |
+| 541 / 543 | 17.0 | 336.9 | 17.2 | 28.7 |
+| 1054 / 1056 | 15.2 | 551.3 | 14.3 | 17.6 |
+| 2078 / 2080 | 12.8 | 767.3 | 10.6 | 24.5 |
+
+The llama.cpp reference used `-c 4096` because its full production-context
+allocation did not fit beside the independent test services; FortAI used its
+production `-c 262144` profile and native MTP sidecar. Thus the table is a
+stress result, not a claim of speed parity. FortAI currently needs prompt
+batching to close the prefill gap ([issue #2](https://github.com/lazy-fortran/fortai/issues/2)); a bounded full OpenCode CLI run is not yet promotion evidence.
+
+### Whisper CUDA (`large-v3-turbo`)
+
+These are end-to-end multipart HTTP latencies with four CPU threads, flash
+attention, one visible RTX 5060 Ti, and deterministic decoding. “Warm” is the
+steady-state median after the first request; first-request CUDA graph setup is
+reported separately in the benchmark logs and intentionally not used as the
+throughput comparison. Both implementations returned the same JFK
+transcription; the 1-second silence case is included as a frontend/decoder
+stress point.
+
+| Audio context | Server | Warm median (ms) |
+|---:|---|---:|
+| 1 s silence | whisper.cpp | 79.9 |
+| 1 s silence | FortAI | 81.7 |
+| 11 s JFK sample | whisper.cpp | 128.2 |
+| 11 s JFK sample | FortAI | 132.1 |
+
+The native Whisper service is the production service on port `8427`; the
+reference processes were private localhost servers and were stopped after the
+comparison. Whisper exposes an end-to-end transcription time rather than
+separate prefill/generation counters.
+
 ## Design
 
 FortAI keeps model semantics, state lifetime, and scheduling in Fortran. A
