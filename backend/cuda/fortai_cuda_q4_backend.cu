@@ -1884,6 +1884,12 @@ int fortai_cuda_q4_embedding_device(fortai_cuda_q4_context *context,
         &context->embedding_id, 0, sizeof(context->embedding_id));
     const int primary_device = context->device_ids[0];
     const bool remote = weights->device != primary_device;
+    /* Token lookup writes directly into the native Q8 stream's activation
+     * buffer.  When the preceding token deliberately skipped its output
+     * projection (prompt fast path), make the Q4 scheduler wait for the
+     * last Q8 producer before overwriting that buffer. */
+    if (fortai_cuda_q4_prepare_input(context, weights->device) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
     void *output_ptr = device_output;
     if (remote) {
         if (weights->device != context->device_ids[1]) return FORTAI_CUDA_INVALID;

@@ -2162,9 +2162,17 @@ contains
         type(string_t), intent(inout) :: output
         real(real64), intent(in) :: value
         character(len=64) :: number
+        character(len=:), allocatable :: normalized
 
         write(number, '(f0.3)') value
-        call output%append(trim(adjustl(number)))
+        normalized = trim(adjustl(number))
+        if (len(normalized) > 0) then
+            if (normalized(1:1) == '.') normalized = '0' // normalized
+        end if
+        if (len(normalized) >= 2) then
+            if (normalized(1:2) == '-.') normalized = '-0' // normalized(2:)
+        end if
+        call output%append(normalized)
     end subroutine append_json_real
 
     subroutine append_timings(output, prompt_tokens, generation_tokens)

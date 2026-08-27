@@ -1658,29 +1658,43 @@ contains
         self%mtp_last_draft_match = .false.
     end subroutine qwen35_cpu_reset
 
-    subroutine qwen35_cpu_forward(self, token_id, position, logits, stat, download_logits)
+    subroutine qwen35_cpu_forward(self, token_id, position, logits, stat, download_logits, use_mtp, save_mtp_hidden, &
+            compute_logits)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id, position
         real(real32), contiguous, intent(out) :: logits(:)
         type(status_t), intent(out) :: stat
         logical, intent(in), optional :: download_logits
-        logical :: should_download
+        logical, intent(in), optional :: use_mtp
+        logical, intent(in), optional :: save_mtp_hidden
+        logical, intent(in), optional :: compute_logits
+        logical :: should_download, should_use_mtp, should_save_mtp, should_compute_logits
 
         should_download = .true.
         if (present(download_logits)) should_download = download_logits
+        should_use_mtp = .true.
+        if (present(use_mtp)) should_use_mtp = use_mtp
+        should_save_mtp = should_use_mtp
+        if (present(save_mtp_hidden)) should_save_mtp = save_mtp_hidden
+        should_compute_logits = .true.
+        if (present(compute_logits)) should_compute_logits = compute_logits
 
         if (self%fast_enabled) then
-            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download)
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download, should_use_mtp, &
+                should_save_mtp, should_compute_logits)
         else if (self%persistent_openmp .and. .not. self%cuda_device_pipeline) then
             self%persistent_openmp_active = .true.
-            !$omp parallel default(none) shared(self, token_id, position, logits, stat, should_download)
+            !$omp parallel default(none) shared(self, token_id, position, logits, stat, should_download, &
+            !$omp& should_use_mtp, should_save_mtp, should_compute_logits)
             !$omp single
-            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download)
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download, should_use_mtp, &
+                should_save_mtp, should_compute_logits)
             !$omp end single
             !$omp end parallel
             self%persistent_openmp_active = .false.
         else
-            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download)
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download, should_use_mtp, &
+                should_save_mtp, should_compute_logits)
         end if
     end subroutine qwen35_cpu_forward
 
@@ -1771,16 +1785,27 @@ contains
         if (ios == 0 .and. parsed >= 1 .and. parsed <= 32) native_mtp_limit = parsed
     end function native_mtp_limit
 
-    subroutine qwen35_cpu_forward_greedy(self, token_id, position, next_token, logit_sum, stat)
+    subroutine qwen35_cpu_forward_greedy(self, token_id, position, next_token, logit_sum, stat, use_mtp, &
+            save_mtp_hidden, compute_logits)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id, position
         integer(int64), intent(out) :: next_token
         real(real32), intent(out) :: logit_sum
         type(status_t), intent(out) :: stat
+        logical, intent(in), optional :: use_mtp
+        logical, intent(in), optional :: save_mtp_hidden
+        logical, intent(in), optional :: compute_logits
         integer(c_int) :: code, next_token_c
+        logical :: should_use_mtp, should_save_mtp, should_compute_logits
 
         next_token = 0_int64
         logit_sum = 0.0_real32
+        should_use_mtp = .true.
+        if (present(use_mtp)) should_use_mtp = use_mtp
+        should_save_mtp = should_use_mtp
+        if (present(save_mtp_hidden)) should_save_mtp = save_mtp_hidden
+        should_compute_logits = .true.
+        if (present(compute_logits)) should_compute_logits = compute_logits
         if (self%fast_enabled) then
             code = fortai_llama_fast_context_decode_greedy(self%fast_handle, &
                 int(token_id, c_int), int(position, c_int), next_token_c, logit_sum)
@@ -1798,8 +1823,10 @@ contains
             return
         end if
         if (self%cuda_device_pipeline) then
-            call qwen35_cpu_forward_body(self, token_id, position, self%logits, stat, .false.)
+            call qwen35_cpu_forward_body(self, token_id, position, self%logits, stat, .false., should_use_mtp, &
+                should_save_mtp, should_compute_logits)
             if (.not. stat%is_ok()) return
+            if (.not. should_compute_logits) return
             block
                 integer :: index
                 call self%cuda%argmax_device(self%cuda_logits, int(self%vocabulary_size, c_size_t), index, stat)
@@ -1808,7 +1835,8 @@ contains
             end block
             return
         end if
-        call qwen35_cpu_forward(self, token_id, position, self%logits, stat, .true.)
+        call qwen35_cpu_forward(self, token_id, position, self%logits, stat, .true., should_use_mtp, should_save_mtp, &
+            should_compute_logits)
         if (.not. stat%is_ok()) return
         logit_sum = sum(self%logits)
         next_token = int(maxloc(self%logits, dim=1) - 1, int64)
@@ -1872,18 +1900,28 @@ contains
         end do
     end subroutine qwen35_cpu_forward_greedy_speculative
 
-    subroutine qwen35_cpu_forward_body(self, token_id, position, logits, stat, download_logits)
+    subroutine qwen35_cpu_forward_body(self, token_id, position, logits, stat, download_logits, use_mtp, &
+            save_mtp_hidden, compute_logits)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id, position
         real(real32), contiguous, intent(out) :: logits(:)
         type(status_t), intent(out) :: stat
         logical, intent(in), optional :: download_logits
+        logical, intent(in), optional :: use_mtp
+        logical, intent(in), optional :: save_mtp_hidden
+        logical, intent(in), optional :: compute_logits
         integer :: i
-        logical :: capture_graph, should_download
+        logical :: capture_graph, should_download, should_use_mtp, should_save_mtp, should_compute_logits
 
         call stat % clear()
         should_download = .true.
         if (present(download_logits)) should_download = download_logits
+        should_use_mtp = .true.
+        if (present(use_mtp)) should_use_mtp = use_mtp
+        should_save_mtp = should_use_mtp
+        if (present(save_mtp_hidden)) should_save_mtp = save_mtp_hidden
+        should_compute_logits = .true.
+        if (present(compute_logits)) should_compute_logits = compute_logits
         if ((.not. self%fast_enabled .and. .not. allocated(self % x)) .or. &
             size(logits) /= self % vocabulary_size) then
             call stat % set(FORTAI_INVALID, 'Qwen3.5 CPU model is not open')
@@ -1897,7 +1935,7 @@ contains
             call stat % set(FORTAI_INVALID, 'Qwen3.5 position exceeds the CPU context')
             return
         end if
-        if (self%mtp_active) then
+        if (self%mtp_active .and. should_use_mtp) then
             if (.not. allocated(self%mtp_pending_hidden)) then
                 call stat%set(FORTAI_INVALID, 'Qwen3.5 native MTP workspace is not allocated')
                 return
@@ -1933,10 +1971,10 @@ contains
             if (.not. stat % is_ok()) return
         end if
         capture_graph = .false.
-        ! Prompt evaluation can skip the host logits transfer for intermediate
-        ! tokens, while retaining the output projection for the established
-        ! CUDA graph and model-state behavior.
-        if (self%cuda_device_pipeline .and. self%cuda_graph_enabled) then
+        ! Prompt evaluation can skip logits work for intermediate tokens.  The
+        ! final token still runs the output projection and records the hidden
+        ! state needed by the native MTP verifier.
+        if (self%cuda_device_pipeline .and. self%cuda_graph_enabled .and. should_compute_logits) then
             if (self%cuda_graph_ready) then
                 call self%cuda%graph_launch(stat)
                 if (.not. stat%is_ok()) return
@@ -1948,7 +1986,7 @@ contains
         end if
 
         if (.not. self%cuda_device_pipeline .or. .not. self%cuda_graph_ready .or. &
-            .not. self%cuda_graph_enabled) then
+            .not. self%cuda_graph_enabled .or. .not. should_compute_logits) then
             do i = 1, self % layer_count
                 if (self%cuda_device_pipeline) then
                     if (cuda_layer_device_ready(self, i)) then
@@ -2022,7 +2060,7 @@ contains
             end do
         end if
 
-        if (self%cuda_device_pipeline .and. (.not. self%cuda_graph_ready .or. &
+        if (self%cuda_device_pipeline .and. should_compute_logits .and. (.not. self%cuda_graph_ready .or. &
             .not. self%cuda_graph_enabled)) then
             call forward_output_device(self, stat)
             if (.not. stat%is_ok()) return
@@ -2042,7 +2080,7 @@ contains
         ! token's host-side MTP verification can consume it without forcing
         ! the whole target decode back through the host-boundary path.  This
         ! download must happen after graph capture has ended.
-        if (self%cuda_device_pipeline .and. self%mtp_active) then
+        if (self%cuda_device_pipeline .and. self%mtp_active .and. should_save_mtp) then
             call self%cuda%download_real(self%cuda_x, self%x, stat)
             if (.not. stat%is_ok()) return
             self%mtp_pending_hidden = self%x
@@ -2050,17 +2088,18 @@ contains
         end if
 
         if (self%cuda_device_pipeline) then
-            if (should_download) then
+            if (should_compute_logits .and. should_download) then
                 call self%cuda%download_real(self%cuda_logits, logits, stat)
                 if (.not. stat%is_ok()) return
             end if
             return
         end if
+        if (.not. should_compute_logits) return
         call rms_norm(self%x, self%file%tensors(self%output_norm), self%norm_epsilon, &
             self % normalized, stat)
         if (.not. stat % is_ok()) return
         call model_matvec(self, self % output, self % normalized, logits, stat)
-        if (stat%is_ok() .and. self%mtp_active) then
+        if (stat%is_ok() .and. self%mtp_active .and. should_save_mtp) then
             self%mtp_pending_hidden = self%x
             self%mtp_last_target_position = position
         end if

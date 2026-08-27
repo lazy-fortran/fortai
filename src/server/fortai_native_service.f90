@@ -720,7 +720,7 @@ contains
         do i = prompt_start, size(prompt_ids)
             if (temperature > 0.0_real32) then
                 call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat, &
-                    i == size(prompt_ids))
+                    i == size(prompt_ids), .false., i == size(prompt_ids), i == size(prompt_ids))
                 if (stat%is_ok()) then
                     if (i == size(prompt_ids)) then
                         current = sample_logits(logits, temperature, random_state, sampling_history, i, options, &
@@ -730,7 +730,7 @@ contains
             else
                 if (sampling_penalties_active(options)) then
                     call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat, &
-                        i == size(prompt_ids))
+                        i == size(prompt_ids), .false., i == size(prompt_ids), i == size(prompt_ids))
                     if (stat%is_ok()) then
                         if (i == size(prompt_ids)) then
                             current = greedy_penalized(logits, adjusted_logits, history_counts, sampling_history, i, &
@@ -739,7 +739,7 @@ contains
                     end if
                 else
                     call service_model%forward_greedy(int(prompt_ids(i), int64), int(i - 1, int64), &
-                        next_token, logit_sum, stat)
+                        next_token, logit_sum, stat, .false., i == size(prompt_ids), i == size(prompt_ids))
                     if (stat%is_ok()) current = next_token
                 end if
             end if

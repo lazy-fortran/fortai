@@ -30,20 +30,26 @@ with CUDA 13.3 and two RTX 5060 Ti (16 GiB) cards. Qwen3.8-27B
 `batch=2048`, `ubatch=256`, q8 K/V, flash attention, and eight greedy output
 tokens. Every row used a fresh prompt prefix, so the resident prefix cache
 could not affect the result. The payload is the one sent by OpenCode; these
-are model timings from the response, not full CLI orchestration time.
+are model timings from the response, not full CLI orchestration time. The
+FortAI rows are the post-fix native path: intermediate prompt tokens now skip
+the vocabulary projection, argmax, and MTP host handoff while the final prompt
+token still produces the exact hidden-state handoff required for generation.
 
 | Prompt tokens (FortAI / llama.cpp) | FortAI prefill (tok/s) | llama.cpp prefill (tok/s) | FortAI generation (tok/s) | llama.cpp generation (tok/s) |
 |---:|---:|---:|---:|---:|
-| 157 / 159 | 18.2 | 185.3 | 19.4 | 22.8 |
-| 541 / 543 | 17.0 | 336.9 | 17.2 | 28.7 |
-| 1054 / 1056 | 15.2 | 551.3 | 14.3 | 17.6 |
-| 2078 / 2080 | 12.8 | 767.3 | 10.6 | 24.5 |
+| 188 / 159 | 22.1 | 185.3 | 19.9 | 22.8 |
+| 571 / 543 | 20.7 | 336.9 | 17.1 | 28.7 |
+| 1070 / 1056 | 19.2 | 551.3 | 14.3 | 17.6 |
+| 2058 / 2080 | 16.6 | 767.3 | 11.0 | 24.5 |
 
 The llama.cpp reference used `-c 4096` because its full production-context
 allocation did not fit beside the independent test services; FortAI used its
 production `-c 262144` profile and native MTP sidecar. Thus the table is a
-stress result, not a claim of speed parity. FortAI currently needs prompt
-batching to close the prefill gap ([issue #2](https://github.com/lazy-fortran/fortai/issues/2)); a bounded full OpenCode CLI run is not yet promotion evidence.
+stress result, not a claim of speed parity; prompt sizes are matched within
+the stated token buckets, but the two fresh-prefix request strings are not
+byte-identical. FortAI currently needs true prompt batching to close the
+remaining prefill gap ([issue #2](https://github.com/lazy-fortran/fortai/issues/2));
+a bounded full OpenCode CLI run is not yet promotion evidence.
 
 ### Whisper CUDA (`large-v3-turbo`)
 
