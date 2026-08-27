@@ -226,12 +226,16 @@ retries the configured second GPU and records the per-layer placement. It
 retains the other resident layers and crosses an explicit host boundary only
 when both devices reject that layer's allocation.
 Multimodal
-projector paths are accepted and surfaced in `/health`; image-token execution
-is not yet part of the native Qwen runtime. A standalone `--model-draft` is
+projector paths are accepted and surfaced in `/health`; the native text runtime
+reports vision/audio as unsupported and rejects non-text content parts instead
+of silently dropping them. A standalone `--model-draft` is
 loaded and advanced by the native Fortran service for greedy requests, with
 target logits remaining authoritative; `draft-mtp` sidecars use the merged
 `blk.64` NextN implementation. The server never delegates either feature to
 another process.
+The configured `cache_reuse` value is surfaced for compatibility, while
+`cache_reuse_supported:false` makes clear that native prefix-KV reuse is not
+implemented yet.
 For native split-Q4 placement, `FORTAI_TENSOR_SPLIT=a,b` (or
 `--tensor-split a,b`/`-ts a,b`) supplies normalized non-negative fractions for
 the two visible GPUs; omitted values retain equal-byte balancing, and malformed

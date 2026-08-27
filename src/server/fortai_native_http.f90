@@ -299,9 +299,9 @@ contains
         integer, intent(in) :: first
         type(string_t), intent(out) :: output
         integer, intent(out) :: after
-        integer :: limit, value, position
+        integer :: limit, value, position, object_end, type_value
         logical :: found
-        type(string_t) :: parsed
+        type(string_t) :: parsed, content_type
 
         call output%clear()
         after = 0
@@ -330,14 +330,65 @@ contains
             json_content = .false.
             return
         end if
+
+        ! OpenAI content arrays may contain text and image/audio parts.  The
+        ! native Qwen text runtime has no vision/audio encoder yet; reject
+        ! every non-text part instead of silently dropping it and returning a
+        ! misleading text-only answer.  A single object is accepted for
+        ! compatibility with clients that send {"type":"text",...}.
+        if (text(first:first) == '{') then
+            type_value = json_key(text, 'type', first, limit)
+            if (type_value > 0) then
+                if (.not. json_string(text, type_value, content_type, after)) then
+                    json_content = .false.
+                    return
+                end if
+                if (.not. content_type%equals('text')) then
+                    json_content = .false.
+                    return
+                end if
+            end if
+            value = json_key(text, 'text', first, limit)
+            if (value == 0) then
+                json_content = .false.
+                return
+            end if
+            if (.not. json_string(text, value, output, after)) then
+                json_content = .false.
+                return
+            end if
+            json_content = .true.
+            return
+        end if
+
         call output%clear()
         found = .false.
         position = first + 1
         do
-            value = json_key(text, 'text', position, limit)
-            if (value == 0) exit
-            if (value > limit) exit
-            if (text(value:value) /= '"') then
+            position = skip_space(text, position)
+            if (position >= limit) exit
+            if (text(position:position) /= '{') then
+                json_content = .false.
+                return
+            end if
+            object_end = matching_delimiter(text, position, '{', '}')
+            if (object_end == 0 .or. object_end > limit) then
+                json_content = .false.
+                return
+            end if
+            type_value = json_key(text, 'type', position, object_end)
+            if (type_value > 0) then
+                if (.not. json_string(text, type_value, content_type, after)) then
+                    json_content = .false.
+                    return
+                end if
+                if (.not. content_type%equals('text')) then
+                    json_content = .false.
+                    return
+                end if
+            end if
+            value = json_key(text, 'text', position, object_end)
+            if (value == 0) then
                 json_content = .false.
                 return
             end if
@@ -347,8 +398,17 @@ contains
             end if
             call output%append_string(parsed)
             found = .true.
-            position = after
-            if (position > limit) exit
+            position = skip_space(text, object_end + 1)
+            if (position >= limit) exit
+            if (text(position:position) == ',') then
+                position = position + 1
+                cycle
+            end if
+            if (text(position:position) /= ']') then
+                json_content = .false.
+                return
+            end if
+            exit
         end do
         json_content = found
     end function json_content
@@ -2801,7 +2861,8 @@ contains
                 if (.not. json_array_value(body_text, 'tools', tools_json)) call tools_json%clear()
                 call reasoning_instruction%clear()
                 if (.not. parse_messages(body_text, messages, count)) then
-                    call error_body(400, 'messages must contain role/content strings', result)
+                    call error_body(400, 'messages must contain text-only role/content strings; native multimodal ' // &
+                        'image/audio input is unsupported', result)
                     status = 400_c_int
                 else
                     prompt = format_chat(messages, count, enable_thinking, tools_json, reasoning_instruction, &
@@ -3027,7 +3088,8 @@ contains
             prompt = format_chat(messages, count, enable_thinking, tools_json, reasoning_instruction, preserve_thinking)
         else if (chat) then
             if (.not. parse_messages(body%as_character(), messages, count)) then
-                call error_body(400, 'messages must contain role/content strings', result); status = 400_c_int
+                call error_body(400, 'messages must contain text-only role/content strings; native multimodal ' // &
+                    'image/audio input is unsupported', result); status = 400_c_int
                 call copy_result(result, 'application/json', response, response_capacity, response_length, &
                     content_type, content_type_capacity, fortai_native_http_handle); return
             end if
@@ -3589,6 +3651,11 @@ contains
         call append_setting(result, 'fit', 'FORTAI_FIT', 'auto', .true.)
         call append_setting(result, 'cache_ram', 'FORTAI_CACHE_RAM', '0', .false.)
         call append_setting(result, 'cache_reuse', 'FORTAI_CACHE_REUSE', '0', .false.)
+        ! Prefix KV reuse is not implemented by the native service yet. Keep
+        ! the configured value visible for drop-in diagnostics, but expose the
+        ! effective capability explicitly so clients cannot mistake it for an
+        ! active cache.
+        call result%append(',"cache_reuse_supported":false')
         call append_setting(result, 'n_cpu_moe', 'FORTAI_N_CPU_MOE', '0', .false.)
         call append_setting(result, 'threads_http', 'FORTAI_THREADS_HTTP', '0', .false.)
         call append_setting(result, 'no_context_shift', 'FORTAI_NO_CONTEXT_SHIFT', 'false', .false.)
