@@ -233,9 +233,13 @@ loaded and advanced by the native Fortran service for greedy requests, with
 target logits remaining authoritative; `draft-mtp` sidecars use the merged
 `blk.64` NextN implementation. The server never delegates either feature to
 another process.
-The configured `cache_reuse` value is surfaced for compatibility, while
-`cache_reuse_supported:false` makes clear that native prefix-KV reuse is not
-implemented yet.
+The native service retains the exact token sequence represented by its live
+KV/recurrent state between serialized requests.  A request that begins with
+that sequence skips the already-evaluated prefix (including the common
+OpenCode system prompt); `/health` reports `cache_reuse_supported`,
+`cache_reuse_active`, and the retained token count.  The cache is single-slot
+by design so it adds no second model or KV allocation; a non-prefix request
+invalidates it and replays from position zero.
 For native split-Q4 placement, `FORTAI_TENSOR_SPLIT=a,b` (or
 `--tensor-split a,b`/`-ts a,b`) supplies normalized non-negative fractions for
 the two visible GPUs; omitted values retain equal-byte balancing, and malformed

@@ -1658,24 +1658,29 @@ contains
         self%mtp_last_draft_match = .false.
     end subroutine qwen35_cpu_reset
 
-    subroutine qwen35_cpu_forward(self, token_id, position, logits, stat)
+    subroutine qwen35_cpu_forward(self, token_id, position, logits, stat, download_logits)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id, position
         real(real32), contiguous, intent(out) :: logits(:)
         type(status_t), intent(out) :: stat
+        logical, intent(in), optional :: download_logits
+        logical :: should_download
+
+        should_download = .true.
+        if (present(download_logits)) should_download = download_logits
 
         if (self%fast_enabled) then
-            call qwen35_cpu_forward_body(self, token_id, position, logits, stat)
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download)
         else if (self%persistent_openmp .and. .not. self%cuda_device_pipeline) then
             self%persistent_openmp_active = .true.
-            !$omp parallel default(none) shared(self, token_id, position, logits, stat)
+            !$omp parallel default(none) shared(self, token_id, position, logits, stat, should_download)
             !$omp single
-            call qwen35_cpu_forward_body(self, token_id, position, logits, stat)
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download)
             !$omp end single
             !$omp end parallel
             self%persistent_openmp_active = .false.
         else
-            call qwen35_cpu_forward_body(self, token_id, position, logits, stat)
+            call qwen35_cpu_forward_body(self, token_id, position, logits, stat, should_download)
         end if
     end subroutine qwen35_cpu_forward
 
@@ -1803,7 +1808,7 @@ contains
             end block
             return
         end if
-        call qwen35_cpu_forward(self, token_id, position, self%logits, stat)
+        call qwen35_cpu_forward(self, token_id, position, self%logits, stat, .true.)
         if (.not. stat%is_ok()) return
         logit_sum = sum(self%logits)
         next_token = int(maxloc(self%logits, dim=1) - 1, int64)
@@ -1928,6 +1933,9 @@ contains
             if (.not. stat % is_ok()) return
         end if
         capture_graph = .false.
+        ! Prompt evaluation can skip the host logits transfer for intermediate
+        ! tokens, while retaining the output projection for the established
+        ! CUDA graph and model-state behavior.
         if (self%cuda_device_pipeline .and. self%cuda_graph_enabled) then
             if (self%cuda_graph_ready) then
                 call self%cuda%graph_launch(stat)

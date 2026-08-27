@@ -16,6 +16,16 @@ module fortai_native_service
     ! MTP tensors are rebound into service_model.  Keep the sidecar mapping
     ! alive for exactly as long as those pointers are in use.
     type(gguf_file_t), save :: service_mtp_sidecar
+    ! The cache keeps the exact token prefix represented by the resident model
+    ! state.  It is deliberately single-slot: CUDA is serialized by the HTTP
+    ! service, so retaining the live KV/recurrent state avoids a second model
+    ! copy while still making the common OpenCode conversation prefix reusable.
+    integer(int32), allocatable, save :: service_cache_tokens(:)
+    real(real32), allocatable, save :: service_cache_logits(:)
+    integer, save :: service_cache_count = 0
+    integer(int64), save :: service_cache_next_token = -1_int64
+    logical, save :: service_cache_valid = .false.
+    logical, save :: service_cache_logits_valid = .false.
     logical, save :: service_ready = .false.
     logical, save :: service_external_draft_active = .false.
     logical, save :: service_mtp_sidecar_active = .false.
@@ -48,6 +58,9 @@ module fortai_native_service
     public :: fortai_native_service_mtp_sidecar_active
     public :: fortai_native_service_device_pipeline
     public :: fortai_native_service_context_size
+    public :: fortai_native_service_cache_reuse_supported
+    public :: fortai_native_service_cache_reuse_active
+    public :: fortai_native_service_cache_reuse_count
 
 contains
 
@@ -155,6 +168,12 @@ contains
         ! The model owns pointers into this mapping for MTP tensors, so it
         ! must be closed before releasing the sidecar address space.
         call service_mtp_sidecar%close()
+        if (allocated(service_cache_tokens)) deallocate(service_cache_tokens)
+        if (allocated(service_cache_logits)) deallocate(service_cache_logits)
+        service_cache_count = 0
+        service_cache_next_token = -1_int64
+        service_cache_valid = .false.
+        service_cache_logits_valid = .false.
         service_ready = .false.
         service_external_draft_active = .false.
         service_mtp_sidecar_active = .false.
@@ -196,6 +215,24 @@ contains
         fortai_native_service_context_size = 0_int64
         if (service_ready) fortai_native_service_context_size = service_model%max_context
     end function fortai_native_service_context_size
+
+    logical function fortai_native_service_cache_reuse_supported()
+        ! The live model state is retained between serialized requests.  This
+        ! is a native prefix-KV cache, not a delegated runtime cache.
+        fortai_native_service_cache_reuse_supported = .true.
+    end function fortai_native_service_cache_reuse_supported
+
+    logical function fortai_native_service_cache_reuse_active()
+        fortai_native_service_cache_reuse_active = .false.
+        if (.not. service_ready) return
+        if (.not. service_cache_valid) return
+        fortai_native_service_cache_reuse_active = service_cache_count > 0
+    end function fortai_native_service_cache_reuse_active
+
+    integer(int64) function fortai_native_service_cache_reuse_count()
+        fortai_native_service_cache_reuse_count = 0_int64
+        if (service_cache_valid) fortai_native_service_cache_reuse_count = int(service_cache_count, int64)
+    end function fortai_native_service_cache_reuse_count
 
     logical function fortai_native_service_tokenize(text, add_special, parse_special, ids)
         character(len=*), intent(in) :: text
@@ -493,17 +530,20 @@ contains
         integer, intent(out) :: token_count
         integer, intent(out), optional :: prompt_token_count
         type(sampling_options_t) :: options
-        integer(int32), allocatable :: prompt_ids(:), generated_ids(:), sampling_history(:)
+        integer(int32), allocatable :: prompt_ids(:), generated_ids(:), sampling_history(:), state_tokens(:)
         integer(int32), allocatable :: history_counts(:), candidate_indices(:)
         real(real32), allocatable :: logits(:), adjusted_logits(:), candidate_values(:)
         integer(int64) :: current, next_token, position
         integer(int64) :: draft_next_token
         integer(int64) :: speculative_tokens(32)
         integer(int64) :: random_state
-        integer :: i, j, generated_count, speculative_count
+        integer :: i, j, generated_count, speculative_count, prompt_start, state_count, cache_count
         real(real32) :: logit_sum, draft_logit_sum
         logical :: use_external_draft, use_native_mtp
-        logical :: stop_generation, ignore_eos
+        logical :: stop_generation, ignore_eos, cache_hit, cache_logits_usable
+        logical :: needs_logits, preserve_old_logits, state_step_speculative
+        integer(int32), allocatable :: new_cache_tokens(:)
+        real(real32), allocatable :: new_cache_logits(:)
         type(status_t) :: stat, draft_stat
 
         options%top_k = top_k
@@ -539,7 +579,11 @@ contains
         end if
         allocate(generated_ids(max_tokens))
         allocate(sampling_history(size(prompt_ids) + max_tokens))
+        allocate(state_tokens(size(prompt_ids) + max_tokens))
         sampling_history(:size(prompt_ids)) = prompt_ids
+        state_tokens(:size(prompt_ids)) = prompt_ids
+        needs_logits = temperature > 0.0_real32
+        if (.not. needs_logits) needs_logits = sampling_penalties_active(options)
         if (temperature > 0.0_real32) then
             allocate(logits(service_model%vocabulary_size))
             allocate(adjusted_logits(service_model%vocabulary_size))
@@ -560,7 +604,6 @@ contains
                 if (random_state == 0_int64) random_state = int(z'6a09e667f3bcc909', int64)
             end block
         end if
-        call service_model%reset()
         ! Keep the standalone draft state synchronized with the target.  The
         ! target remains authoritative because the native hybrid model has no
         ! multi-token decode ABI yet; this still makes external-draft wiring
@@ -570,18 +613,94 @@ contains
         use_native_mtp = service_model%mtp_active .and. temperature == 0.0_real32 .and. &
             .not. sampling_penalties_active(options)
         ignore_eos = native_ignore_eos_requested()
+        cache_count = service_cache_count
+        cache_hit = service_cache_valid
+        if (cache_hit) then
+            if (cache_count <= 0) cache_hit = .false.
+        end if
+        if (cache_hit) then
+            if (.not. allocated(service_cache_tokens)) cache_hit = .false.
+        end if
+        if (cache_hit) then
+            if (size(prompt_ids) < cache_count) cache_hit = .false.
+        end if
+        if (cache_hit) then
+            do i = 1, cache_count
+                if (prompt_ids(i) /= service_cache_tokens(i)) then
+                    cache_hit = .false.
+                    exit
+                end if
+            end do
+        end if
+        ! A standalone external draft has its own recurrent/KV state.  Until
+        ! that second state is retained atomically, replay the request rather
+        ! than reusing only the target prefix.
+        if (cache_hit) then
+            if (service_external_draft_active) cache_hit = .false.
+        end if
+        cache_logits_usable = .false.
+        if (cache_hit) then
+            if (service_cache_logits_valid) then
+                if (allocated(service_cache_logits)) then
+                    if (size(service_cache_logits) == service_model%vocabulary_size) cache_logits_usable = .true.
+                end if
+            end if
+            if (needs_logits) then
+                if (.not. cache_logits_usable) cache_hit = .false.
+            end if
+        end if
+        prompt_start = 1
+        state_count = 0
+        if (cache_hit) then
+            prompt_start = cache_count + 1
+            state_count = cache_count
+            ! Mark the old entry stale while this request mutates the live
+            ! state.  Any forward failure therefore cannot leave a false hit.
+            service_cache_valid = .false.
+        else
+            call service_model%reset()
+            service_cache_valid = .false.
+        end if
         if (use_external_draft) call service_draft_model%reset()
         current = -1_int64
-        do i = 1, size(prompt_ids)
+        call stat%clear()
+        if (cache_hit) then
+            if (prompt_start > size(prompt_ids)) then
+                if (cache_logits_usable) then
+                    if (temperature > 0.0_real32) then
+                        current = sample_logits(service_cache_logits, temperature, random_state, sampling_history, &
+                            size(prompt_ids), options, adjusted_logits, history_counts, candidate_indices, &
+                            candidate_values)
+                    else if (sampling_penalties_active(options)) then
+                        current = greedy_penalized(service_cache_logits, adjusted_logits, history_counts, &
+                            sampling_history, size(prompt_ids), options)
+                    else
+                        current = int(maxloc(service_cache_logits, dim=1) - 1, int64)
+                    end if
+                else
+                    current = service_cache_next_token
+                end if
+            end if
+        end if
+        do i = prompt_start, size(prompt_ids)
             if (temperature > 0.0_real32) then
-                call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat)
-                if (stat%is_ok()) current = sample_logits(logits, temperature, random_state, sampling_history, &
-                    i, options, adjusted_logits, history_counts, candidate_indices, candidate_values)
+                call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat, &
+                    i == size(prompt_ids))
+                if (stat%is_ok()) then
+                    if (i == size(prompt_ids)) then
+                        current = sample_logits(logits, temperature, random_state, sampling_history, i, options, &
+                            adjusted_logits, history_counts, candidate_indices, candidate_values)
+                    end if
+                end if
             else
                 if (sampling_penalties_active(options)) then
-                    call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat)
+                    call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat, &
+                        i == size(prompt_ids))
                     if (stat%is_ok()) then
-                        current = greedy_penalized(logits, adjusted_logits, history_counts, sampling_history, i, options)
+                        if (i == size(prompt_ids)) then
+                            current = greedy_penalized(logits, adjusted_logits, history_counts, sampling_history, i, &
+                                options)
+                        end if
                     end if
                 else
                     call service_model%forward_greedy(int(prompt_ids(i), int64), int(i - 1, int64), &
@@ -591,14 +710,17 @@ contains
             end if
             if (.not. stat%is_ok()) then
                 write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
+                service_cache_valid = .false.
                 return
             end if
+            state_count = i
             if (use_external_draft) then
                 call service_draft_model%forward_greedy(int(prompt_ids(i), int64), int(i - 1, int64), &
                     draft_next_token, draft_logit_sum, draft_stat)
                 if (.not. draft_stat%is_ok()) then
                     write(error_unit, '(a)') 'fortai-native: external draft forward failed: ' // &
                         trim(draft_stat%message)
+                    service_cache_valid = .false.
                     return
                 end if
             end if
@@ -612,17 +734,31 @@ contains
             sampling_history(size(prompt_ids) + generated_count) = int(current, int32)
             if (generated_count == max_tokens) exit
             position = int(size(prompt_ids) + generated_count - 1, int64)
+            state_step_speculative = .false.
             if (use_native_mtp .and. max_tokens - generated_count >= 2) then
                 call service_model%forward_greedy_speculative(current, position, speculative_tokens, &
                     speculative_count, logit_sum, stat)
                 if (.not. stat%is_ok()) then
                     write(error_unit, '(a)') 'fortai-native: speculative model forward failed: ' // trim(stat%message)
+                    service_cache_valid = .false.
                     return
                 end if
                 if (speculative_count <= 0 .or. speculative_count > size(speculative_tokens)) then
                     write(error_unit, '(a)') 'fortai-native: speculative model forward returned no tokens'
+                    service_cache_valid = .false.
                     return
                 end if
+                if (state_count + speculative_count > size(state_tokens)) then
+                    write(error_unit, '(a)') 'fortai-native: speculative state exceeded cache workspace'
+                    service_cache_valid = .false.
+                    return
+                end if
+                state_tokens(state_count + 1) = int(current, int32)
+                do j = 1, speculative_count - 1
+                    state_tokens(state_count + j + 1) = int(speculative_tokens(j), int32)
+                end do
+                state_count = state_count + speculative_count
+                state_step_speculative = .true.
                 stop_generation = .false.
                 ! Keep the final speculative token in CURRENT.  The loop's
                 ! next iteration emits it before asking the model for more;
@@ -645,6 +781,12 @@ contains
                     size(prompt_ids) + generated_count, options, adjusted_logits, history_counts, candidate_indices, &
                     candidate_values)
             else
+                if (state_count >= size(state_tokens)) then
+                    write(error_unit, '(a)') 'fortai-native: generation state exceeded cache workspace'
+                    service_cache_valid = .false.
+                    return
+                end if
+                state_tokens(state_count + 1) = int(current, int32)
                 if (sampling_penalties_active(options)) then
                     call service_model%forward(current, position, logits, stat)
                     if (stat%is_ok()) then
@@ -658,14 +800,17 @@ contains
             end if
             if (.not. stat%is_ok()) then
                 write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
+                service_cache_valid = .false.
                 return
             end if
+            if (.not. state_step_speculative) state_count = state_count + 1
             if (use_external_draft) then
                 call service_draft_model%forward_greedy(current, position, draft_next_token, draft_logit_sum, &
                     draft_stat)
                 if (.not. draft_stat%is_ok()) then
                     write(error_unit, '(a)') 'fortai-native: external draft forward failed: ' // &
                         trim(draft_stat%message)
+                    service_cache_valid = .false.
                     return
                 end if
             end if
@@ -676,6 +821,31 @@ contains
                 call service_tokenizer%decode(generated_ids(:generated_count), decoded)
                 call output_text%set(decoded)
             end block
+        end if
+        if (state_count > 0) then
+            allocate(new_cache_tokens(state_count))
+            new_cache_tokens = state_tokens(:state_count)
+            call move_alloc(new_cache_tokens, service_cache_tokens)
+            service_cache_count = state_count
+            service_cache_next_token = current
+            preserve_old_logits = cache_hit .and. state_count == cache_count
+            if (needs_logits) then
+                if (allocated(logits)) then
+                    allocate(new_cache_logits(size(logits)))
+                    new_cache_logits = logits
+                    call move_alloc(new_cache_logits, service_cache_logits)
+                    service_cache_logits_valid = .true.
+                else if (.not. preserve_old_logits) then
+                    if (allocated(service_cache_logits)) deallocate(service_cache_logits)
+                    service_cache_logits_valid = .false.
+                end if
+            else if (.not. preserve_old_logits) then
+                if (allocated(service_cache_logits)) deallocate(service_cache_logits)
+                service_cache_logits_valid = .false.
+            end if
+            service_cache_valid = .true.
+        else
+            service_cache_valid = .false.
         end if
         token_count = generated_count
         fortai_native_service_complete_text_sampling = output_text%length()

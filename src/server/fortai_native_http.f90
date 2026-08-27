@@ -12,7 +12,8 @@ module fortai_native_http
         fortai_native_service_supports_reasoning_effort, fortai_native_service_mtp_available, &
         fortai_native_service_mtp_active, fortai_native_service_external_draft_active, &
         fortai_native_service_mtp_sidecar_active, fortai_native_service_device_pipeline, &
-        fortai_native_service_context_size
+        fortai_native_service_context_size, fortai_native_service_cache_reuse_supported, &
+        fortai_native_service_cache_reuse_active, fortai_native_service_cache_reuse_count
     use fortai_whisper_service, only: fortai_whisper_http_handle
     use fortai_string, only: string_t
     implicit none
@@ -3651,11 +3652,21 @@ contains
         call append_setting(result, 'fit', 'FORTAI_FIT', 'auto', .true.)
         call append_setting(result, 'cache_ram', 'FORTAI_CACHE_RAM', '0', .false.)
         call append_setting(result, 'cache_reuse', 'FORTAI_CACHE_REUSE', '0', .false.)
-        ! Prefix KV reuse is not implemented by the native service yet. Keep
-        ! the configured value visible for drop-in diagnostics, but expose the
-        ! effective capability explicitly so clients cannot mistake it for an
-        ! active cache.
-        call result%append(',"cache_reuse_supported":false')
+        call result%append(',"cache_reuse_supported":')
+        if (fortai_native_service_cache_reuse_supported()) then
+            call result%append('true')
+        else
+            call result%append('false')
+        end if
+        call result%append(',"cache_reuse_active":')
+        if (fortai_native_service_cache_reuse_active()) then
+            call result%append('true')
+        else
+            call result%append('false')
+        end if
+        call result%append(',"cache_reuse_tokens":')
+        write(number, '(i0)') fortai_native_service_cache_reuse_count()
+        call result%append(trim(number))
         call append_setting(result, 'n_cpu_moe', 'FORTAI_N_CPU_MOE', '0', .false.)
         call append_setting(result, 'threads_http', 'FORTAI_THREADS_HTTP', '0', .false.)
         call append_setting(result, 'no_context_shift', 'FORTAI_NO_CONTEXT_SHIFT', 'false', .false.)
