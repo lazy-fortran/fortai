@@ -27,6 +27,11 @@ int fortai_cuda_q8_context_synchronize(fortai_cuda_q8_context *context);
 /* Return the native CUDA stream used by this context for explicit stream
  * hand-off with another CUDA backend.  The returned handle is borrowed. */
 void *fortai_cuda_q8_context_stream(fortai_cuda_q8_context *context);
+/* Replace the context stream with a borrowed stream owned by another CUDA
+ * backend.  The old stream is synchronized and released; the borrowed stream
+ * is never destroyed by the Q8 context. */
+int fortai_cuda_q8_context_adopt_stream(fortai_cuda_q8_context *context,
+    void *stream);
 int fortai_cuda_q8_context_capture_begin(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_capture_end(fortai_cuda_q8_context *context);
 int fortai_cuda_q8_context_graph_launch(fortai_cuda_q8_context *context);
@@ -57,15 +62,45 @@ int fortai_cuda_q8_matvec_resident(fortai_cuda_q8_context *context,
 int fortai_cuda_q8_matvec_device_f32(fortai_cuda_q8_context *context,
     const fortai_cuda_q8_weights *weights, const void *device_activation,
     size_t activation_elements, void *device_output, size_t output_elements);
+/* Device-F32 pair: quantize one resident activation once, then evaluate both
+ * Q8 matrices on the same stream. */
+int fortai_cuda_q8_matvec_device_f32_pair(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *first_weights,
+    const fortai_cuda_q8_weights *second_weights, const void *device_activation,
+    size_t activation_elements, void *first_output, size_t first_output_elements,
+    void *second_output, size_t second_output_elements);
+int fortai_cuda_q8_reserve_matvec_scratch(fortai_cuda_q8_context *context,
+    size_t activation_elements, size_t output_elements);
+/* Batched F32 matrix multiplication.  Activations are column-major
+ * [width,batch] and outputs are column-major [rows,batch].  Quantization is
+ * performed once per activation column on the resident CUDA stream. */
+int fortai_cuda_q8_matmul_device_f32(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *weights, const void *device_activation,
+    size_t activation_elements, int batch, void *device_output,
+    size_t output_elements);
 int fortai_cuda_qwen35_embedding_device(fortai_cuda_q8_context *context,
     const fortai_cuda_q8_weights *weights, int64_t token_id, void *device_output,
     size_t output_elements);
+int fortai_cuda_qwen35_embedding_device_batch(fortai_cuda_q8_context *context,
+    const fortai_cuda_q8_weights *weights, const int32_t *host_tokens, int batch,
+    void *device_output, size_t output_elements);
 
 int fortai_cuda_qwen35_copy_device(fortai_cuda_q8_context *context,
     const void *device_input, void *device_output, size_t bytes);
 int fortai_cuda_qwen35_add_device(fortai_cuda_q8_context *context,
     const void *device_left, const void *device_right, void *device_output,
     size_t elements);
+int fortai_cuda_qwen35_copy_column_device(fortai_cuda_q8_context *context,
+    const void *device_input, size_t stride, int column, void *device_output,
+    size_t elements);
+int fortai_cuda_qwen35_add_matrix_device(fortai_cuda_q8_context *context,
+    const void *device_left, const void *device_right, void *device_output,
+    size_t elements);
+int fortai_cuda_qwen35_rms_norm_matrix_device(fortai_cuda_q8_context *context,
+    const void *device_input, const void *device_weights, void *device_output,
+    size_t hidden, int batch, float epsilon);
+int fortai_cuda_qwen35_silu_product_matrix_device(fortai_cuda_q8_context *context,
+    void *device_gate, const void *device_up, size_t elements);
 int fortai_cuda_qwen35_rms_norm_device(fortai_cuda_q8_context *context,
     const void *device_input, const void *device_weights, void *device_output,
     size_t elements, float epsilon);
@@ -175,10 +210,19 @@ int fortai_cuda_qwen35_attention_reset(fortai_cuda_qwen35_attention *layer);
 int fortai_cuda_qwen35_attention_run_device(fortai_cuda_qwen35_attention *layer,
     const void *device_activation, size_t activation_elements, int position,
     void *device_output, size_t output_elements);
+int fortai_cuda_qwen35_recurrent_run_core_device_batch(fortai_cuda_qwen35_recurrent *layer,
+    void *device_qkv, size_t qkv_elements, const void *device_gate,
+    size_t gate_elements, const void *device_alpha, size_t alpha_elements,
+    const void *device_beta, size_t beta_elements, int batch,
+    void *device_output, size_t output_elements);
 int fortai_cuda_qwen35_attention_run_core_device(fortai_cuda_qwen35_attention *layer,
     const void *device_query, size_t query_elements, const void *device_key,
     size_t key_elements, const void *device_value, size_t value_elements,
     int position, void *device_output, size_t output_elements);
+int fortai_cuda_qwen35_attention_run_core_device_batch(fortai_cuda_qwen35_attention *layer,
+    const void *device_query, size_t query_elements, const void *device_key,
+    size_t key_elements, const void *device_value, size_t value_elements,
+    int position, int batch, void *device_output, size_t output_elements);
 
 const char *fortai_cuda_q8_last_error(const fortai_cuda_q8_context *context);
 

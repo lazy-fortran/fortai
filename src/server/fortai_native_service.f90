@@ -568,10 +568,12 @@ contains
         integer(int64) :: prompt_clock_start, prompt_clock_end
         integer(int64) :: generation_clock_start, generation_clock_end, clock_rate
         integer :: i, j, generated_count, speculative_count, prompt_start, state_count, cache_count
+        integer :: batch_begin, batch_end, batch_count, batch_capacity
+        integer :: timed_prompt_start
         real(real32) :: logit_sum, draft_logit_sum
         logical :: use_external_draft, use_native_mtp
         logical :: stop_generation, ignore_eos, cache_hit, cache_logits_usable
-        logical :: needs_logits, preserve_old_logits, state_step_speculative
+        logical :: needs_logits, preserve_old_logits, state_step_speculative, prompt_batched
         integer(int32), allocatable :: new_cache_tokens(:)
         real(real32), allocatable :: new_cache_logits(:)
         type(status_t) :: stat, draft_stat
@@ -717,56 +719,113 @@ contains
             end if
         end if
         call system_clock(count=prompt_clock_start, count_rate=clock_rate)
-        do i = prompt_start, size(prompt_ids)
-            if (temperature > 0.0_real32) then
-                call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat, &
-                    i == size(prompt_ids), .false., i == size(prompt_ids), i == size(prompt_ids))
-                if (stat%is_ok()) then
-                    if (i == size(prompt_ids)) then
-                        current = sample_logits(logits, temperature, random_state, sampling_history, i, options, &
-                            adjusted_logits, history_counts, candidate_indices, candidate_values)
-                    end if
+        timed_prompt_start = prompt_start
+        prompt_batched = .false.
+        ! Match llama.cpp's prompt graph: present each uncached microbatch as
+        ! one [hidden,batch] matrix, then carry the recurrent/KV state into the
+        ! next chunk.  This keeps long prompts batched instead of silently
+        ! falling back to one-token GEMVs when they exceed --ubatch-size.
+        ! External draft state is intentionally excluded until both target and
+        ! draft states can be advanced atomically.
+        batch_capacity = service_model%cuda_batch_capacity
+        if (.not. use_external_draft .and. prompt_start <= size(prompt_ids) .and. batch_capacity > 1) then
+            batch_begin = prompt_start
+            do while (batch_begin <= size(prompt_ids))
+                batch_count = min(batch_capacity, size(prompt_ids) - batch_begin + 1)
+                if (batch_count <= 1) exit
+                if (.not. service_model%batch_supported(batch_count)) then
+                    ! A mixed/remote layout may not have a native batch plan.
+                    ! Leave the complete suffix for the scalar oracle rather
+                    ! than partially mutating the live state.
+                    batch_begin = prompt_start
+                    exit
                 end if
-            else
-                if (sampling_penalties_active(options)) then
+                if (.not. allocated(logits)) allocate(logits(service_model%vocabulary_size))
+                batch_end = batch_begin + batch_count - 1
+                call service_model%forward_batch(int(prompt_ids(batch_begin:batch_end), int64), &
+                    int(batch_begin - 1, int64), logits, stat, batch_end == size(prompt_ids))
+                if (.not. stat%is_ok()) then
+                    ! A batch failure may have advanced recurrent/KV state.
+                    ! Reset and replay the complete prompt through the proven
+                    ! scalar path rather than mixing partially-mutated state.
+                    call service_model%reset()
+                    prompt_start = 1
+                    timed_prompt_start = 1
+                    state_count = 0
+                    batch_begin = prompt_start
+                    call stat%clear()
+                    exit
+                end if
+                state_count = batch_end
+                batch_begin = batch_end + 1
+                prompt_start = batch_begin
+                if (batch_end == size(prompt_ids)) then
+                    if (temperature > 0.0_real32) then
+                        current = sample_logits(logits, temperature, random_state, sampling_history, size(prompt_ids), &
+                            options, adjusted_logits, history_counts, candidate_indices, candidate_values)
+                    else if (sampling_penalties_active(options)) then
+                        current = greedy_penalized(logits, adjusted_logits, history_counts, sampling_history, &
+                            size(prompt_ids), options)
+                    else
+                        current = int(maxloc(logits, dim=1) - 1, int64)
+                    end if
+                    prompt_batched = .true.
+                    exit
+                end if
+            end do
+        end if
+        if (.not. prompt_batched) then
+            do i = prompt_start, size(prompt_ids)
+                if (temperature > 0.0_real32) then
                     call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat, &
                         i == size(prompt_ids), .false., i == size(prompt_ids), i == size(prompt_ids))
                     if (stat%is_ok()) then
                         if (i == size(prompt_ids)) then
-                            current = greedy_penalized(logits, adjusted_logits, history_counts, sampling_history, i, &
-                                options)
+                            current = sample_logits(logits, temperature, random_state, sampling_history, i, options, &
+                                adjusted_logits, history_counts, candidate_indices, candidate_values)
                         end if
                     end if
                 else
-                    call service_model%forward_greedy(int(prompt_ids(i), int64), int(i - 1, int64), &
-                        next_token, logit_sum, stat, .false., i == size(prompt_ids), i == size(prompt_ids))
-                    if (stat%is_ok()) current = next_token
+                    if (sampling_penalties_active(options)) then
+                        call service_model%forward(int(prompt_ids(i), int64), int(i - 1, int64), logits, stat, &
+                            i == size(prompt_ids), .false., i == size(prompt_ids), i == size(prompt_ids))
+                        if (stat%is_ok()) then
+                            if (i == size(prompt_ids)) then
+                                current = greedy_penalized(logits, adjusted_logits, history_counts, sampling_history, i, &
+                                    options)
+                            end if
+                        end if
+                    else
+                        call service_model%forward_greedy(int(prompt_ids(i), int64), int(i - 1, int64), &
+                            next_token, logit_sum, stat, .false., i == size(prompt_ids), i == size(prompt_ids))
+                        if (stat%is_ok()) current = next_token
+                    end if
                 end if
-            end if
-            if (.not. stat%is_ok()) then
-                write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
-                service_cache_valid = .false.
-                return
-            end if
-            state_count = i
-            if (use_external_draft) then
-                call service_draft_model%forward_greedy(int(prompt_ids(i), int64), int(i - 1, int64), &
-                    draft_next_token, draft_logit_sum, draft_stat)
-                if (.not. draft_stat%is_ok()) then
-                    write(error_unit, '(a)') 'fortai-native: external draft forward failed: ' // &
-                        trim(draft_stat%message)
+                if (.not. stat%is_ok()) then
+                    write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
                     service_cache_valid = .false.
                     return
                 end if
-            end if
-        end do
+                state_count = i
+                if (use_external_draft) then
+                    call service_draft_model%forward_greedy(int(prompt_ids(i), int64), int(i - 1, int64), &
+                        draft_next_token, draft_logit_sum, draft_stat)
+                    if (.not. draft_stat%is_ok()) then
+                        write(error_unit, '(a)') 'fortai-native: external draft forward failed: ' // &
+                            trim(draft_stat%message)
+                        service_cache_valid = .false.
+                        return
+                    end if
+                end if
+            end do
+        end if
         call system_clock(count=prompt_clock_end)
         if (clock_rate > 0_int64) then
             service_last_prompt_ms = 1000.0_real64 * real(prompt_clock_end - prompt_clock_start, real64) / &
                 real(clock_rate, real64)
         end if
-        if (prompt_start <= size(prompt_ids)) then
-            service_last_prompt_tokens = int(size(prompt_ids) - prompt_start + 1, int64)
+        if (timed_prompt_start <= size(prompt_ids)) then
+            service_last_prompt_tokens = int(size(prompt_ids) - timed_prompt_start + 1, int64)
         end if
         generated_count = 0
         call system_clock(count=generation_clock_start)

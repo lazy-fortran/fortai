@@ -6,6 +6,7 @@ nvcc_bin=${NVCC:-/opt/cuda/bin/nvcc}
 cuda_arch=${FORTAI_CUDA_ARCH:-sm_120}
 out_dir="$root_dir/build/cuda"
 ggml_prefix=${FORTAI_GGML_PREFIX:-/home/ert/.local/llama.cpp-upstream-main-650913862}
+ggml_source=${FORTAI_GGML_SOURCE:-/home/ert/.local/src/llama.cpp}
 # nvcc uses GCC 15 on this host while the default Fortran toolchain is GCC 16.
 # Keep the CUDA-facing archive non-LTO so a warm fo cache cannot hand nvcc a
 # GCC-version-specific bytecode stream.  FORTAI_ALLOW_LTO=1 is an explicit
@@ -28,7 +29,8 @@ mkdir -p "$out_dir"
 
 "$root_dir/tools/build_cuda_backend.sh" >"$out_dir/fortai_cuda_qwen35_backend-build.log"
 "$nvcc_bin" -O3 -std=c++17 -arch="$cuda_arch" -lineinfo \
-    -I"$ggml_prefix/include" -I"$root_dir/backend/cuda" -Xcompiler=-fPIC -c \
+    -DGGML_CUDA_USE_GRAPHS -I"$ggml_prefix/include" -I"$ggml_source/ggml/src" \
+    -I"$ggml_source/ggml/src/ggml-cuda" -I"$root_dir/backend/cuda" -Xcompiler=-fPIC -c \
     "$root_dir/backend/cuda/fortai_cuda_q4_backend.cu" -o "$out_dir/fortai_cuda_q4_backend.o"
 (cd "$root_dir" && FO_DEBUG_LINKS=1 fo build --flag "$link_flags") >"$log_file" 2>&1
 

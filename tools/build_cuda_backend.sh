@@ -7,6 +7,7 @@ cuda_arch=${FORTAI_CUDA_ARCH:-sm_120}
 out_dir="$root_dir/build/cuda"
 fortran_dir="$out_dir/fortran-smoke"
 ggml_prefix=${FORTAI_GGML_PREFIX:-/home/ert/.local/llama.cpp-upstream-main-650913862}
+ggml_source=${FORTAI_GGML_SOURCE:-/home/ert/.local/src/llama.cpp}
 mkdir -p "$out_dir"
 if [[ ! -x "$nvcc_bin" ]]; then
     echo "nvcc not found: $nvcc_bin" >&2
@@ -20,11 +21,15 @@ fi
     -Xcompiler=-fPIC -c "$root_dir/backend/cuda/fortai_cuda_backend.cu" \
     -o "$out_dir/fortai_cuda_backend.o"
 "$nvcc_bin" -O3 --use_fast_math -std=c++17 -arch="$cuda_arch" -lineinfo \
-    -I"$ggml_prefix/include" -I"$root_dir/backend/cuda" -Xcompiler=-fPIC -c \
+    -DGGML_CUDA_USE_GRAPHS -I"$ggml_prefix/include" -I"$ggml_source/ggml/src" \
+    -I"$ggml_source/ggml/src/ggml-cuda" -I"$root_dir/backend/cuda" -Xcompiler=-fPIC -c \
     "$root_dir/backend/cuda/fortai_cuda_q4_backend.cu" -o "$out_dir/fortai_cuda_q4_backend.o"
 "$nvcc_bin" -O3 --use_fast_math -std=c++17 -arch="$cuda_arch" -lineinfo \
     "$root_dir/tools/cuda_backend_smoke.cu" "$out_dir/fortai_cuda_backend.o" \
     -o "$out_dir/cuda_backend_smoke"
+"$nvcc_bin" -O3 --use_fast_math -std=c++17 -arch="$cuda_arch" -lineinfo \
+    "$root_dir/tools/cuda_ffn_smoke.cu" "$out_dir/fortai_cuda_backend.o" \
+    -o "$out_dir/cuda_ffn_smoke"
 mkdir -p "$fortran_dir/mod"
 gfortran -O2 -J"$fortran_dir/mod" -c "$root_dir/src/fortai_status.f90" \
     -o "$fortran_dir/fortai_status.o"
@@ -40,7 +45,8 @@ gfortran -O2 -I"$fortran_dir/mod" -J"$fortran_dir/mod" \
     "$out_dir/fortai_cuda_q4_backend.o" -L"$ggml_prefix/lib" \
     -Xlinker -rpath -Xlinker "$ggml_prefix/lib" -lggml-cuda -lggml-cpu -lggml -lggml-base \
     -lgfortran -lquadmath -o "$out_dir/fortran_cuda_backend_smoke"
-printf 'object=%s\nsmoke=%s\nfortran_smoke=%s\narch=%s\nnvcc=%s\n' \
+printf 'object=%s\nsmoke=%s\nffn_smoke=%s\nfortran_smoke=%s\narch=%s\nnvcc=%s\n' \
     "$out_dir/fortai_cuda_backend.o" "$out_dir/cuda_backend_smoke" \
+    "$out_dir/cuda_ffn_smoke" \
     "$out_dir/fortran_cuda_backend_smoke" \
     "$cuda_arch" "$nvcc_bin"

@@ -1,5 +1,5 @@
 module fortai_backend_cuda
-    use, intrinsic :: iso_c_binding, only: c_float, c_int, c_int8_t, c_int64_t, c_loc, c_ptr, &
+    use, intrinsic :: iso_c_binding, only: c_float, c_int, c_int8_t, c_int32_t, c_int64_t, c_loc, c_ptr, &
         c_null_ptr, c_size_t, c_associated
     use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
     implicit none
@@ -15,6 +15,7 @@ module fortai_backend_cuda
         procedure :: set_position => cuda_q8_context_set_position
         procedure :: synchronize => cuda_q8_context_synchronize
         procedure :: stream => cuda_q8_context_stream
+        procedure :: adopt_stream => cuda_q8_context_adopt_stream
         procedure :: capture_begin => cuda_q8_context_capture_begin
         procedure :: capture_end => cuda_q8_context_capture_end
         procedure :: graph_launch => cuda_q8_context_graph_launch
@@ -41,6 +42,7 @@ module fortai_backend_cuda
         procedure :: create => cuda_q4_context_create
         procedure :: destroy => cuda_q4_context_destroy
         procedure :: synchronize => cuda_q4_context_synchronize
+        procedure :: stream => cuda_q4_context_stream
         procedure :: set_consumer_stream => cuda_q4_context_set_consumer_stream
         procedure :: matvec_device => cuda_q4_matvec_device
     end type cuda_q4_context_t
@@ -62,6 +64,7 @@ module fortai_backend_cuda
         procedure :: run => cuda_qwen35_recurrent_run
         procedure :: run_device => cuda_qwen35_recurrent_run_device
         procedure :: run_core_device => cuda_qwen35_recurrent_run_core_device
+        procedure :: run_core_device_batch => cuda_qwen35_recurrent_run_core_device_batch
     end type cuda_qwen35_recurrent_t
 
     type, public :: cuda_qwen35_attention_t
@@ -73,6 +76,7 @@ module fortai_backend_cuda
         procedure :: reset => cuda_qwen35_attention_reset
         procedure :: run_device => cuda_qwen35_attention_run_device
         procedure :: run_core_device => cuda_qwen35_attention_run_core_device
+        procedure :: run_core_device_batch => cuda_qwen35_attention_run_core_device_batch
     end type cuda_qwen35_attention_t
 
     public :: cuda_q8_matvec_host
@@ -83,12 +87,20 @@ module fortai_backend_cuda
     public :: cuda_q8_ffn_device
     public :: cuda_qwen35_copy_device
     public :: cuda_qwen35_add_device
+    public :: cuda_qwen35_add_matrix_device
+    public :: cuda_qwen35_copy_column_device
     public :: cuda_qwen35_rms_norm_device
+    public :: cuda_qwen35_rms_norm_matrix_device
     public :: cuda_qwen35_silu_product_device
+    public :: cuda_qwen35_silu_product_matrix_device
     public :: cuda_qwen35_argmax_device
     public :: cuda_q8_matvec_resident
     public :: cuda_q8_matvec_device_f32
+    public :: cuda_q8_matvec_device_f32_pair
+    public :: cuda_q8_reserve_matvec_scratch
+    public :: cuda_q8_matmul_device_f32
     public :: cuda_qwen35_embedding_device
+    public :: cuda_qwen35_embedding_device_batch
     public :: cuda_q4_matvec_host
     public :: cuda_q4_matvec_host_pair
     public :: cuda_q4_matvec_host_triplet
@@ -98,9 +110,14 @@ module fortai_backend_cuda
     public :: cuda_q4_matvec_device_swiglu_down
     public :: cuda_q4_matvec_device_pair
     public :: cuda_q4_matvec_device_triplet
+    public :: cuda_q4_matvec_device_quad
+    public :: cuda_q4_matmul_device_pair
+    public :: cuda_q4_matmul_device_triplet
+    public :: cuda_q4_matmul_device_one
     public :: cuda_q4_matvec_device_group_remote_output
     public :: cuda_q4_matvec_device_remote_input
     public :: cuda_q4_embedding_device
+    public :: cuda_q4_embedding_device_batch
     public :: cuda_memory_info
 
     interface
@@ -146,6 +163,13 @@ module fortai_backend_cuda
             type(c_ptr), value :: context
             type(c_ptr) :: stream
         end function c_context_stream
+
+        function c_context_adopt_stream(context, stream) &
+                bind(C, name='fortai_cuda_q8_context_adopt_stream') result(code)
+            import c_int, c_ptr
+            type(c_ptr), value :: context, stream
+            integer(c_int) :: code
+        end function c_context_adopt_stream
 
         function c_context_capture_begin(context) &
                 bind(C, name='fortai_cuda_q8_context_capture_begin') result(code)
@@ -205,6 +229,14 @@ module fortai_backend_cuda
             type(c_ptr), value :: context
             integer(c_int) :: code
         end function c_q4_context_synchronize
+
+        function c_q4_context_stream(context, device_slot) &
+                bind(C, name='fortai_cuda_q4_context_stream') result(stream)
+            import c_int, c_ptr
+            type(c_ptr), value :: context
+            integer(c_int), value :: device_slot
+            type(c_ptr) :: stream
+        end function c_q4_context_stream
 
         function c_q4_context_set_consumer_stream(context, device_slot, stream) &
                 bind(C, name='fortai_cuda_q4_context_set_consumer_stream') result(code)
@@ -316,6 +348,37 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_q4_matvec_device_group
 
+        function c_q4_matvec_device_quad(context, first_weights, second_weights, third_weights, fourth_weights, &
+                device_activation, activation_elements, first_output, first_output_elements, second_output, &
+                second_output_elements, third_output, third_output_elements, fourth_output, fourth_output_elements) &
+                bind(C, name='fortai_cuda_q4_matvec_device_quad') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, first_weights, second_weights, third_weights, fourth_weights
+            type(c_ptr), value :: device_activation, first_output, second_output, third_output, fourth_output
+            integer(c_size_t), value :: activation_elements, first_output_elements, second_output_elements
+            integer(c_size_t), value :: third_output_elements, fourth_output_elements
+            integer(c_int) :: code
+        end function c_q4_matvec_device_quad
+
+        function c_q4_matmul_device_group(context, weights, device_activation, activation_elements, batch, &
+                device_outputs, output_elements, count) bind(C, name='fortai_cuda_q4_matmul_device_group') &
+                result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, device_activation, device_outputs, output_elements
+            integer(c_size_t), value :: activation_elements
+            integer(c_int), value :: batch, count
+            integer(c_int) :: code
+        end function c_q4_matmul_device_group
+
+        function c_q4_matmul_device(context, weights, device_activation, activation_elements, batch, &
+                device_output, output_elements) bind(C, name='fortai_cuda_q4_matmul_device') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, device_activation, device_output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int), value :: batch
+            integer(c_int) :: code
+        end function c_q4_matmul_device
+
         function c_q4_matvec_device_group_remote_output(context, weights, device_activation, activation_elements, &
                 device_outputs, output_elements, count) &
                 bind(C, name='fortai_cuda_q4_matvec_device_group_remote_output') result(code)
@@ -342,6 +405,15 @@ module fortai_backend_cuda
             integer(c_size_t), value :: output_elements
             integer(c_int) :: code
         end function c_q4_embedding_device
+
+        function c_q4_embedding_device_batch(context, weights, host_tokens, batch, device_output, output_elements) &
+                bind(C, name='fortai_cuda_q4_embedding_device_batch') result(code)
+            import c_int, c_int32_t, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, host_tokens, device_output
+            integer(c_int), value :: batch
+            integer(c_size_t), value :: output_elements
+            integer(c_int) :: code
+        end function c_q4_embedding_device_batch
 
         function c_buffer_create(context, bytes, buffer) &
                 bind(C, name='fortai_cuda_q8_device_buffer_create') result(code)
@@ -409,6 +481,34 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_matvec_device_f32
 
+        function c_matvec_device_f32_pair(context, first_weights, second_weights, activation, &
+                activation_elements, first_output, first_output_elements, second_output, &
+                second_output_elements) bind(C, name='fortai_cuda_q8_matvec_device_f32_pair') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, first_weights, second_weights, activation
+            integer(c_size_t), value :: activation_elements
+            type(c_ptr), value :: first_output, second_output
+            integer(c_size_t), value :: first_output_elements, second_output_elements
+            integer(c_int) :: code
+        end function c_matvec_device_f32_pair
+
+        function c_reserve_matvec_scratch(context, activation_elements, output_elements) &
+                bind(C, name='fortai_cuda_q8_reserve_matvec_scratch') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int) :: code
+        end function c_reserve_matvec_scratch
+
+        function c_matmul_device_f32(context, weights, activation, activation_elements, batch, &
+                output, output_elements) bind(C, name='fortai_cuda_q8_matmul_device_f32') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, activation, output
+            integer(c_size_t), value :: activation_elements, output_elements
+            integer(c_int), value :: batch
+            integer(c_int) :: code
+        end function c_matmul_device_f32
+
         function c_embedding_device(context, weights, token_id, output, output_elements) &
                 bind(C, name='fortai_cuda_qwen35_embedding_device') result(code)
             import c_int, c_int64_t, c_ptr, c_size_t
@@ -417,6 +517,15 @@ module fortai_backend_cuda
             integer(c_size_t), value :: output_elements
             integer(c_int) :: code
         end function c_embedding_device
+
+        function c_embedding_device_batch(context, weights, host_tokens, batch, output, output_elements) &
+                bind(C, name='fortai_cuda_qwen35_embedding_device_batch') result(code)
+            import c_int, c_int32_t, c_ptr, c_size_t
+            type(c_ptr), value :: context, weights, host_tokens, output
+            integer(c_int), value :: batch
+            integer(c_size_t), value :: output_elements
+            integer(c_int) :: code
+        end function c_embedding_device_batch
 
         function c_qwen35_copy_device(context, device_input, device_output, bytes) &
                 bind(C, name='fortai_cuda_qwen35_copy_device') result(code)
@@ -434,6 +543,23 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_qwen35_add_device
 
+        function c_qwen35_copy_column_device(context, device_input, stride, column, device_output, elements) &
+                bind(C, name='fortai_cuda_qwen35_copy_column_device') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, device_input, device_output
+            integer(c_size_t), value :: stride, elements
+            integer(c_int), value :: column
+            integer(c_int) :: code
+        end function c_qwen35_copy_column_device
+
+        function c_qwen35_add_matrix_device(context, device_left, device_right, device_output, elements) &
+                bind(C, name='fortai_cuda_qwen35_add_matrix_device') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, device_left, device_right, device_output
+            integer(c_size_t), value :: elements
+            integer(c_int) :: code
+        end function c_qwen35_add_matrix_device
+
         function c_qwen35_rms_norm_device(context, device_input, device_weights, device_output, &
                 elements, epsilon) bind(C, name='fortai_cuda_qwen35_rms_norm_device') result(code)
             import c_float, c_int, c_ptr, c_size_t
@@ -443,6 +569,16 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_qwen35_rms_norm_device
 
+        function c_qwen35_rms_norm_matrix_device(context, device_input, device_weights, device_output, &
+                hidden, batch, epsilon) bind(C, name='fortai_cuda_qwen35_rms_norm_matrix_device') result(code)
+            import c_float, c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, device_input, device_weights, device_output
+            integer(c_size_t), value :: hidden
+            integer(c_int), value :: batch
+            real(c_float), value :: epsilon
+            integer(c_int) :: code
+        end function c_qwen35_rms_norm_matrix_device
+
         function c_qwen35_silu_product_device(context, device_gate, device_up, elements) &
                 bind(C, name='fortai_cuda_qwen35_silu_product_device') result(code)
             import c_int, c_ptr, c_size_t
@@ -450,6 +586,14 @@ module fortai_backend_cuda
             integer(c_size_t), value :: elements
             integer(c_int) :: code
         end function c_qwen35_silu_product_device
+
+        function c_qwen35_silu_product_matrix_device(context, device_gate, device_up, elements) &
+                bind(C, name='fortai_cuda_qwen35_silu_product_matrix_device') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: context, device_gate, device_up
+            integer(c_size_t), value :: elements
+            integer(c_int) :: code
+        end function c_qwen35_silu_product_matrix_device
 
         function c_qwen35_argmax_device(context, device_logits, elements, host_index) &
                 bind(C, name='fortai_cuda_qwen35_argmax_device') result(code)
@@ -623,6 +767,16 @@ module fortai_backend_cuda
             integer(c_int) :: code
         end function c_qwen35_recurrent_run_core_device
 
+        function c_qwen35_recurrent_run_core_device_batch(layer, device_qkv, qkv_elements, device_gate, gate_elements, &
+                device_alpha, alpha_elements, device_beta, beta_elements, batch, device_output, output_elements) &
+                bind(C, name='fortai_cuda_qwen35_recurrent_run_core_device_batch') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: layer, device_qkv, device_gate, device_alpha, device_beta, device_output
+            integer(c_size_t), value :: qkv_elements, gate_elements, alpha_elements, beta_elements, output_elements
+            integer(c_int), value :: batch
+            integer(c_int) :: code
+        end function c_qwen35_recurrent_run_core_device_batch
+
         function c_qwen35_attention_create(context, query_weights, key_weights, value_weights, &
                 output_weights, query_norm, query_norm_bytes, key_norm, key_norm_bytes, heads, &
                 key_value_heads, head_size, value_size, max_context, rope_dimension, rope_base, &
@@ -688,6 +842,16 @@ module fortai_backend_cuda
             integer(c_int), value :: position
             integer(c_int) :: code
         end function c_qwen35_attention_run_core_device
+
+        function c_qwen35_attention_run_core_device_batch(layer, device_query, query_elements, device_key, key_elements, &
+                device_value, value_elements, position, batch, device_output, output_elements) bind(C, &
+                name='fortai_cuda_qwen35_attention_run_core_device_batch') result(code)
+            import c_int, c_ptr, c_size_t
+            type(c_ptr), value :: layer, device_query, device_key, device_value, device_output
+            integer(c_size_t), value :: query_elements, key_elements, value_elements, output_elements
+            integer(c_int), value :: position, batch
+            integer(c_int) :: code
+        end function c_qwen35_attention_run_core_device_batch
 
         function c_last_error(context) bind(C, name='fortai_cuda_q8_last_error') result(message)
             import c_ptr
@@ -755,6 +919,18 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA Q4 context synchronization failed')
     end subroutine cuda_q4_context_synchronize
+
+    function cuda_q4_context_stream(self, device_slot) result(stream)
+        class(cuda_q4_context_t), intent(in) :: self
+        integer, intent(in) :: device_slot
+        type(c_ptr) :: stream
+
+        if (c_associated(self%handle) .and. device_slot >= 0 .and. device_slot <= 1) then
+            stream = c_q4_context_stream(self%handle, int(device_slot, c_int))
+        else
+            stream = c_null_ptr
+        end if
+    end function cuda_q4_context_stream
 
     subroutine cuda_q4_context_set_consumer_stream(self, device_slot, stream, stat)
         class(cuda_q4_context_t), intent(in) :: self
@@ -1030,6 +1206,113 @@ contains
             'CUDA Q4 resident triplet matvec failed')
     end subroutine cuda_q4_matvec_device_triplet
 
+    subroutine cuda_q4_matvec_device_quad(context, first_weights, second_weights, third_weights, fourth_weights, &
+            device_activation, activation_elements, first_output, first_output_elements, second_output, &
+            second_output_elements, third_output, third_output_elements, fourth_output, fourth_output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: first_weights, second_weights, third_weights, fourth_weights
+        type(c_ptr), intent(in) :: device_activation, first_output, second_output, third_output, fourth_output
+        integer(c_size_t), intent(in) :: activation_elements, first_output_elements, second_output_elements, &
+            third_output_elements, fourth_output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(second_weights%handle) .or. .not. c_associated(third_weights%handle) .or. &
+            .not. c_associated(fourth_weights%handle) .or. .not. c_associated(device_activation) .or. &
+            .not. c_associated(first_output) .or. .not. c_associated(second_output) .or. &
+            .not. c_associated(third_output) .or. .not. c_associated(fourth_output)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 resident quad arguments')
+            return
+        end if
+        code = c_q4_matvec_device_quad(context%handle, first_weights%handle, second_weights%handle, &
+            third_weights%handle, fourth_weights%handle, device_activation, activation_elements, first_output, &
+            first_output_elements, second_output, second_output_elements, third_output, third_output_elements, &
+            fourth_output, fourth_output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA Q4 resident quad matvec failed')
+    end subroutine cuda_q4_matvec_device_quad
+
+    subroutine cuda_q4_matmul_device_pair(context, first_weights, second_weights, device_activation, &
+            activation_elements, batch, first_output, first_output_elements, second_output, &
+            second_output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: first_weights, second_weights
+        type(c_ptr), intent(in) :: device_activation, first_output, second_output
+        integer(c_size_t), intent(in) :: activation_elements, first_output_elements, second_output_elements
+        integer, intent(in) :: batch
+        type(status_t), intent(out) :: stat
+        type(c_ptr), target :: handles(2), outputs(2)
+        integer(c_size_t), target :: sizes(2)
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(second_weights%handle) .or. .not. c_associated(device_activation) .or. &
+            .not. c_associated(first_output) .or. .not. c_associated(second_output) .or. batch <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 batched pair arguments')
+            return
+        end if
+        handles = [first_weights%handle, second_weights%handle]
+        outputs = [first_output, second_output]
+        sizes = [first_output_elements, second_output_elements]
+        code = c_q4_matmul_device_group(context%handle, c_loc(handles), device_activation, activation_elements, &
+            int(batch, c_int), c_loc(outputs), c_loc(sizes), 2_c_int)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched pair failed')
+    end subroutine cuda_q4_matmul_device_pair
+
+    subroutine cuda_q4_matmul_device_one(context, weights, device_activation, activation_elements, batch, &
+            device_output, output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: weights
+        type(c_ptr), intent(in) :: device_activation, device_output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        integer, intent(in) :: batch
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
+            .not. c_associated(device_activation) .or. .not. c_associated(device_output) .or. batch <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 batched matrix arguments')
+            return
+        end if
+        code = c_q4_matmul_device(context%handle, weights%handle, device_activation, activation_elements, &
+            int(batch, c_int), device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched matrix failed')
+    end subroutine cuda_q4_matmul_device_one
+
+    subroutine cuda_q4_matmul_device_triplet(context, first_weights, second_weights, third_weights, &
+            device_activation, activation_elements, batch, first_output, first_output_elements, second_output, &
+            second_output_elements, third_output, third_output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: first_weights, second_weights, third_weights
+        type(c_ptr), intent(in) :: device_activation, first_output, second_output, third_output
+        integer(c_size_t), intent(in) :: activation_elements, first_output_elements, second_output_elements, &
+            third_output_elements
+        integer, intent(in) :: batch
+        type(status_t), intent(out) :: stat
+        type(c_ptr), target :: handles(3), outputs(3)
+        integer(c_size_t), target :: sizes(3)
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(second_weights%handle) .or. .not. c_associated(third_weights%handle) .or. &
+            .not. c_associated(device_activation) .or. .not. c_associated(first_output) .or. &
+            .not. c_associated(second_output) .or. .not. c_associated(third_output) .or. batch <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 batched triplet arguments')
+            return
+        end if
+        handles = [first_weights%handle, second_weights%handle, third_weights%handle]
+        outputs = [first_output, second_output, third_output]
+        sizes = [first_output_elements, second_output_elements, third_output_elements]
+        code = c_q4_matmul_device_group(context%handle, c_loc(handles), device_activation, activation_elements, &
+            int(batch, c_int), c_loc(outputs), c_loc(sizes), 3_c_int)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched triplet failed')
+    end subroutine cuda_q4_matmul_device_triplet
+
     subroutine cuda_q4_matvec_device_group_remote_output(context, first_weights, second_weights, third_weights, &
             count, device_activation, activation_elements, first_output, first_output_elements, second_output, &
             second_output_elements, third_output, third_output_elements, stat)
@@ -1116,6 +1399,27 @@ contains
             'CUDA Q4 resident embedding failed')
     end subroutine cuda_q4_embedding_device
 
+    subroutine cuda_q4_embedding_device_batch(context, weights, host_tokens, batch, device_output, output_elements, stat)
+        class(cuda_q4_context_t), intent(in) :: context
+        class(cuda_q4_weights_t), intent(in) :: weights
+        integer(c_int32_t), contiguous, target, intent(in) :: host_tokens(:)
+        integer, intent(in) :: batch
+        type(c_ptr), intent(in) :: device_output
+        integer(c_size_t), intent(in) :: output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
+            .not. c_associated(device_output) .or. batch <= 0 .or. size(host_tokens) < batch) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA Q4 batched embedding arguments')
+            return
+        end if
+        code = c_q4_embedding_device_batch(context%handle, weights%handle, c_loc(host_tokens), int(batch, c_int), &
+            device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched embedding failed')
+    end subroutine cuda_q4_embedding_device_batch
+
     subroutine cuda_q8_context_create(self, device, stat)
         class(cuda_q8_context_t), intent(inout) :: self
         integer, intent(in) :: device
@@ -1174,6 +1478,22 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA context synchronization failed')
     end subroutine cuda_q8_context_synchronize
+
+    subroutine cuda_q8_context_adopt_stream(self, stream, stat)
+        class(cuda_q8_context_t), intent(in) :: self
+        type(c_ptr), intent(in) :: stream
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle) .or. .not. c_associated(stream)) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA stream hand-off arguments')
+            return
+        end if
+        code = c_context_adopt_stream(self%handle, stream)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA stream hand-off failed')
+    end subroutine cuda_q8_context_adopt_stream
 
     function cuda_q8_context_stream(self) result(stream)
         class(cuda_q8_context_t), intent(in) :: self
@@ -1398,6 +1718,23 @@ contains
             'CUDA Q8 resident matvec failed')
     end subroutine cuda_q8_matvec_resident
 
+    subroutine cuda_q8_reserve_matvec_scratch(context, activation_elements, output_elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. activation_elements <= 0_c_size_t .or. &
+            output_elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA F32 matvec scratch reservation')
+            return
+        end if
+        code = c_reserve_matvec_scratch(context%handle, activation_elements, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA F32 matvec scratch reservation failed')
+    end subroutine cuda_q8_reserve_matvec_scratch
+
     subroutine cuda_q8_matvec_device_f32(context, weights, activation, activation_elements, &
             output, output_elements, stat)
         class(cuda_q8_context_t), intent(in) :: context
@@ -1420,6 +1757,55 @@ contains
             'CUDA device F32 matvec failed')
     end subroutine cuda_q8_matvec_device_f32
 
+    subroutine cuda_q8_matvec_device_f32_pair(context, first_weights, second_weights, activation, &
+            activation_elements, first_output, first_output_elements, second_output, &
+            second_output_elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: first_weights, second_weights
+        type(c_ptr), intent(in) :: activation, first_output, second_output
+        integer(c_size_t), intent(in) :: activation_elements, first_output_elements, second_output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(first_weights%handle) .or. &
+            .not. c_associated(second_weights%handle) .or. .not. c_associated(activation) .or. &
+            .not. c_associated(first_output) .or. .not. c_associated(second_output) .or. &
+            activation_elements <= 0_c_size_t .or. first_output_elements <= 0_c_size_t .or. &
+            second_output_elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA device F32 matvec pair')
+            return
+        end if
+        code = c_matvec_device_f32_pair(context%handle, first_weights%handle, second_weights%handle, &
+            activation, activation_elements, first_output, first_output_elements, second_output, &
+            second_output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA device F32 matvec pair failed')
+    end subroutine cuda_q8_matvec_device_f32_pair
+
+    subroutine cuda_q8_matmul_device_f32(context, weights, activation, activation_elements, batch, &
+            output, output_elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: weights
+        type(c_ptr), intent(in) :: activation, output
+        integer(c_size_t), intent(in) :: activation_elements, output_elements
+        integer, intent(in) :: batch
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
+            .not. c_associated(activation) .or. .not. c_associated(output) .or. &
+            activation_elements <= 0_c_size_t .or. output_elements <= 0_c_size_t .or. batch <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA device F32 batched matmul')
+            return
+        end if
+        code = c_matmul_device_f32(context%handle, weights%handle, activation, activation_elements, &
+            int(batch, c_int), output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA device F32 batched matmul failed')
+    end subroutine cuda_q8_matmul_device_f32
+
     subroutine cuda_qwen35_embedding_device(context, weights, token_id, output, output_elements, stat)
         class(cuda_q8_context_t), intent(in) :: context
         class(cuda_q8_weights_t), intent(in) :: weights
@@ -1439,6 +1825,29 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA Q8 embedding lookup failed')
     end subroutine cuda_qwen35_embedding_device
+
+    subroutine cuda_qwen35_embedding_device_batch(context, weights, host_tokens, batch, output, output_elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        class(cuda_q8_weights_t), intent(in) :: weights
+        integer(c_int32_t), contiguous, target, intent(in) :: host_tokens(:)
+        integer, intent(in) :: batch
+        type(c_ptr), intent(in) :: output
+        integer(c_size_t), intent(in) :: output_elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(weights%handle) .or. &
+            .not. c_associated(output) .or. batch <= 0 .or. size(host_tokens) < batch .or. &
+            output_elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA batched embedding arguments')
+            return
+        end if
+        code = c_embedding_device_batch(context%handle, weights%handle, c_loc(host_tokens), &
+            int(batch, c_int), output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA batched embedding lookup failed')
+    end subroutine cuda_qwen35_embedding_device_batch
 
     subroutine cuda_qwen35_copy_device(context, device_input, device_output, bytes, stat)
         class(cuda_q8_context_t), intent(in) :: context
@@ -1477,6 +1886,44 @@ contains
             'CUDA device add failed')
     end subroutine cuda_qwen35_add_device
 
+    subroutine cuda_qwen35_copy_column_device(context, device_input, stride, column, device_output, elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        type(c_ptr), intent(in) :: device_input, device_output
+        integer(c_size_t), intent(in) :: stride, elements
+        integer, intent(in) :: column
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(device_input) .or. &
+            .not. c_associated(device_output) .or. stride <= 0_c_size_t .or. elements <= 0_c_size_t .or. &
+            column < 0) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA device column copy')
+            return
+        end if
+        code = c_qwen35_copy_column_device(context%handle, device_input, stride, int(column, c_int), &
+            device_output, elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'CUDA device column copy failed')
+    end subroutine cuda_qwen35_copy_column_device
+
+    subroutine cuda_qwen35_add_matrix_device(context, device_left, device_right, device_output, elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        type(c_ptr), intent(in) :: device_left, device_right, device_output
+        integer(c_size_t), intent(in) :: elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(device_left) .or. &
+            .not. c_associated(device_right) .or. .not. c_associated(device_output) .or. elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA matrix add arguments')
+            return
+        end if
+        code = c_qwen35_add_matrix_device(context%handle, device_left, device_right, device_output, elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA matrix add failed')
+    end subroutine cuda_qwen35_add_matrix_device
+
     subroutine cuda_qwen35_rms_norm_device(context, device_input, device_weights, device_output, &
             elements, epsilon, stat)
         class(cuda_q8_context_t), intent(in) :: context
@@ -1499,6 +1946,28 @@ contains
             'CUDA device RMS norm failed')
     end subroutine cuda_qwen35_rms_norm_device
 
+    subroutine cuda_qwen35_rms_norm_matrix_device(context, device_input, device_weights, device_output, &
+            hidden, batch, epsilon, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        type(c_ptr), intent(in) :: device_input, device_weights, device_output
+        integer(c_size_t), intent(in) :: hidden
+        integer, intent(in) :: batch
+        real(c_float), intent(in) :: epsilon
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(device_input) .or. &
+            .not. c_associated(device_weights) .or. .not. c_associated(device_output) .or. &
+            hidden <= 0_c_size_t .or. batch <= 0 .or. epsilon <= 0.0_c_float) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA batched RMS norm arguments')
+            return
+        end if
+        code = c_qwen35_rms_norm_matrix_device(context%handle, device_input, device_weights, device_output, &
+            hidden, int(batch, c_int), epsilon)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA batched RMS norm failed')
+    end subroutine cuda_qwen35_rms_norm_matrix_device
+
     subroutine cuda_qwen35_silu_product_device(context, device_gate, device_up, elements, stat)
         class(cuda_q8_context_t), intent(in) :: context
         type(c_ptr), intent(in) :: device_gate, device_up
@@ -1516,6 +1985,23 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA SiLU product failed')
     end subroutine cuda_qwen35_silu_product_device
+
+    subroutine cuda_qwen35_silu_product_matrix_device(context, device_gate, device_up, elements, stat)
+        class(cuda_q8_context_t), intent(in) :: context
+        type(c_ptr), intent(in) :: device_gate, device_up
+        integer(c_size_t), intent(in) :: elements
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(context%handle) .or. .not. c_associated(device_gate) .or. &
+            .not. c_associated(device_up) .or. elements <= 0_c_size_t) then
+            call stat%set(FORTAI_INVALID, 'invalid CUDA matrix SiLU arguments')
+            return
+        end if
+        code = c_qwen35_silu_product_matrix_device(context%handle, device_gate, device_up, elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA matrix SiLU product failed')
+    end subroutine cuda_qwen35_silu_product_matrix_device
 
     subroutine cuda_qwen35_argmax_device(context, device_logits, elements, host_index, stat)
         class(cuda_q8_context_t), intent(in) :: context
@@ -1851,6 +2337,28 @@ contains
             'Qwen3.5 CUDA recurrent core failed')
     end subroutine cuda_qwen35_recurrent_run_core_device
 
+    subroutine cuda_qwen35_recurrent_run_core_device_batch(self, device_qkv, qkv_elements, device_gate, gate_elements, &
+            device_alpha, alpha_elements, device_beta, beta_elements, batch, device_output, output_elements, stat)
+        class(cuda_qwen35_recurrent_t), intent(in) :: self
+        type(c_ptr), intent(in) :: device_qkv, device_gate, device_alpha, device_beta, device_output
+        integer(c_size_t), intent(in) :: qkv_elements, gate_elements, alpha_elements, beta_elements, output_elements
+        integer, intent(in) :: batch
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle) .or. .not. c_associated(device_qkv) .or. &
+            .not. c_associated(device_gate) .or. .not. c_associated(device_alpha) .or. &
+            .not. c_associated(device_beta) .or. .not. c_associated(device_output) .or. batch <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid Qwen3.5 CUDA recurrent batched core arguments')
+            return
+        end if
+        code = c_qwen35_recurrent_run_core_device_batch(self%handle, device_qkv, qkv_elements, device_gate, gate_elements, &
+            device_alpha, alpha_elements, device_beta, beta_elements, int(batch, c_int), device_output, output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'Qwen3.5 CUDA recurrent batched core failed')
+    end subroutine cuda_qwen35_recurrent_run_core_device_batch
+
     subroutine cuda_qwen35_attention_create(self, context, query_weights, key_weights, value_weights, &
             output_weights, query_norm, query_norm_bytes, key_norm, key_norm_bytes, heads, &
             key_value_heads, head_size, value_size, max_context, rope_dimension, rope_base, &
@@ -1997,6 +2505,29 @@ contains
         if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
             'CUDA Qwen attention core failed')
     end subroutine cuda_qwen35_attention_run_core_device
+
+    subroutine cuda_qwen35_attention_run_core_device_batch(self, device_query, query_elements, device_key, key_elements, &
+            device_value, value_elements, position, batch, device_output, output_elements, stat)
+        class(cuda_qwen35_attention_t), intent(in) :: self
+        type(c_ptr), intent(in) :: device_query, device_key, device_value, device_output
+        integer(c_size_t), intent(in) :: query_elements, key_elements, value_elements, output_elements
+        integer, intent(in) :: position, batch
+        type(status_t), intent(out) :: stat
+        integer(c_int) :: code
+
+        call stat%clear()
+        if (.not. c_associated(self%handle) .or. .not. c_associated(device_query) .or. &
+            .not. c_associated(device_key) .or. .not. c_associated(device_value) .or. &
+            .not. c_associated(device_output) .or. position < 0 .or. batch <= 0) then
+            call stat%set(FORTAI_INVALID, 'invalid Qwen attention batched core arguments')
+            return
+        end if
+        code = c_qwen35_attention_run_core_device_batch(self%handle, device_query, query_elements, device_key, &
+            key_elements, device_value, value_elements, int(position, c_int), int(batch, c_int), device_output, &
+            output_elements)
+        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+            'Qwen attention batched core failed')
+    end subroutine cuda_qwen35_attention_run_core_device_batch
 
     function cuda_q8_last_error(self) result(message)
         class(cuda_q8_context_t), intent(in) :: self

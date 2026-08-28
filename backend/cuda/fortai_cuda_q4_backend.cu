@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <vector>
 
@@ -12,6 +14,14 @@
 #include <ggml-cpu.h>
 #include <ggml-cuda.h>
 #include <cuda_runtime.h>
+
+/* The public GGML backend intentionally does not expose its scheduler
+ * stream.  FortAI's unified-stream mode needs the exact stream used by the
+ * backend, not a second stream plus a device fence.  This private definition
+ * is compiled against the same llama.cpp source tree as the linked GGML
+ * library (the build script supplies the include path and graph macro). */
+#include "ggml-backend-impl.h"
+#include "common.cuh"
 
 namespace {
 
@@ -64,14 +74,53 @@ bool fortai_supported_type(int type) {
 
 } // namespace
 
+static bool fortai_cuda_q4_segment_graph_requested();
+
 struct fortai_cuda_q4_weights;
 
 struct fortai_cuda_q4_group_plan {
     int count = 0;
-    const fortai_cuda_q4_weights *weights[3] = {nullptr, nullptr, nullptr};
+    const fortai_cuda_q4_weights *weights[8] = {};
     ggml_context *context = nullptr;
     ggml_cgraph *graph = nullptr;
     ggml_backend_t backend = nullptr;
+    mutable cudaGraph_t cached_graph = nullptr;
+    mutable cudaGraphExec_t cached_exec = nullptr;
+    mutable bool graph_warmup = false;
+    mutable bool graph_disabled = false;
+};
+
+struct fortai_cuda_q4_batch_plan {
+    int count = 0;
+    int batch = 0;
+    const fortai_cuda_q4_weights *weights[3] = {nullptr, nullptr, nullptr};
+    ggml_context *context = nullptr;
+    ggml_tensor *weight[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor *activation[3] = {nullptr, nullptr, nullptr};
+    ggml_tensor *output[3] = {nullptr, nullptr, nullptr};
+    ggml_cgraph *graph = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    mutable cudaGraph_t cached_graph = nullptr;
+    mutable cudaGraphExec_t cached_exec = nullptr;
+    mutable bool graph_warmup = false;
+    mutable bool graph_disabled = false;
+};
+
+struct fortai_cuda_q4_embedding_batch_plan {
+    const fortai_cuda_q4_weights *weights = nullptr;
+    int batch = 0;
+    ggml_context *context = nullptr;
+    ggml_tensor *weight = nullptr;
+    ggml_tensor *ids = nullptr;
+    ggml_tensor *output = nullptr;
+    ggml_cgraph *graph = nullptr;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    mutable cudaGraph_t cached_graph = nullptr;
+    mutable cudaGraphExec_t cached_exec = nullptr;
+    mutable bool graph_warmup = false;
+    mutable bool graph_disabled = false;
 };
 
 struct fortai_cuda_q4_swiglu_plan {
@@ -85,6 +134,10 @@ struct fortai_cuda_q4_swiglu_plan {
     ggml_cgraph *graph = nullptr;
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t compute_buffer = nullptr;
+    mutable cudaGraph_t cached_graph = nullptr;
+    mutable cudaGraphExec_t cached_exec = nullptr;
+    mutable bool graph_warmup = false;
+    mutable bool graph_disabled = false;
 };
 
 /* Complete resident Q4 FFN graph.  Keeping the down projection in the same
@@ -103,6 +156,10 @@ struct fortai_cuda_q4_ffn_plan {
     ggml_cgraph *graph = nullptr;
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t compute_buffer = nullptr;
+    mutable cudaGraph_t cached_graph = nullptr;
+    mutable cudaGraphExec_t cached_exec = nullptr;
+    mutable bool graph_warmup = false;
+    mutable bool graph_disabled = false;
 };
 
 
@@ -141,6 +198,8 @@ struct fortai_cuda_q4_context {
     ggml_backend_t devices[2] = {nullptr, nullptr};
     ggml_backend_t cpu = nullptr;
     int device_ids[2] = {0, 0};
+    bool segment_graph_requested = false;
+    bool sync_bridge_requested = false;
     cudaStream_t consumer_stream[2] = {nullptr, nullptr};
     ggml_backend_event_t producer_event[2][event_slots] = {};
     unsigned producer_event_index[2] = {0, 0};
@@ -171,9 +230,25 @@ struct fortai_cuda_q4_context {
     int32_t embedding_id = 0;
     std::vector<fortai_cuda_q4_weight_arena> weight_arenas[2];
     std::vector<fortai_cuda_q4_group_plan> group_plans;
+    std::vector<fortai_cuda_q4_batch_plan> batch_plans;
+    std::vector<fortai_cuda_q4_embedding_batch_plan> embedding_batch_plans;
     std::vector<fortai_cuda_q4_swiglu_plan> swiglu_plans;
     std::vector<fortai_cuda_q4_ffn_plan> ffn_plans;
 };
+
+/* The linked GGML build exposes two additional 2-D async transfer slots in
+ * ggml_backend_i.  Its backend object is therefore 0x98 bytes and stores the
+ * context pointer at offset 0x90, while older public headers describe the
+ * shorter 0x88-byte object.  Keep this ABI view local so the stream hand-off
+ * never interprets the device pointer as a CUDA context. */
+struct fortai_ggml_backend_runtime_layout {
+    ggml_guid_t guid;
+    void *iface[16];
+    ggml_backend_dev_t device;
+    void *context;
+};
+static_assert(offsetof(fortai_ggml_backend_runtime_layout, context) == 0x90,
+    "unexpected GGML backend ABI layout");
 
 /* ggml_backend_event_t is intentionally opaque in the public API.  The CUDA
  * backend stores the native event handle in its context field; keep this
@@ -394,6 +469,14 @@ struct fortai_cuda_q4_weights {
     ggml_cgraph *embedding_graph = nullptr;
     ggml_backend_buffer_t embedding_buffer = nullptr;
     bool embedding_ready = false;
+    cudaGraph_t cached_graph = nullptr;
+    cudaGraphExec_t cached_exec = nullptr;
+    bool graph_warmup = false;
+    bool graph_disabled = false;
+    mutable cudaGraph_t embedding_cached_graph = nullptr;
+    mutable cudaGraphExec_t embedding_cached_exec = nullptr;
+    mutable bool embedding_graph_warmup = false;
+    mutable bool embedding_graph_disabled = false;
 };
 
 /* Build the same { Q4 matmul, Q4 matmul, SwiGLU } shape that llama.cpp
@@ -516,11 +599,66 @@ static int fail(fortai_cuda_q4_context * context) {
     return FORTAI_CUDA_RUNTIME_ERROR;
 }
 
+static void fortai_cuda_q4_debug(const char *operation) {
+    const char *enabled = std::getenv("FORTAI_CUDA_Q4_DEBUG");
+    if (enabled == nullptr || enabled[0] == '0') return;
+    const cudaError_t error = cudaPeekAtLastError();
+    std::fprintf(stderr, "fortai-q4: %s: %s (%d)\n", operation,
+        cudaGetErrorString(error), static_cast<int>(error));
+}
+
+static void fortai_cuda_q4_debug_code(const char *operation, int code) {
+    const char *enabled = std::getenv("FORTAI_CUDA_Q4_DEBUG");
+    if (enabled == nullptr || enabled[0] == '0') return;
+    const cudaError_t error = cudaPeekAtLastError();
+    std::fprintf(stderr, "fortai-q4: %s: code=%d cuda=%s (%d)\n", operation,
+        code, cudaGetErrorString(error), static_cast<int>(error));
+}
+
 static int fortai_cuda_q4_consumer_slot(const fortai_cuda_q4_context *context, int device) {
     if (context == nullptr) return -1;
     for (int slot = 0; slot < 2; ++slot)
         if (context->device_ids[slot] == device) return slot;
     return -1;
+}
+
+static cudaStream_t fortai_cuda_q4_scheduler_stream(
+    fortai_cuda_q4_context *context, int slot) {
+    if (context == nullptr || slot < 0 || slot > 1 ||
+        context->devices[slot] == nullptr)
+        return nullptr;
+    auto *backend = reinterpret_cast<fortai_ggml_backend_runtime_layout *>(context->devices[slot]);
+    if (backend == nullptr || backend->context == nullptr) return nullptr;
+    auto *cuda_context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    cudaSetDevice(context->device_ids[slot]);
+    return cuda_context->stream();
+}
+
+static int fortai_cuda_q4_record_scheduler_event(fortai_cuda_q4_context *context,
+    int slot, ggml_backend_event_t event) {
+    if (context == nullptr || event == nullptr || slot < 0 || slot > 1)
+        return FORTAI_CUDA_INVALID;
+    const cudaStream_t stream = fortai_cuda_q4_scheduler_stream(context, slot);
+    if (stream == nullptr || cudaEventRecord(fortai_cuda_event_handle(event), stream) != cudaSuccess)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    return FORTAI_CUDA_OK;
+}
+
+static int fortai_cuda_q4_wait_scheduler_event(fortai_cuda_q4_context *context,
+    int slot, ggml_backend_event_t event) {
+    if (context == nullptr || event == nullptr || slot < 0 || slot > 1)
+        return FORTAI_CUDA_INVALID;
+    const cudaStream_t stream = fortai_cuda_q4_scheduler_stream(context, slot);
+    if (stream == nullptr || cudaStreamWaitEvent(stream,
+            fortai_cuda_event_handle(event), 0) != cudaSuccess)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    return FORTAI_CUDA_OK;
+}
+
+static bool fortai_cuda_q4_sync_bridge_requested() {
+    const char *value = std::getenv("FORTAI_CUDA_Q4_SYNC_BRIDGE");
+    return value != nullptr && (value[0] == '1' || value[0] == 'y' ||
+        value[0] == 'Y' || value[0] == 't' || value[0] == 'T');
 }
 
 static int fortai_cuda_q4_next_event(fortai_cuda_q4_context *context, int slot,
@@ -553,6 +691,8 @@ static int fortai_cuda_q4_prepare_input(fortai_cuda_q4_context *context, int dev
     const int slot = fortai_cuda_q4_consumer_slot(context, device);
     if (slot < 0) return FORTAI_CUDA_INVALID;
     if (context->consumer_stream[slot] == nullptr) return FORTAI_CUDA_OK;
+    if (context->consumer_stream[slot] == fortai_cuda_q4_scheduler_stream(context, slot))
+        return FORTAI_CUDA_OK;
     ggml_backend_event_t producer_event = nullptr;
     if (fortai_cuda_q4_next_event(context, slot, context->producer_event,
             context->producer_event_index, &producer_event) != FORTAI_CUDA_OK)
@@ -563,8 +703,7 @@ static int fortai_cuda_q4_prepare_input(fortai_cuda_q4_context *context, int dev
     /* Queue a device-side dependency on GGML's own stream.  The old path
      * synchronized this event on the host, which serialized every Q4
      * projection behind the preceding Q8 operation. */
-    ggml_backend_event_wait(context->devices[slot], producer_event);
-    return FORTAI_CUDA_OK;
+    return fortai_cuda_q4_wait_scheduler_event(context, slot, producer_event);
 }
 
 static int fortai_cuda_q4_publish_output(fortai_cuda_q4_context *context,
@@ -572,6 +711,8 @@ static int fortai_cuda_q4_publish_output(fortai_cuda_q4_context *context,
     const int slot = fortai_cuda_q4_consumer_slot(context, device);
     if (slot < 0) return FORTAI_CUDA_INVALID;
     if (context->consumer_stream[slot] == nullptr) return FORTAI_CUDA_OK;
+    if (context->consumer_stream[slot] == fortai_cuda_q4_scheduler_stream(context, slot))
+        return FORTAI_CUDA_OK;
     ggml_backend_event_t output_event = nullptr;
     if (fortai_cuda_q4_next_event(context, slot, context->producer_event,
             context->producer_event_index, &output_event) != FORTAI_CUDA_OK)
@@ -579,11 +720,13 @@ static int fortai_cuda_q4_publish_output(fortai_cuda_q4_context *context,
     /* The graph and the event use the same GGML stream.  Once recorded, the
      * downstream Fortran stream can wait without a host-visible scheduler
      * barrier, preserving the dependency for the next native CUDA op. */
-    ggml_backend_event_record(output_event, backend);
-    if (cudaSetDevice(device) != cudaSuccess ||
+    if (fortai_cuda_q4_record_scheduler_event(context, slot, output_event) != FORTAI_CUDA_OK ||
+        cudaSetDevice(device) != cudaSuccess ||
         cudaStreamWaitEvent(context->consumer_stream[slot],
-            fortai_cuda_event_handle(output_event), 0) != cudaSuccess)
+            fortai_cuda_event_handle(output_event), 0) != cudaSuccess) {
+        fortai_cuda_q4_debug("publish output edge");
         return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     return FORTAI_CUDA_OK;
 }
 
@@ -595,6 +738,27 @@ int fortai_cuda_q4_context_create(int first_device, int second_device,
     if (created == nullptr) return FORTAI_CUDA_RUNTIME_ERROR;
     created->device_ids[0] = first_device;
     created->device_ids[1] = second_device;
+    created->segment_graph_requested = fortai_cuda_q4_segment_graph_requested();
+    created->sync_bridge_requested = fortai_cuda_q4_sync_bridge_requested();
+    /* The unified and split-segment paths capture native and Q4 operations
+     * in an outer graph.  GGML's per-plan graph must therefore execute
+     * directly; nesting its capture in the active outer capture is rejected
+     * by CUDA.  Segment capture is safe for split devices because it stops at
+     * the first remote layer, before the scheduler's bridge streams. */
+    bool disable_ggml_graphs = false;
+    if (const char *unified = std::getenv("FORTAI_ENABLE_CUDA_Q4_UNIFIED_GRAPH")) {
+        disable_ggml_graphs = unified[0] == '1' || unified[0] == 'y' || unified[0] == 'Y' ||
+            unified[0] == 't' || unified[0] == 'T';
+        if (disable_ggml_graphs && created->device_ids[0] != created->device_ids[1])
+            disable_ggml_graphs = false;
+    }
+    if (const char *segment = std::getenv("FORTAI_ENABLE_CUDA_Q4_SEGMENT_GRAPH")) {
+        if (segment[0] == '1' || segment[0] == 'y' || segment[0] == 'Y' ||
+            segment[0] == 't' || segment[0] == 'T')
+            disable_ggml_graphs = true;
+    }
+    if (disable_ggml_graphs)
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
     if (const char *peer_copy = std::getenv("FORTAI_CUDA_Q4_USE_PEER")) {
         if (peer_copy[0] == '1' || peer_copy[0] == 'y' || peer_copy[0] == 'Y' ||
             peer_copy[0] == 't' || peer_copy[0] == 'T')
@@ -738,7 +902,33 @@ int fortai_cuda_q4_context_destroy(fortai_cuda_q4_context * context) {
         delete events;
     }
     context->extra_bridge_events.clear();
+    auto destroy_cached_graph = [](cudaGraph_t &graph, cudaGraphExec_t &exec) {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        exec = nullptr;
+        graph = nullptr;
+    };
+    for (auto &plan : context->batch_plans) {
+        destroy_cached_graph(plan.cached_graph, plan.cached_exec);
+        if (plan.buffer != nullptr) ggml_backend_buffer_free(plan.buffer);
+        plan.buffer = nullptr;
+        if (plan.context != nullptr) ggml_free(plan.context);
+        plan.context = nullptr;
+    }
+    context->batch_plans.clear();
+    for (auto &plan : context->embedding_batch_plans) {
+        destroy_cached_graph(plan.cached_graph, plan.cached_exec);
+        if (plan.buffer != nullptr) ggml_backend_buffer_free(plan.buffer);
+        plan.buffer = nullptr;
+        if (plan.context != nullptr) ggml_free(plan.context);
+        plan.context = nullptr;
+    }
+    context->embedding_batch_plans.clear();
+    for (auto &plan : context->group_plans)
+        destroy_cached_graph(plan.cached_graph, plan.cached_exec);
+    context->group_plans.clear();
     for (auto &plan : context->swiglu_plans) {
+        destroy_cached_graph(plan.cached_graph, plan.cached_exec);
         if (plan.compute_buffer != nullptr) ggml_backend_buffer_free(plan.compute_buffer);
         plan.compute_buffer = nullptr;
         if (plan.context != nullptr) ggml_free(plan.context);
@@ -746,6 +936,7 @@ int fortai_cuda_q4_context_destroy(fortai_cuda_q4_context * context) {
     }
     context->swiglu_plans.clear();
     for (auto &plan : context->ffn_plans) {
+        destroy_cached_graph(plan.cached_graph, plan.cached_exec);
         if (plan.compute_buffer != nullptr) ggml_backend_buffer_free(plan.compute_buffer);
         plan.compute_buffer = nullptr;
         if (plan.context != nullptr) ggml_free(plan.context);
@@ -815,6 +1006,48 @@ static int fortai_cuda_q4_arena_alloc(fortai_cuda_q4_context *context, int devic
     return FORTAI_CUDA_OK;
 }
 
+/* CUDA treats a pageable source for cudaMemcpyAsync as a synchronous staging
+ * operation.  UD-Q4_K_XL has hundreds of mapped tensors, so issuing one such
+ * copy per tensor makes model loading dominated by driver staging overhead.
+ * Reuse one bounded pinned buffer and perform blocking copies during setup;
+ * the upload is outside the decode critical path and reaches the same DMA
+ * engine used by llama.cpp's pinned loader without retaining the whole model
+ * in locked host memory. */
+static bool fortai_cuda_q4_staged_upload_enabled() {
+    const char *value = std::getenv("FORTAI_CUDA_STAGED_UPLOAD");
+    return value == nullptr || (value[0] != '0' && value[0] != 'n' && value[0] != 'N' &&
+        value[0] != 'f' && value[0] != 'F');
+}
+
+static int fortai_cuda_q4_upload_staged(fortai_cuda_q4_context *context, int device,
+    void *destination, const void *source, size_t bytes) {
+    if (context == nullptr || destination == nullptr || source == nullptr || bytes == 0)
+        return FORTAI_CUDA_INVALID;
+    constexpr size_t stage_capacity = size_t(64) << 20;
+    const size_t required = std::min(stage_capacity, bytes);
+    if (context->host_bridge_bytes < required) {
+        if (context->host_bridge != nullptr) {
+            cudaFreeHost(context->host_bridge);
+            context->host_bridge = nullptr;
+            context->host_bridge_bytes = 0;
+        }
+        if (cudaHostAlloc(&context->host_bridge, required, cudaHostAllocPortable) != cudaSuccess)
+            return FORTAI_CUDA_RUNTIME_ERROR;
+        context->host_bridge_bytes = required;
+    }
+    if (cudaSetDevice(device) != cudaSuccess) return FORTAI_CUDA_RUNTIME_ERROR;
+    const auto *input = static_cast<const unsigned char *>(source);
+    auto *output = static_cast<unsigned char *>(destination);
+    for (size_t offset = 0; offset < bytes; offset += required) {
+        const size_t chunk = std::min(required, bytes - offset);
+        std::memcpy(context->host_bridge, input + offset, chunk);
+        if (cudaMemcpy(output + offset, context->host_bridge, chunk,
+                cudaMemcpyHostToDevice) != cudaSuccess)
+            return FORTAI_CUDA_RUNTIME_ERROR;
+    }
+    return FORTAI_CUDA_OK;
+}
+
 int fortai_cuda_q4_weights_upload(fortai_cuda_q4_context * context, int value_type,
     const void * host_weights, size_t weight_bytes, int rows, int width, int device,
     fortai_cuda_q4_weights **out) {
@@ -870,10 +1103,15 @@ int fortai_cuda_q4_weights_upload(fortai_cuda_q4_context * context, int value_ty
     }
     created->buffer = compute_buffer;
     ggml_backend_buffer_set_usage(compute_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    /* Queue model uploads on each device and synchronize once after the full
-     * tensor set is built.  The previous per-tensor synchronous copy made
-     * large UD-Q4_K_XL model open time scale with the tensor count. */
-    ggml_backend_tensor_set_async(created->backend, created->weight, host_weights, 0, weight_bytes);
+    /* Mapped GGUF pages are pageable.  Stage through one bounded pinned
+     * buffer when possible; fall back to GGML's async path if the host cannot
+     * provide a pinned allocation (for example under a strict memlock limit).
+     */
+    const int staged = fortai_cuda_q4_staged_upload_enabled() ?
+        fortai_cuda_q4_upload_staged(context, created->device, weight_address, host_weights, weight_bytes) :
+        FORTAI_CUDA_RUNTIME_ERROR;
+    if (staged != FORTAI_CUDA_OK)
+        ggml_backend_tensor_set_async(created->backend, created->weight, host_weights, 0, weight_bytes);
     created->output_bytes = static_cast<size_t>(rows) * sizeof(float);
     *out = created;
     return FORTAI_CUDA_OK;
@@ -891,7 +1129,110 @@ int fortai_cuda_q4_context_synchronize(fortai_cuda_q4_context *context) {
                 return FORTAI_CUDA_RUNTIME_ERROR;
         }
     }
+    /* The host bridge doubles as the bounded setup staging buffer.  Release
+     * it once all model uploads are complete; runtime transfers allocate it
+     * lazily again only if a non-peer bridge is actually needed. */
+    cudaFreeHost(context->host_bridge);
+    context->host_bridge = nullptr;
+    context->host_bridge_bytes = 0;
     return FORTAI_CUDA_OK;
+}
+
+void *fortai_cuda_q4_context_stream(fortai_cuda_q4_context *context,
+    int device_slot) {
+    if (context == nullptr || device_slot < 0 || device_slot > 1 ||
+        context->devices[device_slot] == nullptr)
+        return nullptr;
+    auto *backend = reinterpret_cast<fortai_ggml_backend_runtime_layout *>(context->devices[device_slot]);
+    if (backend == nullptr || backend->context == nullptr) return nullptr;
+    auto *cuda_context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    cudaSetDevice(context->device_ids[device_slot]);
+    return reinterpret_cast<void *>(cuda_context->stream());
+}
+
+static bool fortai_cuda_q4_segment_graph_requested() {
+    const char *value = std::getenv("FORTAI_ENABLE_CUDA_Q4_SEGMENT_GRAPH");
+    return value != nullptr && (value[0] == '1' || value[0] == 'y' ||
+        value[0] == 'Y' || value[0] == 't' || value[0] == 'T');
+}
+
+static int fortai_cuda_q4_backend_slot(const fortai_cuda_q4_context *context,
+    ggml_backend_t backend) {
+    if (context == nullptr || backend == nullptr) return -1;
+    for (int slot = 0; slot < 2; ++slot)
+        if (context->devices[slot] == backend) return slot;
+    return -1;
+}
+
+/* GGML-CUDA normally captures one graph per backend scheduler.  The split
+ * Q4 path also has a native CUDA graph for the primary prefix, so GGML's
+ * process-wide graph switch is disabled there to avoid nested capture.  Keep
+ * the same low-overhead behaviour for every Q4 plan outside that prefix by
+ * caching a small graph per stable plan.  The bridge waits are queued before
+ * this helper and therefore remain outside the cached graph, just as they do
+ * in llama.cpp's scheduler split. */
+static enum ggml_status fortai_cuda_q4_graph_compute_cached(
+    fortai_cuda_q4_context *context, ggml_backend_t backend, ggml_cgraph *graph,
+    cudaGraph_t *cached_graph, cudaGraphExec_t *cached_exec, bool *warmup,
+    bool *disabled) {
+    if (context == nullptr || backend == nullptr || graph == nullptr ||
+        cached_graph == nullptr || cached_exec == nullptr || warmup == nullptr ||
+        disabled == nullptr)
+        return GGML_STATUS_FAILED;
+    if (!context->segment_graph_requested || *disabled)
+        return ggml_backend_graph_compute_async(backend, graph);
+
+    const int slot = fortai_cuda_q4_backend_slot(context, backend);
+    const cudaStream_t stream = fortai_cuda_q4_scheduler_stream(context, slot);
+    if (slot < 0 || stream == nullptr)
+        return ggml_backend_graph_compute_async(backend, graph);
+
+    enum cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture_status) != cudaSuccess)
+        return ggml_backend_graph_compute_async(backend, graph);
+    /* The native prefix graph owns this capture.  Directly enqueueing the
+     * kernels is exactly what becomes part of that outer graph. */
+    if (capture_status == cudaStreamCaptureStatusActive)
+        return ggml_backend_graph_compute_async(backend, graph);
+
+    if (*cached_exec != nullptr) {
+        if (cudaSetDevice(context->device_ids[slot]) != cudaSuccess ||
+            cudaGraphLaunch(*cached_exec, stream) != cudaSuccess)
+            return GGML_STATUS_FAILED;
+        return GGML_STATUS_SUCCESS;
+    }
+
+    if (!*warmup) {
+        *warmup = true;
+        return ggml_backend_graph_compute_async(backend, graph);
+    }
+
+    if (cudaSetDevice(context->device_ids[slot]) != cudaSuccess ||
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+        *disabled = true;
+        return ggml_backend_graph_compute_async(backend, graph);
+    }
+    const enum ggml_status status = ggml_backend_graph_compute_async(backend, graph);
+    cudaGraph_t captured = nullptr;
+    const cudaError_t end_error = cudaStreamEndCapture(stream, &captured);
+    if (status != GGML_STATUS_SUCCESS || end_error != cudaSuccess || captured == nullptr) {
+        if (captured != nullptr) cudaGraphDestroy(captured);
+        *disabled = true;
+        return ggml_backend_graph_compute_async(backend, graph);
+    }
+    cudaGraphExec_t executable = nullptr;
+    const cudaError_t instantiate_error = cudaGraphInstantiate(&executable, captured,
+        nullptr, nullptr, 0);
+    if (instantiate_error != cudaSuccess || executable == nullptr) {
+        cudaGraphDestroy(captured);
+        *disabled = true;
+        return ggml_backend_graph_compute_async(backend, graph);
+    }
+    *cached_graph = captured;
+    *cached_exec = executable;
+    if (cudaGraphLaunch(*cached_exec, stream) != cudaSuccess)
+        return GGML_STATUS_FAILED;
+    return GGML_STATUS_SUCCESS;
 }
 
 int fortai_cuda_q4_context_set_consumer_stream(fortai_cuda_q4_context *context,
@@ -904,6 +1245,10 @@ int fortai_cuda_q4_context_set_consumer_stream(fortai_cuda_q4_context *context,
 
 int fortai_cuda_q4_weights_destroy(fortai_cuda_q4_weights * weights) {
     if (weights == nullptr) return FORTAI_CUDA_OK;
+    if (weights->cached_exec != nullptr) cudaGraphExecDestroy(weights->cached_exec);
+    if (weights->cached_graph != nullptr) cudaGraphDestroy(weights->cached_graph);
+    if (weights->embedding_cached_exec != nullptr) cudaGraphExecDestroy(weights->embedding_cached_exec);
+    if (weights->embedding_cached_graph != nullptr) cudaGraphDestroy(weights->embedding_cached_graph);
     if (weights->embedding_buffer != nullptr)
         ggml_backend_buffer_free(weights->embedding_buffer);
     if (weights->embedding_context != nullptr)
@@ -975,8 +1320,12 @@ static int fortai_cuda_q4_matvec_host_group(fortai_cuda_q4_context *context,
         if (member_count == 1) {
             ggml_backend_tensor_set_async(weight->backend, weight->activation,
                 host_activation, 0, activation_bytes);
-            enum ggml_status status = ggml_backend_graph_compute_async(
-                weight->backend, weight->graph);
+            enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context,
+                weight->backend, weight->graph,
+                &const_cast<fortai_cuda_q4_weights *>(weight)->cached_graph,
+                &const_cast<fortai_cuda_q4_weights *>(weight)->cached_exec,
+                &const_cast<fortai_cuda_q4_weights *>(weight)->graph_warmup,
+                &const_cast<fortai_cuda_q4_weights *>(weight)->graph_disabled);
             if (status != GGML_STATUS_SUCCESS) return fail(context);
             ggml_backend_tensor_get_async(weight->backend, weight->output,
                 host_outputs[i], 0, output_bytes[i]);
@@ -1013,7 +1362,8 @@ static int fortai_cuda_q4_matvec_host_group(fortai_cuda_q4_context *context,
             ggml_backend_tensor_set_async(member->backend, member->activation,
                 host_activation, 0, activation_bytes);
         }
-        enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
+        enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, plan->backend, plan->graph,
+            &plan->cached_graph, &plan->cached_exec, &plan->graph_warmup, &plan->graph_disabled);
         if (status != GGML_STATUS_SUCCESS) return fail(context);
         for (int k = 0; k < member_count; ++k) {
             int output_index = members[k];
@@ -1117,6 +1467,16 @@ static int fortai_cuda_q4_copy_between_devices(fortai_cuda_q4_context *context,
             return FORTAI_CUDA_RUNTIME_ERROR;
         return FORTAI_CUDA_OK;
     }
+    /* The diagnostic synchronous bridge is deliberately conservative: a
+     * plain cudaMemcpy does not establish a dependency on GGML's non-default
+     * producer stream on every runtime configuration.  Drain that source
+     * stream before the host staging copy so this A/B tests bridge data, not
+     * an unrelated stream race. */
+    if (context->sync_bridge_requested) {
+        if (cudaSetDevice(source_device) != cudaSuccess ||
+            cudaDeviceSynchronize() != cudaSuccess)
+            return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     if (context->host_bridge_bytes < bytes) {
         cudaFreeHost(context->host_bridge);
         context->host_bridge = nullptr;
@@ -1129,6 +1489,12 @@ static int fortai_cuda_q4_copy_between_devices(fortai_cuda_q4_context *context,
         return FORTAI_CUDA_RUNTIME_ERROR;
     if (cudaSetDevice(destination_device) != cudaSuccess ||
         cudaMemcpy(destination, context->host_bridge, bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    /* A synchronous host copy completes from the caller's point of view, but
+     * it is still issued on the current/default stream.  The native consumer
+     * runs on a non-default stream, so make the diagnostic path publish an
+     * explicit device-wide dependency before returning to Fortran. */
+    if (context->sync_bridge_requested && cudaDeviceSynchronize() != cudaSuccess)
         return FORTAI_CUDA_RUNTIME_ERROR;
     return FORTAI_CUDA_OK;
 }
@@ -1145,16 +1511,20 @@ static int fortai_cuda_q4_queue_activation_remote(fortai_cuda_q4_context *contex
         context->consumer_stream[0] == nullptr || events_out == nullptr)
         return FORTAI_CUDA_INVALID;
     fortai_cuda_q4_bridge_events *events = nullptr;
-    if (fortai_cuda_q4_next_bridge_events(context, &events) != FORTAI_CUDA_OK)
+    if (fortai_cuda_q4_next_bridge_events(context, &events) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("next bridge events");
         return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     const int primary_device = context->device_ids[0];
     const int remote_device = context->device_ids[1];
 
     if (context->use_peer_copy) {
         if (cudaSetDevice(primary_device) != cudaSuccess ||
             cudaEventRecord(fortai_cuda_event_handle(events->source_ready),
-                context->consumer_stream[0]) != cudaSuccess)
+                context->consumer_stream[0]) != cudaSuccess) {
+            fortai_cuda_q4_debug("peer activation source");
             return FORTAI_CUDA_RUNTIME_ERROR;
+        }
         if (cudaSetDevice(remote_device) != cudaSuccess ||
             (context->last_activation_done != nullptr &&
                 cudaStreamWaitEvent(context->bridge_stream[1],
@@ -1165,16 +1535,23 @@ static int fortai_cuda_q4_queue_activation_remote(fortai_cuda_q4_context *contex
                 device_activation, primary_device, activation_bytes,
                 context->bridge_stream[1]) != cudaSuccess ||
             cudaEventRecord(fortai_cuda_event_handle(events->remote_ready),
-                context->bridge_stream[1]) != cudaSuccess)
+                context->bridge_stream[1]) != cudaSuccess) {
+            fortai_cuda_q4_debug("peer activation copy");
             return FORTAI_CUDA_RUNTIME_ERROR;
-        ggml_backend_event_wait(context->devices[1], events->remote_ready);
+        }
+        if (fortai_cuda_q4_wait_scheduler_event(context, 1, events->remote_ready) != FORTAI_CUDA_OK) {
+            fortai_cuda_q4_debug("peer activation scheduler wait");
+            return FORTAI_CUDA_RUNTIME_ERROR;
+        }
         *events_out = events;
         return FORTAI_CUDA_OK;
     }
 
     int host_index = -1;
-    if (fortai_cuda_q4_acquire_input_host(context, activation_bytes, &host_index) != FORTAI_CUDA_OK)
+    if (fortai_cuda_q4_acquire_input_host(context, activation_bytes, &host_index) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("acquire input bridge");
         return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     auto &host = context->input_host[host_index];
 
     if (cudaSetDevice(primary_device) != cudaSuccess ||
@@ -1184,8 +1561,10 @@ static int fortai_cuda_q4_queue_activation_remote(fortai_cuda_q4_context *contex
             fortai_cuda_event_handle(events->source_ready), 0) != cudaSuccess ||
         cudaMemcpyAsync(host.buffer, device_activation, activation_bytes,
             cudaMemcpyDeviceToHost, context->bridge_stream[0]) != cudaSuccess ||
-        cudaEventRecord(host.ready_event, context->bridge_stream[0]) != cudaSuccess)
+        cudaEventRecord(host.ready_event, context->bridge_stream[0]) != cudaSuccess) {
+        fortai_cuda_q4_debug("queue input bridge primary");
         return FORTAI_CUDA_RUNTIME_ERROR;
+    }
 
     if (cudaSetDevice(remote_device) != cudaSuccess ||
         context->last_activation_done != nullptr &&
@@ -1196,10 +1575,15 @@ static int fortai_cuda_q4_queue_activation_remote(fortai_cuda_q4_context *contex
             cudaMemcpyHostToDevice, context->bridge_stream[1]) != cudaSuccess ||
         cudaEventRecord(host.free_event, context->bridge_stream[1]) != cudaSuccess ||
         cudaEventRecord(fortai_cuda_event_handle(events->remote_ready),
-            context->bridge_stream[1]) != cudaSuccess)
+            context->bridge_stream[1]) != cudaSuccess) {
+        fortai_cuda_q4_debug("queue input bridge remote");
         return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     host.free_recorded = true;
-    ggml_backend_event_wait(context->devices[1], events->remote_ready);
+    if (fortai_cuda_q4_wait_scheduler_event(context, 1, events->remote_ready) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("input scheduler wait");
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     *events_out = events;
     return FORTAI_CUDA_OK;
 }
@@ -1207,7 +1591,9 @@ static int fortai_cuda_q4_queue_activation_remote(fortai_cuda_q4_context *contex
 static int fortai_cuda_q4_record_remote_done(fortai_cuda_q4_context *context,
     ggml_backend_t backend, fortai_cuda_q4_bridge_events *events) {
     if (context == nullptr || backend == nullptr || events == nullptr) return FORTAI_CUDA_INVALID;
-    ggml_backend_event_record(events->remote_done, backend);
+    const int slot = fortai_cuda_q4_consumer_slot(context, context->device_ids[1]);
+    if (fortai_cuda_q4_record_scheduler_event(context, slot, events->remote_done) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
     context->last_activation_done = events->remote_done;
     return FORTAI_CUDA_OK;
 }
@@ -1221,10 +1607,10 @@ static int fortai_cuda_q4_queue_outputs_primary(fortai_cuda_q4_context *context,
     fortai_cuda_q4_bridge_events *events, const void * const *sources,
     void * const *destinations, const size_t *bytes, int count) {
     if (context == nullptr || events == nullptr || sources == nullptr || destinations == nullptr ||
-        bytes == nullptr || count < 1 || count > 3 || context->bridge_stream[0] == nullptr ||
+        bytes == nullptr || count < 1 || count > 8 || context->bridge_stream[0] == nullptr ||
         context->bridge_stream[1] == nullptr || context->consumer_stream[0] == nullptr)
         return FORTAI_CUDA_INVALID;
-    int host_indices[3] = {-1, -1, -1};
+    int host_indices[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     const int primary_device = context->device_ids[0];
     const int remote_device = context->device_ids[1];
     if (context->use_peer_copy) {
@@ -1288,8 +1674,11 @@ static int fortai_cuda_q4_queue_outputs_primary(fortai_cuda_q4_context *context,
 static int fortai_cuda_q4_wait_output_buffer(fortai_cuda_q4_context *context,
     ggml_backend_t backend) {
     if (context == nullptr || backend == nullptr) return FORTAI_CUDA_INVALID;
-    if (context->last_output_free != nullptr)
-        ggml_backend_event_wait(backend, context->last_output_free);
+    if (context->last_output_free != nullptr) {
+        const int slot = fortai_cuda_q4_consumer_slot(context, context->device_ids[1]);
+        if (fortai_cuda_q4_wait_scheduler_event(context, slot, context->last_output_free) != FORTAI_CUDA_OK)
+            return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     return FORTAI_CUDA_OK;
 }
 
@@ -1322,8 +1711,8 @@ static int fortai_cuda_q4_matvec_device_swiglu_impl(
 
     const size_t activation_bytes = activation_elements * sizeof(float);
     const size_t output_bytes = static_cast<size_t>(plan->output->ne[0]) * sizeof(float);
-    const bool async_bridge = remote && context->consumer_stream[0] != nullptr &&
-        context->consumer_stream[1] != nullptr;
+    const bool async_bridge = remote && !context->sync_bridge_requested &&
+        context->consumer_stream[0] != nullptr && context->consumer_stream[1] != nullptr;
     fortai_cuda_q4_bridge_events *bridge_events = nullptr;
     void *activation_ptr = const_cast<void *>(device_activation);
     void *output_ptr = device_output;
@@ -1355,7 +1744,8 @@ static int fortai_cuda_q4_matvec_device_swiglu_impl(
     void *saved_output = plan->output->data;
     plan->activation->data = activation_ptr;
     plan->output->data = output_ptr;
-    enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
+    enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, plan->backend, plan->graph,
+        &plan->cached_graph, &plan->cached_exec, &plan->graph_warmup, &plan->graph_disabled);
     plan->activation->data = saved_activation;
     plan->output->data = saved_output;
     if (status != GGML_STATUS_SUCCESS) {
@@ -1397,6 +1787,7 @@ int fortai_cuda_q4_matvec_device_swiglu(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights *gate_weights, const fortai_cuda_q4_weights *up_weights,
     const void *device_activation, size_t activation_elements, void *device_output,
     size_t output_elements) {
+    fortai_cuda_q4_debug("enter swiglu");
     return fortai_cuda_q4_matvec_device_swiglu_impl(context, gate_weights, up_weights,
         device_activation, activation_elements, device_output, output_elements, false);
 }
@@ -1405,6 +1796,7 @@ int fortai_cuda_q4_matvec_device_swiglu_remote_output(fortai_cuda_q4_context *co
     const fortai_cuda_q4_weights *gate_weights, const fortai_cuda_q4_weights *up_weights,
     const void *device_activation, size_t activation_elements, void *device_output,
     size_t output_elements) {
+    fortai_cuda_q4_debug("enter swiglu remote output");
     return fortai_cuda_q4_matvec_device_swiglu_impl(context, gate_weights, up_weights,
         device_activation, activation_elements, device_output, output_elements, true);
 }
@@ -1417,6 +1809,7 @@ int fortai_cuda_q4_matvec_device_swiglu_down(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights *gate_weights, const fortai_cuda_q4_weights *up_weights,
     const fortai_cuda_q4_weights *down_weights, const void *device_activation,
     size_t activation_elements, void *device_output, size_t output_elements) {
+    fortai_cuda_q4_debug("enter swiglu down");
     if (context == nullptr || gate_weights == nullptr || up_weights == nullptr ||
         down_weights == nullptr || device_activation == nullptr || device_output == nullptr ||
         activation_elements == 0 || gate_weights->owner != context || up_weights->owner != context ||
@@ -1439,30 +1832,38 @@ int fortai_cuda_q4_matvec_device_swiglu_down(fortai_cuda_q4_context *context,
         return FORTAI_CUDA_INVALID;
     const size_t activation_bytes = activation_elements * sizeof(float);
     const size_t output_bytes = static_cast<size_t>(plan->output->ne[0]) * sizeof(float);
-    const bool async_bridge = remote && context->consumer_stream[0] != nullptr &&
-        context->consumer_stream[1] != nullptr;
+    const bool async_bridge = remote && !context->sync_bridge_requested &&
+        context->consumer_stream[0] != nullptr && context->consumer_stream[1] != nullptr;
     fortai_cuda_q4_bridge_events *bridge_events = nullptr;
     void *activation_ptr = const_cast<void *>(device_activation);
     void *output_ptr = device_output;
     if (remote) {
         const int code = fortai_cuda_q4_ensure_bridge(context, 1, activation_bytes, output_bytes);
-        if (code != FORTAI_CUDA_OK) return code;
+        if (code != FORTAI_CUDA_OK) {
+            fortai_cuda_q4_debug_code("swiglu-down ensure bridge", code);
+            return code;
+        }
         if (async_bridge) {
             if (fortai_cuda_q4_queue_activation_remote(context, device_activation,
                     activation_bytes, &bridge_events) != FORTAI_CUDA_OK ||
-                fortai_cuda_q4_wait_output_buffer(context, plan->backend) != FORTAI_CUDA_OK)
+                fortai_cuda_q4_wait_output_buffer(context, plan->backend) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("swiglu-down queue activation/output");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
         } else {
             if (fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK ||
                 fortai_cuda_q4_copy_between_devices(context, context->bridge_activation[1],
                     weight_device, device_activation, primary_device, activation_bytes) !=
-                    FORTAI_CUDA_OK)
+                    FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("swiglu-down sync activation");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
         }
         activation_ptr = context->bridge_activation[1];
         if (async_bridge) output_ptr = context->bridge_output[1];
         else output_ptr = context->bridge_output[1];
     } else if (fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("swiglu-down local prepare");
         return FORTAI_CUDA_RUNTIME_ERROR;
     }
 
@@ -1470,30 +1871,41 @@ int fortai_cuda_q4_matvec_device_swiglu_down(fortai_cuda_q4_context *context,
     void *saved_output = plan->output->data;
     plan->activation->data = activation_ptr;
     plan->output->data = output_ptr;
-    enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
+    enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, plan->backend, plan->graph,
+        &plan->cached_graph, &plan->cached_exec, &plan->graph_warmup, &plan->graph_disabled);
     plan->activation->data = saved_activation;
     plan->output->data = saved_output;
-    if (status != GGML_STATUS_SUCCESS) return FORTAI_CUDA_RUNTIME_ERROR;
+    if (status != GGML_STATUS_SUCCESS) {
+        fortai_cuda_q4_debug("GGML Q4 matvec graph");
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    }
 
     if (remote) {
         if (async_bridge) {
             if (fortai_cuda_q4_record_remote_done(context, plan->backend, bridge_events) !=
-                    FORTAI_CUDA_OK)
+                    FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("swiglu-down remote done");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
             const void *sources[1] = {output_ptr};
             void *destinations[1] = {device_output};
             const size_t bytes[1] = {output_bytes};
             if (fortai_cuda_q4_queue_outputs_primary(context, bridge_events, sources,
-                    destinations, bytes, 1) != FORTAI_CUDA_OK)
+                    destinations, bytes, 1) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("swiglu-down queue output");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
         } else {
             ggml_backend_synchronize(down_weights->backend);
             if (fortai_cuda_q4_copy_between_devices(context, device_output, primary_device,
-                    output_ptr, weight_device, output_bytes) != FORTAI_CUDA_OK)
+                    output_ptr, weight_device, output_bytes) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("swiglu-down sync output");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
         }
     } else if (fortai_cuda_q4_publish_output(context, plan->backend, primary_device) !=
             FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("swiglu-down local publish");
         return FORTAI_CUDA_RUNTIME_ERROR;
     }
     return FORTAI_CUDA_OK;
@@ -1502,7 +1914,8 @@ int fortai_cuda_q4_matvec_device_swiglu_down(fortai_cuda_q4_context *context,
 int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights *weights, const void *device_activation,
     size_t activation_elements, void *device_output, size_t output_elements) {
-    if (context == nullptr || weights == nullptr || weights->owner != context ||
+    fortai_cuda_q4_debug("enter matvec");
+    if (context == nullptr || weights == nullptr || weights->owner != context || weights->weight == nullptr ||
         device_activation == nullptr || device_output == nullptr || activation_elements == 0 ||
         output_elements < static_cast<size_t>(weights->output->ne[0]))
         return FORTAI_CUDA_INVALID;
@@ -1526,25 +1939,35 @@ int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
         if (weights->device != context->device_ids[1]) return FORTAI_CUDA_INVALID;
         bridge_slot = 1;
         int code = fortai_cuda_q4_ensure_bridge(context, bridge_slot, activation_bytes, output_bytes);
-        if (code != FORTAI_CUDA_OK) return code;
+        if (code != FORTAI_CUDA_OK) {
+            fortai_cuda_q4_debug_code("matvec ensure bridge", code);
+            return code;
+        }
         if (context->consumer_stream[0] != nullptr && context->consumer_stream[1] != nullptr) {
             if (fortai_cuda_q4_queue_activation_remote(context, device_activation,
-                    activation_bytes, &bridge_events) != FORTAI_CUDA_OK)
+                    activation_bytes, &bridge_events) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("matvec queue input");
                 return FORTAI_CUDA_RUNTIME_ERROR;
-            if (fortai_cuda_q4_wait_output_buffer(context, weights->backend) != FORTAI_CUDA_OK)
+            }
+            if (fortai_cuda_q4_wait_output_buffer(context, weights->backend) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("matvec wait output");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
             activation_ptr = context->bridge_activation[bridge_slot];
             output_ptr = context->bridge_output[bridge_slot];
         } else {
             /* Standalone callers have no producer stream to attach to.  Keep
              * the conservative synchronous path for that ABI. */
             if (fortai_cuda_q4_copy_between_devices(context, context->bridge_activation[bridge_slot], weights->device,
-                    device_activation, primary_device, activation_bytes) != FORTAI_CUDA_OK)
+                    device_activation, primary_device, activation_bytes) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("matvec sync input");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
             activation_ptr = context->bridge_activation[bridge_slot];
             output_ptr = context->bridge_output[bridge_slot];
         }
     } else if (fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("matvec local prepare");
         return FORTAI_CUDA_RUNTIME_ERROR;
     }
     void *saved_activation = weights->activation->data;
@@ -1555,26 +1978,40 @@ int fortai_cuda_q4_matvec_device(fortai_cuda_q4_context *context,
     };
     weights->activation->data = activation_ptr;
     weights->output->data = output_ptr;
-    enum ggml_status status = ggml_backend_graph_compute_async(weights->backend, weights->graph);
+    enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, weights->backend, weights->graph,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->cached_graph,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->cached_exec,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->graph_warmup,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->graph_disabled);
     if (status == GGML_STATUS_SUCCESS && !remote &&
-        fortai_cuda_q4_publish_output(context, weights->backend, weights->device) != FORTAI_CUDA_OK)
+        fortai_cuda_q4_publish_output(context, weights->backend, weights->device) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("matvec local publish");
         status = GGML_STATUS_FAILED;
+    }
+    if (status != GGML_STATUS_SUCCESS)
+        fortai_cuda_q4_debug("matvec graph");
     restore_edges();
     if (status == GGML_STATUS_SUCCESS && remote) {
         if (bridge_events != nullptr) {
-            if (fortai_cuda_q4_record_remote_done(context, weights->backend, bridge_events) != FORTAI_CUDA_OK)
+            if (fortai_cuda_q4_record_remote_done(context, weights->backend, bridge_events) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("matvec remote done");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
             const void *sources[1] = {output_ptr};
             void *destinations[1] = {device_output};
             const size_t bytes[1] = {output_bytes};
             if (fortai_cuda_q4_queue_outputs_primary(context, bridge_events, sources, destinations,
-                    bytes, 1) != FORTAI_CUDA_OK)
+                    bytes, 1) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("matvec queue output");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
         } else {
             ggml_backend_synchronize(weights->backend);
             if (fortai_cuda_q4_copy_between_devices(context, device_output, primary_device, output_ptr,
-                    weights->device, output_bytes) != FORTAI_CUDA_OK)
+                    weights->device, output_bytes) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("matvec sync output");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
         }
     }
     return status == GGML_STATUS_SUCCESS ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
@@ -1610,8 +2047,9 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights * const *weights, const void *device_activation,
     size_t activation_elements, void * const *device_outputs,
     const size_t *output_elements, int count) {
+    fortai_cuda_q4_debug("enter group");
     if (context == nullptr || weights == nullptr || device_activation == nullptr ||
-        device_outputs == nullptr || output_elements == nullptr || count < 1 || count > 3 ||
+        device_outputs == nullptr || output_elements == nullptr || count < 1 || count > 8 ||
         activation_elements == 0) return FORTAI_CUDA_INVALID;
 
     const size_t activation_bytes = activation_elements * sizeof(float);
@@ -1626,17 +2064,19 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
     bool has_primary = false;
     for (int i = 0; i < count; ++i)
         if (weights[i]->device == primary_device) has_primary = true;
-    if (has_primary && fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK)
+    if (has_primary && fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("group primary prepare");
         return FORTAI_CUDA_RUNTIME_ERROR;
+    }
 
-    bool done[3] = {false, false, false};
+    bool done[8] = {};
     for (int first_index = 0; first_index < count; ++first_index) {
         if (done[first_index]) continue;
         const int device = weights[first_index]->device;
         if (device != primary_device && device != context->device_ids[1])
             return FORTAI_CUDA_INVALID;
 
-        int members[3] = {0, 0, 0};
+        int members[8] = {};
         int member_count = 0;
         for (int i = first_index; i < count; ++i) {
             if (!done[i] && weights[i]->device == device)
@@ -1648,38 +2088,53 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
         const bool remote = device != primary_device;
         void * activation_ptr = const_cast<void *>(device_activation);
         fortai_cuda_q4_bridge_events *bridge_events = nullptr;
-        const bool async_bridge = remote && context->consumer_stream[0] != nullptr &&
-            context->consumer_stream[1] != nullptr;
+        const bool async_bridge = remote && !context->sync_bridge_requested &&
+            context->consumer_stream[0] != nullptr && context->consumer_stream[1] != nullptr;
         if (remote) {
             int code = fortai_cuda_q4_ensure_bridge(context, 1, activation_bytes, 0);
-            if (code != FORTAI_CUDA_OK) return code;
+            if (code != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug_code("group ensure input bridge", code);
+                return code;
+            }
             if (async_bridge) {
                 if (fortai_cuda_q4_queue_activation_remote(context, device_activation,
-                        activation_bytes, &bridge_events) != FORTAI_CUDA_OK)
+                        activation_bytes, &bridge_events) != FORTAI_CUDA_OK) {
+                    fortai_cuda_q4_debug("group queue input");
                     return FORTAI_CUDA_RUNTIME_ERROR;
+                }
             } else if (fortai_cuda_q4_copy_between_devices(context, context->bridge_activation[1], device,
-                    device_activation, primary_device, activation_bytes) != FORTAI_CUDA_OK)
+                    device_activation, primary_device, activation_bytes) != FORTAI_CUDA_OK) {
+                    fortai_cuda_q4_debug("group sync input");
                     return FORTAI_CUDA_RUNTIME_ERROR;
+            }
             activation_ptr = context->bridge_activation[1];
         }
 
         fortai_cuda_q4_group_plan *plan =
             fortai_cuda_q4_find_device_group_plan(context, weights, members, member_count);
-        if (plan == nullptr) return FORTAI_CUDA_RUNTIME_ERROR;
+        if (plan == nullptr) {
+            fortai_cuda_q4_debug("group plan");
+            return FORTAI_CUDA_RUNTIME_ERROR;
+        }
         size_t bridge_output_bytes = 0;
-        size_t output_offsets[3] = {0, 0, 0};
+        size_t output_offsets[8] = {};
         if (remote) {
             for (int i = 0; i < member_count; ++i) {
                 output_offsets[i] = bridge_output_bytes;
                 bridge_output_bytes += static_cast<size_t>(weights[members[i]]->output->ne[0]) * sizeof(float);
             }
             int code = fortai_cuda_q4_ensure_bridge(context, 1, activation_bytes, bridge_output_bytes);
-            if (code != FORTAI_CUDA_OK) return code;
-            if (async_bridge && fortai_cuda_q4_wait_output_buffer(context, plan->backend) != FORTAI_CUDA_OK)
+            if (code != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug_code("group ensure output bridge", code);
+                return code;
+            }
+            if (async_bridge && fortai_cuda_q4_wait_output_buffer(context, plan->backend) != FORTAI_CUDA_OK) {
+                fortai_cuda_q4_debug("group wait output");
                 return FORTAI_CUDA_RUNTIME_ERROR;
+            }
         }
-        void *saved_activation[3] = {nullptr, nullptr, nullptr};
-        void *saved_output[3] = {nullptr, nullptr, nullptr};
+        void *saved_activation[8] = {};
+        void *saved_output[8] = {};
         for (int i = 0; i < member_count; ++i) {
             const int index = members[i];
             saved_activation[i] = weights[index]->activation->data;
@@ -1696,22 +2151,26 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
                 weights[index]->output->data = saved_output[i];
             }
         };
-        enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
+        enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, plan->backend, plan->graph,
+            &plan->cached_graph, &plan->cached_exec, &plan->graph_warmup, &plan->graph_disabled);
         if (status == GGML_STATUS_SUCCESS && !remote &&
             fortai_cuda_q4_publish_output(context, plan->backend, device) != FORTAI_CUDA_OK)
             status = GGML_STATUS_FAILED;
         if (status != GGML_STATUS_SUCCESS) {
+            fortai_cuda_q4_debug("group graph");
             restore_edges();
             return FORTAI_CUDA_RUNTIME_ERROR;
         }
         restore_edges();
         if (remote) {
             if (async_bridge) {
-                if (fortai_cuda_q4_record_remote_done(context, plan->backend, bridge_events) != FORTAI_CUDA_OK)
+                if (fortai_cuda_q4_record_remote_done(context, plan->backend, bridge_events) != FORTAI_CUDA_OK) {
+                    fortai_cuda_q4_debug("group remote done");
                     return FORTAI_CUDA_RUNTIME_ERROR;
-                const void *sources[3] = {nullptr, nullptr, nullptr};
-                void *destinations[3] = {nullptr, nullptr, nullptr};
-                size_t bytes[3] = {0, 0, 0};
+                }
+                const void *sources[8] = {};
+                void *destinations[8] = {};
+                size_t bytes[8] = {};
                 for (int i = 0; i < member_count; ++i) {
                     const int index = members[i];
                     sources[i] = static_cast<char *>(context->bridge_output[1]) + output_offsets[i];
@@ -1719,8 +2178,10 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
                     bytes[i] = static_cast<size_t>(weights[index]->output->ne[0]) * sizeof(float);
                 }
                 if (fortai_cuda_q4_queue_outputs_primary(context, bridge_events, sources,
-                        destinations, bytes, member_count) != FORTAI_CUDA_OK)
+                        destinations, bytes, member_count) != FORTAI_CUDA_OK) {
+                    fortai_cuda_q4_debug("group queue output");
                     return FORTAI_CUDA_RUNTIME_ERROR;
+                }
             } else {
                 ggml_backend_synchronize(plan->backend);
                 for (int i = 0; i < member_count; ++i) {
@@ -1737,10 +2198,218 @@ int fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
     return FORTAI_CUDA_OK;
 }
 
+/* Four recurrent projections (QKV/conv, gate, alpha, beta) consume the same
+ * normalized activation.  Keeping them in one graph avoids an otherwise
+ * unavoidable scheduler launch and activation quantization boundary between
+ * the two legacy pair calls. */
+int fortai_cuda_q4_matvec_device_quad(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *first_weights,
+    const fortai_cuda_q4_weights *second_weights,
+    const fortai_cuda_q4_weights *third_weights,
+    const fortai_cuda_q4_weights *fourth_weights, const void *device_activation,
+    size_t activation_elements, void *first_output, size_t first_output_elements,
+    void *second_output, size_t second_output_elements, void *third_output,
+    size_t third_output_elements, void *fourth_output, size_t fourth_output_elements) {
+    const fortai_cuda_q4_weights *weights[4] = {
+        first_weights, second_weights, third_weights, fourth_weights};
+    void *outputs[4] = {first_output, second_output, third_output, fourth_output};
+    const size_t output_elements[4] = {first_output_elements, second_output_elements,
+        third_output_elements, fourth_output_elements};
+    return fortai_cuda_q4_matvec_device_group(context, weights, device_activation,
+        activation_elements, outputs, output_elements, 4);
+}
+
+static fortai_cuda_q4_batch_plan *fortai_cuda_q4_find_batch_plan(
+    fortai_cuda_q4_context *context, const fortai_cuda_q4_weights * const *weights,
+    int count, int batch) {
+    if (context == nullptr || weights == nullptr || count < 1 || count > 3 || batch <= 0)
+        return nullptr;
+    for (auto &candidate : context->batch_plans) {
+        if (candidate.count != count || candidate.batch != batch ||
+            candidate.backend != weights[0]->backend) continue;
+        bool match = true;
+        for (int i = 0; i < count; ++i)
+            if (candidate.weights[i] != weights[i]) match = false;
+        if (match) return &candidate;
+    }
+
+    fortai_cuda_q4_batch_plan candidate;
+    candidate.count = count;
+    candidate.batch = batch;
+    candidate.backend = weights[0]->backend;
+    ggml_init_params params{};
+    params.mem_size = 4 << 20;
+    params.no_alloc = true;
+    candidate.context = ggml_init(params);
+    if (candidate.context == nullptr) return nullptr;
+    /* The immutable quantized allocation belongs to the normal per-tensor
+     * plan.  The batch context owns only descriptors and its activation/
+     * output compute buffer, so model VRAM is not duplicated. */
+    for (int i = 0; i < count; ++i) {
+        if (weights[i] == nullptr || weights[i]->weight == nullptr ||
+            weights[i]->backend != candidate.backend ||
+            weights[i]->device != weights[0]->device ||
+            weights[i]->weight->ne[0] != weights[0]->weight->ne[0]) {
+            ggml_free(candidate.context);
+            return nullptr;
+        }
+        candidate.weights[i] = weights[i];
+        candidate.weight[i] = ggml_new_tensor_2d(candidate.context, weights[i]->weight->type,
+            weights[i]->weight->ne[0], weights[i]->weight->ne[1]);
+        if (candidate.weight[i] == nullptr) {
+            ggml_free(candidate.context);
+            return nullptr;
+        }
+        candidate.weight[i]->data = weights[i]->weight->data;
+        candidate.weight[i]->buffer = weights[i]->weight->buffer;
+    }
+    candidate.activation[0] = ggml_new_tensor_2d(candidate.context, GGML_TYPE_F32,
+        weights[0]->weight->ne[0], batch);
+    if (candidate.activation[0] == nullptr) {
+        ggml_free(candidate.context);
+        return nullptr;
+    }
+    for (int i = 1; i < count; ++i) candidate.activation[i] = candidate.activation[0];
+    for (int i = 0; i < count; ++i) {
+        candidate.output[i] = ggml_mul_mat(candidate.context, candidate.weight[i], candidate.activation[0]);
+        if (candidate.output[i] == nullptr) {
+            ggml_free(candidate.context);
+            return nullptr;
+        }
+    }
+    candidate.graph = ggml_new_graph_custom(candidate.context, GGML_DEFAULT_GRAPH_SIZE, false);
+    if (candidate.graph == nullptr) {
+        ggml_free(candidate.context);
+        return nullptr;
+    }
+    for (int i = 0; i < count; ++i) ggml_build_forward_expand(candidate.graph, candidate.output[i]);
+    candidate.buffer = ggml_backend_alloc_ctx_tensors(candidate.context, candidate.backend);
+    if (candidate.buffer == nullptr) {
+        ggml_free(candidate.context);
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(candidate.buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    try {
+        context->batch_plans.push_back(candidate);
+    } catch (...) {
+        ggml_backend_buffer_free(candidate.buffer);
+        ggml_free(candidate.context);
+        return nullptr;
+    }
+    return &context->batch_plans.back();
+}
+
+static fortai_cuda_q4_embedding_batch_plan *fortai_cuda_q4_find_embedding_batch_plan(
+    fortai_cuda_q4_context *context, const fortai_cuda_q4_weights *weights, int batch) {
+    if (context == nullptr || weights == nullptr || weights->owner != context ||
+        weights->weight == nullptr || weights->backend == nullptr || batch <= 0)
+        return nullptr;
+    for (auto &candidate : context->embedding_batch_plans) {
+        if (candidate.weights == weights && candidate.batch == batch)
+            return &candidate;
+    }
+
+    fortai_cuda_q4_embedding_batch_plan candidate;
+    candidate.weights = weights;
+    candidate.batch = batch;
+    candidate.backend = weights->backend;
+    ggml_init_params params{};
+    params.mem_size = std::max<size_t>(2u << 20, static_cast<size_t>(batch) * sizeof(int32_t) * 8);
+    params.no_alloc = true;
+    candidate.context = ggml_init(params);
+    if (candidate.context == nullptr) return nullptr;
+    candidate.weight = ggml_new_tensor_2d(candidate.context, weights->weight->type,
+        weights->weight->ne[0], weights->weight->ne[1]);
+    candidate.ids = ggml_new_tensor_1d(candidate.context, GGML_TYPE_I32, batch);
+    if (candidate.weight == nullptr || candidate.ids == nullptr) {
+        ggml_free(candidate.context);
+        return nullptr;
+    }
+    candidate.weight->data = weights->weight->data;
+    candidate.weight->buffer = weights->weight->buffer;
+    candidate.output = ggml_get_rows(candidate.context, candidate.weight, candidate.ids);
+    candidate.graph = ggml_new_graph_custom(candidate.context, GGML_DEFAULT_GRAPH_SIZE, false);
+    if (candidate.output == nullptr || candidate.graph == nullptr) {
+        ggml_free(candidate.context);
+        return nullptr;
+    }
+    ggml_build_forward_expand(candidate.graph, candidate.output);
+    candidate.buffer = ggml_backend_alloc_ctx_tensors(candidate.context, candidate.backend);
+    if (candidate.buffer == nullptr || candidate.ids->data == nullptr || candidate.output->data == nullptr) {
+        if (candidate.buffer != nullptr) ggml_backend_buffer_free(candidate.buffer);
+        ggml_free(candidate.context);
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(candidate.buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    try {
+        context->embedding_batch_plans.push_back(candidate);
+    } catch (...) {
+        ggml_backend_buffer_free(candidate.buffer);
+        ggml_free(candidate.context);
+        return nullptr;
+    }
+    return &context->embedding_batch_plans.back();
+}
+
+int fortai_cuda_q4_matmul_device_group(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights * const *weights, const void *device_activation,
+    size_t activation_elements, int batch, void * const *device_outputs,
+    const size_t *output_elements, int count) {
+    if (context == nullptr || weights == nullptr || device_activation == nullptr ||
+        device_outputs == nullptr || output_elements == nullptr || count < 1 || count > 3 ||
+        batch <= 0 || activation_elements == 0) return FORTAI_CUDA_INVALID;
+    const int device = weights[0] != nullptr ? weights[0]->device : -1;
+    const int primary = context->device_ids[0];
+    if (device != primary) return FORTAI_CUDA_INVALID;
+    for (int i = 0; i < count; ++i) {
+        if (weights[i] == nullptr || weights[i]->owner != context ||
+            weights[i]->device != device || device_outputs[i] == nullptr ||
+            output_elements[i] < static_cast<size_t>(weights[i]->output->ne[0]) * batch ||
+            activation_elements != static_cast<size_t>(weights[i]->weight->ne[0]) * batch)
+            return FORTAI_CUDA_INVALID;
+    }
+    if (fortai_cuda_q4_prepare_input(context, primary) != FORTAI_CUDA_OK)
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    fortai_cuda_q4_batch_plan *plan = fortai_cuda_q4_find_batch_plan(context, weights, count, batch);
+    if (plan == nullptr) return FORTAI_CUDA_RUNTIME_ERROR;
+    void *saved_activation = plan->activation[0]->data;
+    void *saved_output[3] = {nullptr, nullptr, nullptr};
+    plan->activation[0]->data = const_cast<void *>(device_activation);
+    for (int i = 0; i < count; ++i) {
+        saved_output[i] = plan->output[i]->data;
+        plan->output[i]->data = device_outputs[i];
+    }
+    const enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, plan->backend, plan->graph,
+        &plan->cached_graph, &plan->cached_exec, &plan->graph_warmup, &plan->graph_disabled);
+    if (status == GGML_STATUS_SUCCESS &&
+        fortai_cuda_q4_publish_output(context, plan->backend, device) != FORTAI_CUDA_OK) {
+        plan->activation[0]->data = saved_activation;
+        for (int i = 0; i < count; ++i) plan->output[i]->data = saved_output[i];
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    }
+    plan->activation[0]->data = saved_activation;
+    for (int i = 0; i < count; ++i) plan->output[i]->data = saved_output[i];
+    return status == GGML_STATUS_SUCCESS ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
+}
+
+int fortai_cuda_q4_matmul_device(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *weights, const void *device_activation,
+    size_t activation_elements, int batch, void *device_output,
+    size_t output_elements) {
+    if (context == nullptr || weights == nullptr || device_output == nullptr || batch <= 0)
+        return FORTAI_CUDA_INVALID;
+    const fortai_cuda_q4_weights *group[1] = {weights};
+    void *outputs[1] = {device_output};
+    const size_t sizes[1] = {output_elements};
+    return fortai_cuda_q4_matmul_device_group(context, group, device_activation,
+        activation_elements, batch, outputs, sizes, 1);
+}
+
 int fortai_cuda_q4_matvec_device_group_remote_output(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights * const *weights, const void *device_activation,
     size_t activation_elements, void * const *device_outputs,
     const size_t *output_elements, int count) {
+    fortai_cuda_q4_debug("enter group remote output");
     if (context == nullptr || weights == nullptr || device_activation == nullptr ||
         device_outputs == nullptr || output_elements == nullptr || count < 1 || count > 3 ||
         activation_elements == 0 || context->device_ids[0] == context->device_ids[1])
@@ -1760,28 +2429,40 @@ int fortai_cuda_q4_matvec_device_group_remote_output(fortai_cuda_q4_context *con
     /* The input is produced by FortAI's primary stream.  Queue the PCIe
      * staging edge and leave the projection output on the remote device for
      * the attention core. */
-    const bool async_bridge = context->consumer_stream[0] != nullptr &&
-        context->consumer_stream[1] != nullptr;
+    const bool async_bridge = !context->sync_bridge_requested &&
+        context->consumer_stream[0] != nullptr && context->consumer_stream[1] != nullptr;
     fortai_cuda_q4_bridge_events *bridge_events = nullptr;
     if (async_bridge) {
         if (fortai_cuda_q4_queue_activation_remote(context, device_activation,
-                activation_bytes, &bridge_events) != FORTAI_CUDA_OK)
+                activation_bytes, &bridge_events) != FORTAI_CUDA_OK) {
+            fortai_cuda_q4_debug("remote-output queue input");
             return FORTAI_CUDA_RUNTIME_ERROR;
+        }
     } else if (fortai_cuda_q4_prepare_input(context, primary_device) != FORTAI_CUDA_OK) {
         return FORTAI_CUDA_RUNTIME_ERROR;
     }
     int code = fortai_cuda_q4_ensure_bridge(context, 1, activation_bytes, 0);
-    if (code != FORTAI_CUDA_OK) return code;
+    if (code != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug_code("remote-output ensure bridge", code);
+        return code;
+    }
     if (!async_bridge && fortai_cuda_q4_copy_between_devices(context, context->bridge_activation[1], remote_device,
-            device_activation, primary_device, activation_bytes) != FORTAI_CUDA_OK)
+            device_activation, primary_device, activation_bytes) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("remote-output sync input");
         return FORTAI_CUDA_RUNTIME_ERROR;
+    }
 
     int members[3] = {0, 1, 2};
     fortai_cuda_q4_group_plan *plan =
         fortai_cuda_q4_find_device_group_plan(context, weights, members, count);
-    if (plan == nullptr) return FORTAI_CUDA_RUNTIME_ERROR;
-    if (async_bridge && fortai_cuda_q4_wait_output_buffer(context, plan->backend) != FORTAI_CUDA_OK)
+    if (plan == nullptr) {
+        fortai_cuda_q4_debug("remote-output group plan");
         return FORTAI_CUDA_RUNTIME_ERROR;
+    }
+    if (async_bridge && fortai_cuda_q4_wait_output_buffer(context, plan->backend) != FORTAI_CUDA_OK) {
+        fortai_cuda_q4_debug("remote-output wait output");
+        return FORTAI_CUDA_RUNTIME_ERROR;
+    }
     void *saved_activation[3] = {nullptr, nullptr, nullptr};
     void *saved_output[3] = {nullptr, nullptr, nullptr};
     for (int i = 0; i < count; ++i) {
@@ -1790,14 +2471,19 @@ int fortai_cuda_q4_matvec_device_group_remote_output(fortai_cuda_q4_context *con
         weights[i]->activation->data = context->bridge_activation[1];
         weights[i]->output->data = device_outputs[i];
     }
-    enum ggml_status status = ggml_backend_graph_compute_async(plan->backend, plan->graph);
+    enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, plan->backend, plan->graph,
+        &plan->cached_graph, &plan->cached_exec, &plan->graph_warmup, &plan->graph_disabled);
     if (status == GGML_STATUS_SUCCESS && async_bridge) {
-        if (fortai_cuda_q4_record_remote_done(context, plan->backend, bridge_events) != FORTAI_CUDA_OK)
+        if (fortai_cuda_q4_record_remote_done(context, plan->backend, bridge_events) != FORTAI_CUDA_OK) {
+            fortai_cuda_q4_debug("remote-output remote done");
             status = GGML_STATUS_FAILED;
+        }
         else if (cudaSetDevice(remote_device) != cudaSuccess ||
             cudaStreamWaitEvent(context->consumer_stream[1],
-                fortai_cuda_event_handle(bridge_events->remote_done), 0) != cudaSuccess)
+                fortai_cuda_event_handle(bridge_events->remote_done), 0) != cudaSuccess) {
+            fortai_cuda_q4_debug("remote-output consumer wait");
             status = GGML_STATUS_FAILED;
+        }
     } else if (status == GGML_STATUS_SUCCESS) {
         /* Standalone callers retain the conservative host-visible barrier. */
         if (fortai_cuda_q4_publish_output(context, plan->backend, remote_device) != FORTAI_CUDA_OK)
@@ -1807,12 +2493,14 @@ int fortai_cuda_q4_matvec_device_group_remote_output(fortai_cuda_q4_context *con
         weights[i]->activation->data = saved_activation[i];
         weights[i]->output->data = saved_output[i];
     }
+    if (status != GGML_STATUS_SUCCESS) fortai_cuda_q4_debug("remote-output graph");
     return status == GGML_STATUS_SUCCESS ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
 }
 
 int fortai_cuda_q4_matvec_device_remote_input(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights *weights, const void *device_activation,
     size_t activation_elements, void *device_output, size_t output_elements) {
+    fortai_cuda_q4_debug("enter remote input");
     if (context == nullptr || weights == nullptr || weights->owner != context ||
         device_activation == nullptr || device_output == nullptr || activation_elements == 0 ||
         context->device_ids[0] == context->device_ids[1] ||
@@ -1834,8 +2522,8 @@ int fortai_cuda_q4_matvec_device_remote_input(fortai_cuda_q4_context *context,
         return FORTAI_CUDA_RUNTIME_ERROR;
     int code = fortai_cuda_q4_ensure_bridge(context, 1, activation_bytes, output_bytes);
     if (code != FORTAI_CUDA_OK) return code;
-    const bool async_bridge = context->consumer_stream[0] != nullptr &&
-        context->consumer_stream[1] != nullptr;
+    const bool async_bridge = !context->sync_bridge_requested &&
+        context->consumer_stream[0] != nullptr && context->consumer_stream[1] != nullptr;
     fortai_cuda_q4_bridge_events *bridge_events = nullptr;
     if (async_bridge) {
         if (fortai_cuda_q4_next_bridge_events(context, &bridge_events) != FORTAI_CUDA_OK)
@@ -1847,7 +2535,11 @@ int fortai_cuda_q4_matvec_device_remote_input(fortai_cuda_q4_context *context,
     void *saved_output = weights->output->data;
     weights->activation->data = const_cast<void *>(device_activation);
     weights->output->data = context->bridge_output[1];
-    enum ggml_status status = ggml_backend_graph_compute_async(weights->backend, weights->graph);
+    enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, weights->backend, weights->graph,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->cached_graph,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->cached_exec,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->graph_warmup,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->graph_disabled);
     weights->activation->data = saved_activation;
     weights->output->data = saved_output;
     if (status != GGML_STATUS_SUCCESS) return FORTAI_CUDA_RUNTIME_ERROR;
@@ -1900,7 +2592,11 @@ int fortai_cuda_q4_embedding_device(fortai_cuda_q4_context *context,
     }
     void *saved_output = weights->embedding_output->data;
     weights->embedding_output->data = output_ptr;
-    enum ggml_status status = ggml_backend_graph_compute_async(weights->backend, weights->embedding_graph);
+    enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, weights->backend, weights->embedding_graph,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->embedding_cached_graph,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->embedding_cached_exec,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->embedding_graph_warmup,
+        &const_cast<fortai_cuda_q4_weights *>(weights)->embedding_graph_disabled);
     weights->embedding_output->data = saved_output;
     if (status == GGML_STATUS_SUCCESS && !remote) {
         if (fortai_cuda_q4_publish_output(context, weights->backend, primary_device) != FORTAI_CUDA_OK)
@@ -1915,4 +2611,30 @@ int fortai_cuda_q4_embedding_device(fortai_cuda_q4_context *context,
             status = GGML_STATUS_FAILED;
     }
     return status == GGML_STATUS_SUCCESS ? FORTAI_CUDA_OK : FORTAI_CUDA_RUNTIME_ERROR;
+}
+
+int fortai_cuda_q4_embedding_device_batch(fortai_cuda_q4_context *context,
+    const fortai_cuda_q4_weights *weights, const int32_t *host_tokens, int batch,
+    void *device_output, size_t output_elements) {
+    if (context == nullptr || weights == nullptr || weights->owner != context || weights->weight == nullptr ||
+        host_tokens == nullptr || batch <= 0 || device_output == nullptr ||
+        weights->device != context->device_ids[0] ||
+        output_elements < static_cast<size_t>(weights->weight->ne[0]) * batch)
+        return FORTAI_CUDA_INVALID;
+    const int code = fortai_cuda_q4_prepare_input(context, weights->device);
+    if (code != FORTAI_CUDA_OK) return code;
+    auto *plan = fortai_cuda_q4_find_embedding_batch_plan(context, weights, batch);
+    if (plan == nullptr) return FORTAI_CUDA_RUNTIME_ERROR;
+    /* A synchronous set keeps the caller's short-lived token array from
+     * being reused while GGML's CUDA stream is still reading it.  The copy is
+     * only batch*sizeof(int32_t), and the expensive row lookup remains fully
+     * asynchronous on the resident stream. */
+    ggml_backend_tensor_set(plan->ids, host_tokens, 0, static_cast<size_t>(batch) * sizeof(int32_t));
+    void *saved_output = plan->output->data;
+    plan->output->data = device_output;
+    const enum ggml_status status = fortai_cuda_q4_graph_compute_cached(context, plan->backend, plan->graph,
+        &plan->cached_graph, &plan->cached_exec, &plan->graph_warmup, &plan->graph_disabled);
+    plan->output->data = saved_output;
+    if (status != GGML_STATUS_SUCCESS) return FORTAI_CUDA_RUNTIME_ERROR;
+    return fortai_cuda_q4_publish_output(context, plan->backend, weights->device);
 }

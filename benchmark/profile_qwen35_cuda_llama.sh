@@ -11,6 +11,7 @@ token_id="${2:-${FORTAI_TOKEN_ID:-9419}}"
 steps="${3:-${FORTAI_PROFILE_STEPS:-16}}"
 context="${4:-${FORTAI_CONTEXT:-128}}"
 device="${5:-${CUDA_DEVICE:-0}}"
+visible_devices="${FORTAI_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-$device}}"
 if ! command -v nsys >/dev/null 2>&1; then
     echo "nsys is required for CUDA model profiling" >&2
     exit 2
@@ -48,7 +49,7 @@ mkdir -p "$profile_dir"
 } >"$profile_dir/provenance.txt"
 
 "$root_dir/tools/build_cuda_qwen35.sh" >"$profile_dir/build.log"
-CUDA_VISIBLE_DEVICES="$device" OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" \
+CUDA_VISIBLE_DEVICES="$visible_devices" OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" \
     nsys profile --trace=cuda,osrt --sample=none --cpuctxsw=none \
     --force-overwrite=true -o "$profile_dir/fortai" \
     "$root_dir/build/cuda/fortai_cuda_run" "$model_path" "$token_id" "$steps" \
@@ -57,7 +58,7 @@ CUDA_VISIBLE_DEVICES="$device" OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}" \
 if [[ -n "$llama_library_dir" ]]; then
     export LD_LIBRARY_PATH="$llama_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-CUDA_VISIBLE_DEVICES="$device" nsys profile --trace=cuda,osrt --sample=none --cpuctxsw=none \
+CUDA_VISIBLE_DEVICES="$visible_devices" nsys profile --trace=cuda,osrt --sample=none --cpuctxsw=none \
     --force-overwrite=true -o "$profile_dir/llama" \
     "$llama_server" -m "$model_path" --host 127.0.0.1 --port "$port" -c "$context" \
     -ngl 99 -t "${OMP_NUM_THREADS:-2}" -tb "${OMP_NUM_THREADS:-2}" --no-webui \

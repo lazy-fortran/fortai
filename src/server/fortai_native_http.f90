@@ -700,11 +700,15 @@ contains
                 value = fortai_native_http_json_integer_checked(text, 'max_completion_tokens', -1, valid)
             else if (json_key(text, 'max_tokens', 1) > 0) then
                 value = fortai_native_http_json_integer_checked(text, 'max_tokens', -1, valid)
+            else if (json_key(text, 'n_predict', 1) > 0) then
+                value = fortai_native_http_json_integer_checked(text, 'n_predict', -1, valid)
             end if
         else if (json_key(text, 'max_tokens', 1) > 0) then
             value = fortai_native_http_json_integer_checked(text, 'max_tokens', -1, valid)
         else if (json_key(text, 'max_completion_tokens', 1) > 0) then
             value = fortai_native_http_json_integer_checked(text, 'max_completion_tokens', -1, valid)
+        else if (json_key(text, 'n_predict', 1) > 0) then
+            value = fortai_native_http_json_integer_checked(text, 'n_predict', -1, valid)
         end if
         if (.not. valid) then
             json_token_limit = 0

@@ -51,6 +51,22 @@ byte-identical. FortAI currently needs true prompt batching to close the
 remaining prefill gap ([issue #2](https://github.com/lazy-fortran/fortai/issues/2));
 a bounded full OpenCode CLI run is not yet promotion evidence.
 
+The latest matched native CUDA decode check used the same 27B model, 128-token
+context, 64 generated tokens, q8 K/V, flash attention, two GPUs split
+`0.57,0.43`, and two OpenMP threads.  The independent 8-token trace was exact
+in both runs.  Greedy decode now keeps a remote Q4 output head and performs
+`argmax` on its owning GPU, so it does not copy a full vocabulary row over
+PCIe.
+
+| Run | FortAI tok/s | llama.cpp tok/s | FortAI / llama.cpp |
+|---:|---:|---:|---:|
+| 1 | 22.69 | 23.02 | 0.985 |
+| 2 | 22.46 | 22.65 | 0.992 |
+| Median | 22.58 | 22.84 | 0.989 |
+
+This is within the observed run-to-run variance, but remains evidence rather
+than a blanket promotion claim for every context length or prompt workload.
+
 ### Whisper CUDA (`large-v3-turbo`)
 
 These are end-to-end multipart HTTP latencies with four CPU threads, flash
@@ -100,6 +116,9 @@ The repository follows the Lazy Fortran conventions:
 See [docs/architecture.md](docs/architecture.md) for the staged implementation
 plan.
 
+The exact llama.cpp/GGML source revision used for algorithm comparison and its
+MIT notice are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Build and test
 
 Requirements are a Fortran 2018 compiler, the local Lazy Fortran `fo`
@@ -122,18 +141,18 @@ benchmark/run_cpu_reference.sh
 # model-level CPU smoke/benchmark
 benchmark/run_qwen35_cpu.sh .provenance/downloads/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf
 
-# llama.cpp ABI fast path (automatic when the resident library is available)
+# optional llama.cpp ABI comparison path (never used by the native server)
 FORTAI_LLAMA_FASTPATH=cpu benchmark/run_qwen35_cpu.sh MODEL.gguf
 FORTAI_LLAMA_FASTPATH=cuda benchmark/compare_qwen35_cuda_llama.sh MODEL.gguf
 
-# pass llama.cpp model/context controls through the resident fast path
+# pass llama.cpp model/context controls through the comparison path
 FORTAI_LLAMA_FASTPATH=cuda \
   FORTAI_FLASH_ATTN=on \
   LLAMACPP_BATCH=2048 LLAMACPP_UBATCH=256 LLAMACPP_PARALLEL=1 \
   LLAMACPP_CACHE_TYPE_K=q8_0 LLAMACPP_CACHE_TYPE_V=q8_0 \
   LLAMACPP_TENSOR_SPLIT=0.57,0.43 \
   benchmark/compare_qwen35_cuda_llama.sh MODEL.gguf
-# force the native Fortran/GGML fallback for diagnostics
+# force the native Fortran/GGML implementation
 FORTAI_LLAMA_FASTPATH=native benchmark/run_qwen35_cpu.sh MODEL.gguf
 
 # fair short-decode comparison; FortAI and llama.cpp run sequentially
@@ -201,12 +220,11 @@ and canonical `LLAMA_ARG_*` environment surface (and also accepts the
 corresponding `FORTAI_*` and legacy `LLAMACPP_*` names). The launcher normalizes
 those settings before model initialization, including split mode, tensor
 fractions, draft/MTP cache types, reasoning controls, HTTP/UI/CORS settings,
-and authentication. The resident llama.cpp adapter
-honors the corresponding `FORTAI_*`, `LLAMA_ARG_*`, and local service
-`LLAMACPP_*` settings for flash attention,
-batch/ubatch sizes, parallel sequence count, K/V cache types, KQV and generic
-operation offload, SWA/KV-unified mode, thread-batch count, and multi-GPU
-tensor splitting. The CUDA runner reports `vram_*_bytes` before and after
+and authentication. The independent llama.cpp comparison harness accepts the
+corresponding `FORTAI_*`, `LLAMA_ARG_*`, and local service `LLAMACPP_*` settings
+for flash attention, batch/ubatch sizes, parallel sequence count, K/V cache
+types, KQV and generic operation offload, SWA/KV-unified mode, thread-batch
+count, and multi-GPU tensor splitting. The CUDA runner reports `vram_*_bytes` before and after
 loading so the memory delta can be compared with llama.cpp under the same
 profile. Qwen3.8-style embedded NextN/MTP heads are also bound by the native
 Fortran Qwen3.5 runtime. Set `FORTAI_NATIVE_MTP=1` (or
@@ -222,8 +240,8 @@ available.
 It keeps greedy target output exact and uses the CUDA-resident target pipeline
 whenever the KV allocation fits, with a host-controlled NextN verification
 handoff. The
-resident llama.cpp adapter remains the reference path for true batched
-speculative throughput. FortAI accepts and validates the configured external
+independent llama.cpp remains the reference oracle for true batched speculative
+throughput. FortAI accepts and validates the configured external
 draft path, while a matching MTP sidecar is loaded into the target's `blk.64`
 head tensors (without duplicating the target embedding/output weights) and
 native speculative execution consumes that head. `/health` reports
@@ -368,12 +386,9 @@ and top-8 logits pass at 1e-2 tolerance on CPU and CUDA). The native mixed-
 quant fallback remains a correctness-first compatibility path: the earlier 2B
 Q4_K_M probe measured
 7.33 tok/s CPU versus 22.30 tok/s for llama.cpp at eight threads, and 76.9
-tok/s CUDA versus 213.2 tok/s at two threads. When the resident llama.cpp ABI
-library is available, the model runner automatically uses the same resident
-graph, repack kernels, and CPU threadpool as the comparison harness; set
-`FORTAI_LLAMA_FASTPATH=native` to measure the native fallback. Explicit
-`cpu`/`cuda` selections remain available for deployments that need to pin the
-backend.
+tok/s CUDA versus 213.2 tok/s at two threads. Native FortAI is the default and
+production path; `FORTAI_LLAMA_FASTPATH=cpu|cuda` is retained only for explicit
+compatibility measurements, while `native` selects the Fortran/GGML path.
 For an independent exact Q4_K_XL CUDA oracle smoke on the two GPUs, use
 `benchmark/run_q4_cuda_compat.sh`; it starts and cleans up its own private
 localhost server. See [ROADMAP.md](ROADMAP.md).

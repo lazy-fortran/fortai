@@ -44,13 +44,15 @@ export OMP_PROC_BIND="${FORTAI_LLAMA_OMP_PROC_BIND:-${OMP_PROC_BIND:-false}}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
 export OMP_WAIT_POLICY="${FORTAI_LLAMA_OMP_WAIT_POLICY:-${OMP_WAIT_POLICY:-ACTIVE}}"
 native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto}"
+ggml_prefix="${FORTAI_GGML_PREFIX:-/home/ert/.local/llama.cpp-upstream-main-650913862}"
+link_flags="${native_flags} -L${ggml_prefix}/lib -Wl,-rpath,${ggml_prefix}/lib -lggml-cpu -lggml-cuda -lggml -lggml-base -lpthread -ldl"
 
 {
     "$root_dir/tools/worktree_digest.sh"
     printf 'fortai_commit=%s\n' "$(git -C "$root_dir" rev-parse HEAD)"
     printf 'model_sha256=%s\n' "$(sha256sum "$model_path" | awk '{print $1}')"
     printf 'compiler=%s\n' "$(gfortran --version | head -n 1)"
-    printf 'build_flags=%s\n' "$native_flags"
+    printf 'build_flags=%s\n' "$link_flags"
     printf 'omp_num_threads=%s\n' "$OMP_NUM_THREADS"
     printf 'omp_proc_bind=%s\n' "$OMP_PROC_BIND"
     printf 'omp_places=%s\n' "$OMP_PLACES"
@@ -60,7 +62,7 @@ native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-lo
     printf 'perf_runner=%s\n' "$perf_runner"
 } >"$profile_dir/provenance.txt"
 
-(cd "$root_dir" && fo build --flag "$native_flags") >"$profile_dir/build.log"
+(cd "$root_dir" && fo build --flag "$link_flags") >"$profile_dir/build.log"
 run=(fo exec --no-build --cwd "$root_dir" fortai_cpu_run "$model_path" "$token_id" "$steps" "$context")
 events="task-clock,context-switches,cpu-migrations,cycles,instructions,branches,branch-misses,cache-references,cache-misses"
 perf_delay_args=()

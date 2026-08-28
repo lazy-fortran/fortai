@@ -61,6 +61,8 @@ export FORTAI_ENABLE_PERSISTENT_OPENMP="$persistent_openmp"
 # libggml-cuda.so: hide every GPU so backend init finds zero devices.
 export CUDA_VISIBLE_DEVICES=""
 native_flags="${FORTAI_NATIVE_FLAGS:--O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto}"
+ggml_prefix="${FORTAI_GGML_PREFIX:-/home/ert/.local/llama.cpp-upstream-main-650913862}"
+link_flags="${native_flags} -L${ggml_prefix}/lib -Wl,-rpath,${ggml_prefix}/lib -lggml-cpu -lggml-cuda -lggml -lggml-base -lpthread -ldl"
 digest_output=$("$root_dir/tools/worktree_digest.sh")
 patch_digest=$(printf '%s\n' "$digest_output" | sed -n 's/^patch_digest=//p')
 tree_digest=$(printf '%s\n' "$digest_output" | sed -n 's/^tracked_tree_digest=//p')
@@ -129,7 +131,7 @@ llama_record="$root_dir/.provenance/records/llama.cpp.txt"
 
 # Run FortAI before starting llama.cpp so the measurements do not compete.
 fortai_executable="$root_dir/build/fo/app/fortai_cpu_run"
-(cd "$root_dir" && fo build --flag "$native_flags" && \
+(cd "$root_dir" && fo build --flag "$link_flags" && \
     env OMP_NUM_THREADS="$OMP_NUM_THREADS" OMP_PROC_BIND="$OMP_PROC_BIND" \
         OMP_PLACES="$OMP_PLACES" FORTAI_EXCLUDE_PROMPT=1 \
         "$fortai_executable" \
@@ -274,7 +276,7 @@ MODEL_PATH="$model_path" TOKEN_ID="$token_id" STEPS="$steps" CONTEXT="$context" 
 COMMIT="$(git -C "$root_dir" rev-parse HEAD)" OMP_NUM_THREADS="$threads" \
 COMPILER="$(gfortran --version | head -n 1)" FORTAI_LOG="$fortai_log" \
 LLAMA_RESULT="$result_file.llama" RESULT_FILE="$result_file" \
-BUILD_FLAGS="$native_flags" PATCH_DIGEST="$patch_digest" \
+BUILD_FLAGS="$link_flags" PATCH_DIGEST="$patch_digest" \
 TRACKED_TREE_DIGEST="$tree_digest" \
 WORKTREE_DIGEST="$worktree_digest" \
 FORTAI_LOG_PATH="$fortai_log" LLAMA_LOG_PATH="$llama_log" \

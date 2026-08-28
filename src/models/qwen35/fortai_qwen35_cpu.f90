@@ -1,19 +1,25 @@
 module fortai_qwen35_cpu
-    use, intrinsic :: iso_c_binding, only: c_associated, c_char, c_float, c_int, c_int16_t, c_int64_t, c_int8_t, &
+    use, intrinsic :: iso_c_binding, only: c_associated, c_char, c_float, c_int, c_int16_t, c_int32_t, c_int64_t, c_int8_t, &
         c_null_char, c_null_ptr, c_ptr, c_size_t
     use, intrinsic :: iso_fortran_env, only: error_unit, int8, int32, int64, real32, real64
     use fortai_backend_cuda, only: cuda_q8_context_t, cuda_q8_matvec_host, &
         cuda_q8_ffn_host, cuda_q8_ffn_device, cuda_q8_matvec_host_pair, &
         cuda_q8_matvec_host_triplet, cuda_q8_matvec_host_triplet_contiguous, cuda_q8_weights_t, &
-        cuda_q8_matvec_device_f32, cuda_qwen35_add_device, cuda_qwen35_copy_device, &
-        cuda_qwen35_embedding_device, cuda_qwen35_rms_norm_device
-    use fortai_backend_cuda, only: cuda_qwen35_silu_product_device
+        cuda_q8_matvec_device_f32, cuda_q8_matvec_device_f32_pair, cuda_q8_reserve_matvec_scratch, &
+        cuda_q8_matmul_device_f32, cuda_qwen35_add_device, &
+        cuda_qwen35_add_matrix_device, cuda_qwen35_copy_column_device, cuda_qwen35_copy_device, &
+        cuda_qwen35_embedding_device, cuda_qwen35_embedding_device_batch, cuda_qwen35_rms_norm_device, &
+        cuda_qwen35_rms_norm_matrix_device
+    use fortai_backend_cuda, only: cuda_qwen35_silu_product_device, cuda_qwen35_silu_product_matrix_device
     use fortai_backend_cuda, only: cuda_q4_context_t, cuda_q4_weights_t, cuda_q4_matvec_host, &
         cuda_q4_matvec_host_pair, cuda_q4_matvec_host_triplet, cuda_q4_matvec_device, &
         cuda_q4_matvec_device_swiglu, cuda_q4_matvec_device_swiglu_remote_output, &
         cuda_q4_matvec_device_swiglu_down, &
         cuda_q4_matvec_device_pair, cuda_q4_matvec_device_triplet, cuda_q4_matvec_device_group_remote_output, &
-        cuda_q4_matvec_device_remote_input, cuda_q4_embedding_device
+        cuda_q4_matvec_device_quad, cuda_q4_matvec_device_remote_input, cuda_q4_embedding_device, &
+        cuda_q4_embedding_device_batch
+    use fortai_backend_cuda, only: cuda_q4_matmul_device_one, cuda_q4_matmul_device_pair, &
+        cuda_q4_matmul_device_triplet
     use fortai_backend_cuda, only: cuda_qwen35_attention_t, cuda_qwen35_recurrent_t
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, &
         GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, gguf_file_t, &
@@ -243,6 +249,11 @@ module fortai_qwen35_cpu
         type(c_ptr) :: cuda_hidden = c_null_ptr
         type(c_ptr) :: cuda_output_norm = c_null_ptr
         type(c_ptr) :: cuda_logits = c_null_ptr
+        ! Greedy decode keeps a split Q4 output projection on its owning
+        ! device, matching llama.cpp's backend argmax path.  Only the final
+        ! token ID crosses the PCIe boundary; the primary-device buffer above
+        ! remains the fallback for sampling/diagnostics that need raw logits.
+        type(c_ptr) :: cuda_logits_second = c_null_ptr
         type(c_ptr) :: cuda_qkv_device = c_null_ptr
         type(c_ptr) :: cuda_gate_device = c_null_ptr
         type(c_ptr) :: cuda_alpha_device = c_null_ptr
@@ -260,11 +271,38 @@ module fortai_qwen35_cpu
         type(c_ptr) :: cuda_attention_v_device_second = c_null_ptr
         type(c_ptr) :: cuda_attention_work_device_second = c_null_ptr
         type(c_ptr) :: fast_handle = c_null_ptr
+        ! Reusable column-major [feature,batch] workspace for true prompt
+        ! batching.  It is allocated once beside the scalar decode buffers;
+        ! no model weights or KV state are duplicated.
+        type(c_ptr) :: cuda_batch_x = c_null_ptr
+        type(c_ptr) :: cuda_batch_residual = c_null_ptr
+        type(c_ptr) :: cuda_batch_normalized = c_null_ptr
+        type(c_ptr) :: cuda_batch_hidden = c_null_ptr
+        type(c_ptr) :: cuda_batch_qkv = c_null_ptr
+        type(c_ptr) :: cuda_batch_gate = c_null_ptr
+        type(c_ptr) :: cuda_batch_alpha = c_null_ptr
+        type(c_ptr) :: cuda_batch_beta = c_null_ptr
+        type(c_ptr) :: cuda_batch_ffn_gate = c_null_ptr
+        type(c_ptr) :: cuda_batch_ffn_up = c_null_ptr
+        type(c_ptr) :: cuda_batch_q = c_null_ptr
+        type(c_ptr) :: cuda_batch_k = c_null_ptr
+        type(c_ptr) :: cuda_batch_v = c_null_ptr
+        type(c_ptr) :: cuda_batch_attention = c_null_ptr
+        integer :: cuda_batch_capacity = 0
+        logical :: cuda_batch_enabled = .false.
         character(len=:), allocatable :: model_path
         logical :: cuda_enabled = .false.
         logical :: cuda_device_pipeline = .false.
         logical :: cuda_graph_enabled = .false.
         logical :: cuda_graph_ready = .false.
+        ! Split-Q4 graph execution mirrors llama.cpp's scheduler: a graph is
+        ! captured only for the contiguous primary-device prefix, while any
+        ! cross-device bridge remains outside capture.  The warmup flag keeps
+        ! lazy GGML/CUDA scratch allocation out of the capture itself.
+        logical :: cuda_segment_graph_enabled = .false.
+        logical :: cuda_segment_graph_ready = .false.
+        logical :: cuda_segment_graph_warmup = .false.
+        integer :: cuda_segment_graph_end = 0
         logical :: cuda_q4_resident = .false.
         logical :: cuda_q4_split = .false.
         logical :: cuda_q8_split = .false.
@@ -290,6 +328,8 @@ module fortai_qwen35_cpu
         procedure :: close => qwen35_cpu_close
         procedure :: enable_cuda => qwen35_cpu_enable_cuda
         procedure :: forward => qwen35_cpu_forward
+        procedure :: forward_batch => qwen35_cpu_forward_batch
+        procedure :: batch_supported => qwen35_cpu_batch_supported
         procedure :: forward_greedy => qwen35_cpu_forward_greedy
         procedure :: forward_greedy_speculative => qwen35_cpu_forward_greedy_speculative
         procedure :: mtp_draft_greedy => qwen35_cpu_mtp_draft_greedy
@@ -699,6 +739,7 @@ contains
         integer :: resident_length
         integer :: group_length
         integer :: tensor_split_length, tensor_split_status
+        type(c_ptr) :: q4_stream
 
         call stat%clear()
         call validate_cuda_split_mode(stat)
@@ -907,20 +948,25 @@ contains
                         real(q4_split_layer_count, real64)
                     q4_device = 1
                     if (q4_layer_position < tensor_split_fraction(1)) q4_device = 0
-                    ! At short context the primary board has enough headroom
-                    ! to keep recurrent projections beside the native GDN
-                    ! state.  This avoids a PCIe round trip for qkv/gate on
-                    ! every recurrent layer; long-context placement retains
-                    ! the split to protect KV-cache capacity.
-                    if (self%max_context <= 32768_int64 .and. &
-                        q4_recurrent_projection_tensor(self, i)) q4_device = 0
-                    ! A mixed Q4/Q8 attention block cannot keep its Q/K/V/O
-                    ! projections and attention state on the remote board:
-                    ! the Q8 member would otherwise force a full QKV host
-                    ! round trip.  Keep all quantized members of that block
-                    ! on the primary board, matching llama.cpp's whole-layer
-                    ! placement while avoiding an avoidable PCIe boundary.
-                    if (q4_attention_tensor_mixed(self, i)) q4_device = 0
+                    ! Mixed Q4/Q8 attention blocks stay on the primary side:
+                    ! the native attention kernel owns the Q8 projections and
+                    ! a split mixed block would otherwise require an extra
+                    ! QKV transfer.  Fully-Q4 blocks below follow the layer
+                    ! split, matching llama.cpp's scheduler locality.
+                    if (self%max_context <= 32768_int64 .and. q4_attention_tensor_mixed(self, i)) q4_device = 0
+                    ! At short context the primary-side Q8 attention path
+                    ! also owns fully-Q4 attention state.  Keep its Q/K/V
+                    ! projections local so every token avoids a host bridge;
+                    ! long-context placement follows the requested split.
+                    if (self%max_context <= 32768_int64 .and. q4_layer_number > 0 .and. &
+                        q4_layer_number <= size(self%layers) .and. .not. self%layers(q4_layer_number)%recurrent) &
+                        q4_device = 0
+                    ! Short decode contexts have no KV pressure; keeping the
+                    ! recurrent Q4 projections beside the native GDN state
+                    ! removes a bridge on every recurrent layer.  At the
+                    ! production context length the normal layer split is
+                    ! retained to leave room for the distributed KV cache.
+                    if (self%max_context <= 32768_int64 .and. q4_recurrent_projection_tensor(self, i)) q4_device = 0
                 else if (layer_split_mode .and. q4_split .and. i == self%output) then
                     q4_layer_position = real(self%layer_count, real64) / &
                         real(q4_split_layer_count, real64)
@@ -990,6 +1036,28 @@ contains
             ! GGML's Q4 scheduler runs on a separate stream.  Attach the
             ! native Q8 stream so the bridge can hand results across with a
             ! CUDA event instead of synchronizing the whole device.
+            if (cuda_q4_unified_graph_requested() .or. cuda_q4_segment_graph_requested()) then
+                ! In unified mode native Q8 work adopts GGML's scheduler
+                ! stream.  This lets the outer resident graph contain both
+                ! native kernels and direct GGML quantized launches.
+                q4_stream = self%cuda_q4%stream(0)
+                call self%cuda%adopt_stream(q4_stream, stat)
+                if (.not. stat%is_ok()) then
+                    call self%cuda_q4%destroy(cleanup_stat)
+                    call self%cuda%destroy(cleanup_stat)
+                    return
+                end if
+                if (c_associated(self%cuda_second%handle)) then
+                    q4_stream = self%cuda_q4%stream(1)
+                    call self%cuda_second%adopt_stream(q4_stream, stat)
+                    if (.not. stat%is_ok()) then
+                        call self%cuda_q4%destroy(cleanup_stat)
+                        call self%cuda_second%destroy(cleanup_stat)
+                        call self%cuda%destroy(cleanup_stat)
+                        return
+                    end if
+                end if
+            end if
             call self%cuda_q4%set_consumer_stream(0, self%cuda%stream(), stat)
             if (.not. stat%is_ok()) then
                 do j = 1, size(self%cuda_q4_weights)
@@ -1206,20 +1274,26 @@ contains
     subroutine setup_cuda_device_pipeline(self, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         type(status_t), intent(out) :: stat
-        integer :: i, graph_length, pipeline_length, q4_pipeline_length, q4_disable_length
+        integer :: i, graph_length, pipeline_length, q4_pipeline_length, q4_disable_length, batch_capacity
         integer(c_size_t) :: hidden_bytes, ffn_bytes, qkv_bytes, query_bytes, key_bytes, value_bytes
         integer(c_size_t) :: core_bytes
+        integer(c_size_t) :: max_matvec_elements
         character(len=8) :: graph_env
         character(len=8) :: pipeline_env
         character(len=8) :: q4_pipeline_env, q4_disable_env
         integer :: device_layer_count
         logical :: all_device_layers
         logical, allocatable :: device_layer(:)
+        type(status_t) :: cleanup_stat
 
         call stat%clear()
         self%cuda_device_pipeline = .false.
         self%cuda_graph_enabled = .false.
         self%cuda_graph_ready = .false.
+        self%cuda_segment_graph_enabled = .false.
+        self%cuda_segment_graph_ready = .false.
+        self%cuda_segment_graph_warmup = .false.
+        self%cuda_segment_graph_end = 0
         device_layer_count = 0
         all_device_layers = .true.
         ! Q8_0 K/V caches are now first-class CUDA-resident storage.  The
@@ -1383,6 +1457,46 @@ contains
         call self%cuda%allocate_buffer(int(size(self%logits) * storage_size(self%logits(1)) / 8, c_size_t), &
             self%cuda_logits, stat)
         if (.not. stat%is_ok()) return
+        ! The output tensor is normally the largest remote Q4 projection.  A
+        ! small remote logits buffer lets greedy argmax run where that
+        ! projection already ran, avoiding a full-vocabulary device-to-device
+        ! copy for every generated token.
+        if (self%cuda_q4_resident .and. self%cuda_q4_split .and. &
+            c_associated(self%cuda_second%handle) .and. is_q4_xl_type(self%file%tensors(self%output)%value_type) .and. &
+            cuda_q4_on_second(self, self%output)) then
+            call self%cuda_second%allocate_buffer(int(size(self%logits) * storage_size(self%logits(1)) / 8, c_size_t), &
+                self%cuda_logits_second, stat)
+            if (.not. stat%is_ok()) return
+        end if
+        ! Reserve the largest Q8 activation before any optional CUDA graph
+        ! capture.  Graph replay cannot perform a cudaFree/cudaMalloc resize;
+        ! doing this once during model setup keeps the first post-prompt
+        ! scalar decode valid even when the prompt ended in a microbatch.
+        max_matvec_elements = int(size(self%x), c_size_t)
+        do i = 1, size(self%file%tensors)
+            if (self%file%tensors(i)%value_type /= GGML_TYPE_Q8_0) cycle
+            if (.not. allocated(self%file%tensors(i)%shape)) cycle
+            if (size(self%file%tensors(i)%shape) /= 2) cycle
+            max_matvec_elements = max(max_matvec_elements, int(self%file%tensors(i)%shape(1), c_size_t))
+        end do
+        call cuda_q8_reserve_matvec_scratch(self%cuda, max_matvec_elements, &
+            int(size(self%logits), c_size_t), stat)
+        if (.not. stat%is_ok()) return
+        batch_capacity = configured_batch_capacity()
+        if (batch_capacity > 1) then
+            call allocate_cuda_batch_workspace(self, batch_capacity, stat)
+            if (.not. stat%is_ok()) then
+                ! Prompt batching is an optional acceleration.  Keep scalar
+                ! CUDA decode available when a constrained card cannot spare
+                ! the bounded workspace.
+                write(error_unit, '(a,i0,2a)') 'FortAI batch workspace failed capacity=', batch_capacity, ': ', &
+                    trim(stat%message)
+                call cuda_batch_workspace_cleanup(self, cleanup_stat)
+                call stat%clear()
+                self%cuda_batch_capacity = 0
+                self%cuda_batch_enabled = .false.
+            end if
+        end if
         do i = 1, size(self%layers)
             if (.not. device_layer(i)) cycle
             call self%cuda%allocate_buffer(hidden_bytes, self%cuda_attn_norm(i), stat)
@@ -1407,10 +1521,31 @@ contains
             if (.not. stat%is_ok()) return
         end if
         self%cuda_device_pipeline = .true.
-        ! GGML Q4 operations use their own CUDA scheduler stream.  Keep the
-        ! resident mixed-quant pipeline deterministic; a graph capture of the
-        ! Q8 stream cannot capture work submitted to that second scheduler.
-        if (self%cuda_q4_resident) self%cuda_graph_enabled = .false.
+        ! A split-Q4 request still crosses the two cards through bridge
+        ! streams.  CUDA graph capture cannot legally join those pre-existing
+        ! bridge events (cudaErrorStreamCaptureUnjoined), even when the Q8
+        ! and Q4 scheduler streams are unified.  Keep the graph opt-in for
+        ! single-device Q4, but force the split path onto the deterministic
+        ! stream/event schedule; the unified-stream option still removes the
+        ! redundant Q8<->Q4 hand-off without risking a mid-generation abort.
+        if (self%cuda_q4_resident) then
+            if (self%cuda_q4_split .or. .not. cuda_q4_unified_graph_requested()) &
+                self%cuda_graph_enabled = .false.
+        end if
+        if (self%cuda_q4_split .and. cuda_q4_segment_graph_requested()) then
+            self%cuda_segment_graph_end = cuda_primary_segment_end(self)
+            self%cuda_segment_graph_enabled = self%cuda_segment_graph_end > 0
+            if (self%cuda_segment_graph_end > 0) then
+                write(error_unit, '(a,i0)') 'fortai-native: CUDA segment graph prefix layers=', &
+                    self%cuda_segment_graph_end
+            end if
+            ! A segment graph and GGML's per-plan graphs cannot coexist on
+            ! one stream.  The Q4 backend therefore runs its graph nodes
+            ! directly while this feature is active.
+            if (.not. self%cuda_segment_graph_enabled) then
+                self%cuda_segment_graph_end = 0
+            end if
+        end if
         call release_host_attention_caches(self)
         ! Device-resident base weights no longer need physical host pages.
         ! Keep the token embedding because Q4 get-rows remains on the
@@ -1418,11 +1553,203 @@ contains
         call self%file%evict_mapped_payloads(self%token_embedding)
     end subroutine setup_cuda_device_pipeline
 
-    subroutine release_host_attention_caches(self)
-        class(qwen35_cpu_model_t), intent(inout) :: self
+    logical function cuda_q4_unified_graph_requested()
+        character(len=16) :: value
+        integer :: length
+
+        cuda_q4_unified_graph_requested = .false.
+        value = ''
+        call get_environment_variable('FORTAI_ENABLE_CUDA_Q4_UNIFIED_GRAPH', value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        select case (trim(value(:length)))
+        case ('1', 'true', 'on', 'yes')
+            cuda_q4_unified_graph_requested = .true.
+        end select
+    end function cuda_q4_unified_graph_requested
+
+    logical function cuda_q4_segment_graph_requested()
+        character(len=16) :: value
+        integer :: length
+
+        cuda_q4_segment_graph_requested = .false.
+        value = ''
+        call get_environment_variable('FORTAI_ENABLE_CUDA_Q4_SEGMENT_GRAPH', value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        select case (trim(value(:length)))
+        case ('1', 'true', 'on', 'yes')
+            cuda_q4_segment_graph_requested = .true.
+        end select
+    end function cuda_q4_segment_graph_requested
+
+    logical function cuda_layer_primary_device(self, layer_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: layer_index
+        integer :: indices(20), i, tensor_index
+
+        cuda_layer_primary_device = .false.
+        if (.not. allocated(self%layers)) return
+        if (layer_index <= 0 .or. layer_index > size(self%layers)) return
+        if (cuda_attention_on_second(self, layer_index)) return
+        indices = [self%layers(layer_index)%attn_norm, self%layers(layer_index)%post_norm, &
+            self%layers(layer_index)%ffn_gate, self%layers(layer_index)%ffn_up, &
+            self%layers(layer_index)%ffn_down, self%layers(layer_index)%attn_qkv, &
+            self%layers(layer_index)%attn_gate, self%layers(layer_index)%attn_q, &
+            self%layers(layer_index)%attn_k, self%layers(layer_index)%attn_v, &
+            self%layers(layer_index)%attn_out, self%layers(layer_index)%q_norm, &
+            self%layers(layer_index)%k_norm, self%layers(layer_index)%ssm_a, &
+            self%layers(layer_index)%ssm_alpha, self%layers(layer_index)%ssm_beta, &
+            self%layers(layer_index)%ssm_conv, self%layers(layer_index)%ssm_dt, &
+            self%layers(layer_index)%ssm_norm, self%layers(layer_index)%ssm_out]
+        do i = 1, size(indices)
+            tensor_index = indices(i)
+            if (tensor_index <= 0 .or. tensor_index > size(self%file%tensors)) cycle
+            if (is_q4_xl_type(self%file%tensors(tensor_index)%value_type)) then
+                if (cuda_q4_on_second(self, tensor_index)) return
+            else if (self%file%tensors(tensor_index)%value_type == GGML_TYPE_Q8_0) then
+                if (cuda_q8_on_second(self, tensor_index)) return
+            end if
+        end do
+        cuda_layer_primary_device = .true.
+    end function cuda_layer_primary_device
+
+    integer function cuda_primary_segment_end(self)
+        class(qwen35_cpu_model_t), intent(in) :: self
         integer :: i
 
+        cuda_primary_segment_end = 0
         if (.not. allocated(self%layers)) return
+        do i = 1, size(self%layers)
+            if (.not. cuda_layer_primary_device(self, i)) exit
+            ! A segment graph may only contain layers whose complete native
+            ! implementation is resident and initialized.  Keep explicit
+            ! device-layer limits and diagnostic fallbacks outside capture.
+            if (.not. cuda_layer_device_ready(self, i)) exit
+            cuda_primary_segment_end = i
+        end do
+    end function cuda_primary_segment_end
+
+    integer function configured_batch_capacity()
+        character(len=32) :: value
+        integer :: length, ios, parsed
+
+        configured_batch_capacity = 256
+        value = ''
+        call get_environment_variable('FORTAI_UBATCH', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMA_ARG_UBATCH', value, length=length)
+        if (length <= 0) call get_environment_variable('LLAMACPP_UBATCH', value, length=length)
+        if (length <= 0 .or. length > len(value)) return
+        read(value(:length), *, iostat=ios) parsed
+        if (ios == 0 .and. parsed >= 2) configured_batch_capacity = min(parsed, 512)
+    end function configured_batch_capacity
+
+    subroutine allocate_cuda_batch_workspace(self, capacity, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: capacity
+        type(status_t), intent(out) :: stat
+        integer(c_size_t) :: hidden_bytes, ffn_bytes, qkv_bytes, query_bytes, key_bytes, value_bytes, core_bytes
+        integer(c_size_t) :: hidden_batch_bytes, ffn_batch_bytes, qkv_batch_bytes, query_batch_bytes
+        integer(c_size_t) :: key_batch_bytes, value_batch_bytes, core_batch_bytes
+
+        call stat%clear()
+        if (capacity <= 1) return
+        hidden_bytes = int(size(self%x) * storage_size(self%x(1)) / 8, c_size_t)
+        ffn_bytes = int(self%feed_forward_size * storage_size(self%x(1)) / 8, c_size_t)
+        qkv_bytes = int(max(self%recurrent_conv_size, 2 * self%attention_heads * self%attention_head_size) * &
+            storage_size(self%x(1)) / 8, c_size_t)
+        query_bytes = int(2 * self%attention_heads * self%attention_head_size * storage_size(self%x(1)) / 8, c_size_t)
+        key_bytes = int(self%attention_heads_kv * self%attention_head_size * storage_size(self%x(1)) / 8, c_size_t)
+        value_bytes = int(self%attention_heads_kv * self%value_length * storage_size(self%x(1)) / 8, c_size_t)
+        core_bytes = int(max(self%recurrent_inner_size, self%attention_heads * self%value_length) * &
+            storage_size(self%x(1)) / 8, c_size_t)
+        hidden_batch_bytes = hidden_bytes * int(capacity, c_size_t)
+        ffn_batch_bytes = ffn_bytes * int(capacity, c_size_t)
+        qkv_batch_bytes = qkv_bytes * int(capacity, c_size_t)
+        query_batch_bytes = query_bytes * int(capacity, c_size_t)
+        key_batch_bytes = key_bytes * int(capacity, c_size_t)
+        value_batch_bytes = value_bytes * int(capacity, c_size_t)
+        core_batch_bytes = core_bytes * int(capacity, c_size_t)
+        call self%cuda%allocate_buffer(hidden_batch_bytes, self%cuda_batch_x, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(hidden_batch_bytes, self%cuda_batch_residual, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(hidden_batch_bytes, self%cuda_batch_normalized, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(hidden_batch_bytes, self%cuda_batch_hidden, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(qkv_batch_bytes, self%cuda_batch_qkv, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(ffn_batch_bytes, self%cuda_batch_gate, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(int(self%recurrent_value_heads * capacity * &
+            storage_size(self%x(1)) / 8, c_size_t), self%cuda_batch_alpha, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(int(self%recurrent_value_heads * capacity * &
+            storage_size(self%x(1)) / 8, c_size_t), self%cuda_batch_beta, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(ffn_batch_bytes, self%cuda_batch_ffn_gate, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(ffn_batch_bytes, self%cuda_batch_ffn_up, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(query_batch_bytes, self%cuda_batch_q, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(key_batch_bytes, self%cuda_batch_k, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(value_batch_bytes, self%cuda_batch_v, stat)
+        if (.not. stat%is_ok()) return
+        call self%cuda%allocate_buffer(core_batch_bytes, self%cuda_batch_attention, stat)
+        if (.not. stat%is_ok()) return
+        self%cuda_batch_capacity = capacity
+        self%cuda_batch_enabled = .true.
+    end subroutine allocate_cuda_batch_workspace
+
+    subroutine cuda_batch_workspace_cleanup(self, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        type(status_t), intent(out) :: stat
+
+        call stat%clear()
+        if (c_associated(self%cuda_batch_x)) call self%cuda%free_buffer(self%cuda_batch_x, stat)
+        if (c_associated(self%cuda_batch_residual)) call self%cuda%free_buffer(self%cuda_batch_residual, stat)
+        if (c_associated(self%cuda_batch_normalized)) call self%cuda%free_buffer(self%cuda_batch_normalized, stat)
+        if (c_associated(self%cuda_batch_hidden)) call self%cuda%free_buffer(self%cuda_batch_hidden, stat)
+        if (c_associated(self%cuda_batch_qkv)) call self%cuda%free_buffer(self%cuda_batch_qkv, stat)
+        if (c_associated(self%cuda_batch_gate)) call self%cuda%free_buffer(self%cuda_batch_gate, stat)
+        if (c_associated(self%cuda_batch_alpha)) call self%cuda%free_buffer(self%cuda_batch_alpha, stat)
+        if (c_associated(self%cuda_batch_beta)) call self%cuda%free_buffer(self%cuda_batch_beta, stat)
+        if (c_associated(self%cuda_batch_ffn_gate)) call self%cuda%free_buffer(self%cuda_batch_ffn_gate, stat)
+        if (c_associated(self%cuda_batch_ffn_up)) call self%cuda%free_buffer(self%cuda_batch_ffn_up, stat)
+        if (c_associated(self%cuda_batch_q)) call self%cuda%free_buffer(self%cuda_batch_q, stat)
+        if (c_associated(self%cuda_batch_k)) call self%cuda%free_buffer(self%cuda_batch_k, stat)
+        if (c_associated(self%cuda_batch_v)) call self%cuda%free_buffer(self%cuda_batch_v, stat)
+        if (c_associated(self%cuda_batch_attention)) call self%cuda%free_buffer(self%cuda_batch_attention, stat)
+        self%cuda_batch_x = c_null_ptr
+        self%cuda_batch_residual = c_null_ptr
+        self%cuda_batch_normalized = c_null_ptr
+        self%cuda_batch_hidden = c_null_ptr
+        self%cuda_batch_qkv = c_null_ptr
+        self%cuda_batch_gate = c_null_ptr
+        self%cuda_batch_alpha = c_null_ptr
+        self%cuda_batch_beta = c_null_ptr
+        self%cuda_batch_ffn_gate = c_null_ptr
+        self%cuda_batch_ffn_up = c_null_ptr
+        self%cuda_batch_q = c_null_ptr
+        self%cuda_batch_k = c_null_ptr
+        self%cuda_batch_v = c_null_ptr
+        self%cuda_batch_attention = c_null_ptr
+        self%cuda_batch_capacity = 0
+        self%cuda_batch_enabled = .false.
+    end subroutine cuda_batch_workspace_cleanup
+
+    subroutine release_host_attention_caches(self)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer :: i, limit_length
+        character(len=16) :: limit_value
+
+        if (.not. allocated(self%layers)) return
+        ! Keep host caches available for the layer-by-layer CUDA diagnostic
+        ! (the normal resident path still evicts them to save RAM).
+        limit_value = ''
+        call get_environment_variable('FORTAI_CUDA_DEVICE_LAYER_LIMIT', limit_value, length=limit_length)
+        if (limit_length > 0) return
         do i = 1, size(self%layers)
             if (self%layers(i)%recurrent) cycle
             if (.not. cuda_layer_kernel_ready(self, i)) cycle
@@ -1445,6 +1772,11 @@ contains
         call stat%clear()
         self%cuda_device_pipeline = .false.
         self%cuda_graph_ready = .false.
+        self%cuda_segment_graph_enabled = .false.
+        self%cuda_segment_graph_ready = .false.
+        self%cuda_segment_graph_warmup = .false.
+        self%cuda_segment_graph_end = 0
+        call cuda_batch_workspace_cleanup(self, stat)
         if (allocated(self%cuda_attn_norm)) then
             do i = 1, size(self%cuda_attn_norm)
                 if (.not. c_associated(self%cuda_attn_norm(i))) cycle
@@ -1497,6 +1829,9 @@ contains
         self%cuda_ffn_up_device_second = c_null_ptr
         if (c_associated(self%cuda_output_norm)) call self%cuda%free_buffer(self%cuda_output_norm, stat)
         if (c_associated(self%cuda_logits)) call self%cuda%free_buffer(self%cuda_logits, stat)
+        if (c_associated(self%cuda_logits_second)) call self%cuda_second%free_buffer(self%cuda_logits_second, stat)
+        self%cuda_logits = c_null_ptr
+        self%cuda_logits_second = c_null_ptr
     end subroutine cuda_device_pipeline_cleanup
 
     subroutine qwen35_cpu_close(self)
@@ -1698,6 +2033,306 @@ contains
         end if
     end subroutine qwen35_cpu_forward
 
+    logical function qwen35_cpu_batch_supported(self, count)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: count
+        integer :: i
+
+        qwen35_cpu_batch_supported = .false.
+        if (count <= 1 .or. count > self%cuda_batch_capacity) return
+        if (.not. self%cuda_batch_enabled .or. .not. self%cuda_device_pipeline) return
+        if (.not. c_associated(self%cuda_batch_x)) return
+        if (.not. c_associated(self%cuda_batch_attention)) return
+        if (.not. allocated(self%layers)) return
+        if (.not. batch_q8_tensor_ready(self, self%token_embedding) .and. &
+            .not. batch_q4_tensor_ready(self, self%token_embedding)) return
+        do i = 1, self%layer_count
+            if (.not. cuda_layer_device_ready(self, i)) return
+            ! A batched matrix has one owning CUDA stream.  A layer whose
+            ! long-context KV state lives on the second board must use the
+            ! established scalar bridge until a two-device batch plan exists.
+            if (cuda_attention_on_second(self, i)) return
+            if (.not. batch_projection_set_supported(self, [self%layers(i)%ffn_gate, &
+                self%layers(i)%ffn_up, self%layers(i)%ffn_down])) return
+            if (self%layers(i)%recurrent) then
+                if (.not. batch_projection_set_supported(self, [self%layers(i)%attn_qkv, &
+                    self%layers(i)%attn_gate, self%layers(i)%ssm_alpha, self%layers(i)%ssm_beta, &
+                    self%layers(i)%ssm_out])) return
+            else
+                if (.not. batch_projection_set_supported(self, [self%layers(i)%attn_q, &
+                    self%layers(i)%attn_k, self%layers(i)%attn_v, self%layers(i)%attn_out])) return
+            end if
+        end do
+        qwen35_cpu_batch_supported = .true.
+    end function qwen35_cpu_batch_supported
+
+    logical function batch_projection_set_supported(self, indices)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: indices(:)
+        integer :: i
+        logical :: all_q8, all_q4
+
+        batch_projection_set_supported = .false.
+        all_q8 = .true.
+        all_q4 = .true.
+        do i = 1, size(indices)
+            if (.not. batch_q8_tensor_ready(self, indices(i))) all_q8 = .false.
+            if (.not. batch_q4_tensor_ready(self, indices(i))) all_q4 = .false.
+        end do
+        batch_projection_set_supported = all_q8 .or. all_q4
+    end function batch_projection_set_supported
+
+    logical function batch_q8_tensor_ready(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+
+        batch_q8_tensor_ready = .false.
+        if (tensor_index <= 0 .or. .not. allocated(self%file%tensors)) return
+        if (tensor_index > size(self%file%tensors) .or. .not. allocated(self%cuda_weights)) return
+        if (tensor_index > size(self%cuda_weights)) return
+        batch_q8_tensor_ready = self%file%tensors(tensor_index)%value_type == GGML_TYPE_Q8_0 .and. &
+            c_associated(self%cuda_weights(tensor_index)%handle)
+    end function batch_q8_tensor_ready
+
+    logical function batch_q4_tensor_ready(self, tensor_index)
+        class(qwen35_cpu_model_t), intent(in) :: self
+        integer, intent(in) :: tensor_index
+
+        batch_q4_tensor_ready = .false.
+        if (tensor_index <= 0 .or. .not. allocated(self%file%tensors)) return
+        if (tensor_index > size(self%file%tensors) .or. .not. self%cuda_q4_resident) return
+        if (.not. allocated(self%cuda_q4_weights) .or. tensor_index > size(self%cuda_q4_weights)) return
+        if (self%file%tensors(tensor_index)%value_type /= GGML_TYPE_Q3_K .and. &
+            self%file%tensors(tensor_index)%value_type /= GGML_TYPE_Q4_K .and. &
+            self%file%tensors(tensor_index)%value_type /= GGML_TYPE_Q5_K .and. &
+            self%file%tensors(tensor_index)%value_type /= GGML_TYPE_Q6_K .and. &
+            self%file%tensors(tensor_index)%value_type /= GGML_TYPE_IQ4_NL .and. &
+            self%file%tensors(tensor_index)%value_type /= GGML_TYPE_IQ3_S .and. &
+            self%file%tensors(tensor_index)%value_type /= GGML_TYPE_IQ4_XS) return
+        if (tensor_index > size(self%cuda_q4_weight_device)) return
+        ! The placement array stores one-based CUDA device slots (primary=1,
+        ! secondary=2); batched work is owned by the primary stream.
+        if (self%cuda_q4_weight_device(tensor_index) /= 1) return
+        batch_q4_tensor_ready = c_associated(self%cuda_q4_weights(tensor_index)%handle)
+    end function batch_q4_tensor_ready
+
+    subroutine qwen35_cpu_forward_batch(self, token_ids, position_start, logits, stat, compute_logits)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(int64), contiguous, intent(in) :: token_ids(:)
+        integer(int64), intent(in) :: position_start
+        real(real32), contiguous, intent(out) :: logits(:)
+        type(status_t), intent(out) :: stat
+        logical, intent(in), optional :: compute_logits
+        integer(c_int32_t), allocatable, target :: token_ids_c(:)
+        integer :: batch, i
+        integer(c_size_t) :: hidden_elements, hidden_bytes, ffn_elements, qkv_elements
+        integer(c_size_t) :: query_elements, key_elements, value_elements, core_elements, matrix_elements
+        logical :: should_compute_logits
+
+        call stat%clear()
+        should_compute_logits = .true.
+        if (present(compute_logits)) should_compute_logits = compute_logits
+        batch = size(token_ids)
+        if (.not. self%batch_supported(batch)) then
+            call stat%set(FORTAI_UNSUPPORTED, 'Qwen3.5 CUDA prompt batch is unavailable for this layout')
+            return
+        end if
+        if (size(logits) /= self%vocabulary_size .or. position_start < 0_int64 .or. &
+            position_start + int(batch, int64) > self%max_context) then
+            call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA prompt batch dimensions are invalid')
+            return
+        end if
+        allocate(token_ids_c(batch))
+        do i = 1, batch
+            if (token_ids(i) < 0_int64 .or. token_ids(i) >= self%vocabulary_size) then
+                call stat%set(FORTAI_INVALID, 'Qwen3.5 prompt batch token is outside the vocabulary')
+                return
+            end if
+            token_ids_c(i) = int(token_ids(i), c_int32_t)
+        end do
+        hidden_elements = int(size(self%x), c_size_t)
+        hidden_bytes = hidden_elements * int(storage_size(self%x(1)) / 8, c_size_t)
+        ffn_elements = int(self%feed_forward_size, c_size_t)
+        qkv_elements = int(self%recurrent_conv_size, c_size_t)
+        query_elements = int(2 * self%attention_heads * self%attention_head_size, c_size_t)
+        key_elements = int(self%attention_heads_kv * self%attention_head_size, c_size_t)
+        value_elements = int(self%attention_heads_kv * self%value_length, c_size_t)
+        core_elements = int(self%attention_heads * self%value_length, c_size_t)
+        matrix_elements = hidden_elements * int(batch, c_size_t)
+        if (batch_q8_tensor_ready(self, self%token_embedding)) then
+            call cuda_qwen35_embedding_device_batch(self%cuda, self%cuda_weights(self%token_embedding), token_ids_c, &
+                batch, self%cuda_batch_x, matrix_elements, stat)
+        else if (batch_q4_tensor_ready(self, self%token_embedding)) then
+            call cuda_q4_embedding_device_batch(self%cuda_q4, self%cuda_q4_weights(self%token_embedding), token_ids_c, &
+                batch, self%cuda_batch_x, matrix_elements, stat)
+        else
+            call stat%set(FORTAI_UNSUPPORTED, 'Qwen3.5 CUDA prompt batch embedding is not device resident')
+            return
+        end if
+        if (.not. stat%is_ok()) return
+        do i = 1, self%layer_count
+            call cuda_qwen35_copy_device(self%cuda, self%cuda_batch_x, self%cuda_batch_residual, &
+                hidden_bytes * int(batch, c_size_t), stat)
+            if (.not. stat%is_ok()) return
+            call cuda_qwen35_rms_norm_matrix_device(self%cuda, self%cuda_batch_x, self%cuda_attn_norm(i), &
+                self%cuda_batch_normalized, hidden_elements, batch, self%norm_epsilon, stat)
+            if (.not. stat%is_ok()) return
+            if (self%layers(i)%recurrent) then
+                call batch_project_pair(self, self%layers(i)%attn_qkv, self%layers(i)%attn_gate, &
+                    self%cuda_batch_normalized, hidden_elements, batch, self%cuda_batch_qkv, qkv_elements, &
+                    self%cuda_batch_gate, int(self%recurrent_inner_size, c_size_t), stat)
+                if (.not. stat%is_ok()) return
+                call batch_project_pair(self, self%layers(i)%ssm_alpha, self%layers(i)%ssm_beta, &
+                    self%cuda_batch_normalized, hidden_elements, batch, self%cuda_batch_alpha, &
+                    int(self%recurrent_value_heads, c_size_t), self%cuda_batch_beta, &
+                    int(self%recurrent_value_heads, c_size_t), stat)
+                if (.not. stat%is_ok()) return
+                call self%layers(i)%cuda_recurrent%run_core_device_batch(self%cuda_batch_qkv, &
+                    qkv_elements * int(batch, c_size_t), self%cuda_batch_gate, &
+                    int(self%recurrent_inner_size, c_size_t) * int(batch, c_size_t), self%cuda_batch_alpha, &
+                    int(self%recurrent_value_heads, c_size_t) * int(batch, c_size_t), self%cuda_batch_beta, &
+                    int(self%recurrent_value_heads, c_size_t) * int(batch, c_size_t), batch, &
+                    self%cuda_batch_attention, int(self%recurrent_inner_size, c_size_t) * int(batch, c_size_t), stat)
+                if (.not. stat%is_ok()) return
+                call batch_project_one(self, self%layers(i)%ssm_out, self%cuda_batch_attention, &
+                    int(self%recurrent_inner_size, c_size_t), batch, self%cuda_batch_hidden, hidden_elements, stat)
+            else
+                call batch_project_triplet(self, self%layers(i)%attn_q, self%layers(i)%attn_k, &
+                    self%layers(i)%attn_v, self%cuda_batch_normalized, hidden_elements, batch, self%cuda_batch_q, &
+                    query_elements, self%cuda_batch_k, key_elements, self%cuda_batch_v, value_elements, stat)
+                if (.not. stat%is_ok()) return
+                call self%layers(i)%cuda_attention%run_core_device_batch(self%cuda_batch_q, &
+                    query_elements * int(batch, c_size_t), self%cuda_batch_k, key_elements * int(batch, c_size_t), &
+                    self%cuda_batch_v, value_elements * int(batch, c_size_t), int(position_start), batch, &
+                    self%cuda_batch_attention, core_elements * int(batch, c_size_t), stat)
+                if (.not. stat%is_ok()) return
+                call batch_project_one(self, self%layers(i)%attn_out, self%cuda_batch_attention, core_elements, batch, &
+                    self%cuda_batch_hidden, hidden_elements, stat)
+            end if
+            if (.not. stat%is_ok()) return
+            call cuda_qwen35_add_matrix_device(self%cuda, self%cuda_batch_hidden, self%cuda_batch_residual, &
+                self%cuda_batch_x, matrix_elements, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_qwen35_copy_device(self%cuda, self%cuda_batch_x, self%cuda_batch_residual, &
+                hidden_bytes * int(batch, c_size_t), stat)
+            if (.not. stat%is_ok()) return
+            call cuda_qwen35_rms_norm_matrix_device(self%cuda, self%cuda_batch_x, self%cuda_post_norm(i), &
+                self%cuda_batch_normalized, hidden_elements, batch, self%norm_epsilon, stat)
+            if (.not. stat%is_ok()) return
+            call batch_project_pair(self, self%layers(i)%ffn_gate, self%layers(i)%ffn_up, self%cuda_batch_normalized, &
+                hidden_elements, batch, self%cuda_batch_ffn_gate, ffn_elements, self%cuda_batch_ffn_up, ffn_elements, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_qwen35_silu_product_matrix_device(self%cuda, self%cuda_batch_ffn_gate, self%cuda_batch_ffn_up, &
+                ffn_elements * int(batch, c_size_t), stat)
+            if (.not. stat%is_ok()) return
+            call batch_project_one(self, self%layers(i)%ffn_down, self%cuda_batch_ffn_gate, ffn_elements, batch, &
+                self%cuda_batch_hidden, hidden_elements, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_qwen35_add_matrix_device(self%cuda, self%cuda_batch_hidden, self%cuda_batch_residual, &
+                self%cuda_batch_x, matrix_elements, stat)
+            if (.not. stat%is_ok()) return
+        end do
+        if (should_compute_logits) then
+            call cuda_qwen35_copy_column_device(self%cuda, self%cuda_batch_x, hidden_elements, batch - 1, &
+                self%cuda_x, hidden_elements, stat)
+            if (.not. stat%is_ok()) return
+            call forward_output_device(self, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%download_real(self%cuda_logits, logits, stat)
+            if (.not. stat%is_ok()) return
+        end if
+        if (self%mtp_active) then
+            call cuda_qwen35_copy_column_device(self%cuda, self%cuda_batch_x, hidden_elements, batch - 1, &
+                self%cuda_x, hidden_elements, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%download_real(self%cuda_x, self%x, stat)
+            if (.not. stat%is_ok()) return
+            self%mtp_pending_hidden = self%x
+            self%mtp_last_target_position = position_start + int(batch, int64) - 1_int64
+        end if
+    end subroutine qwen35_cpu_forward_batch
+
+    subroutine batch_project_one(self, tensor_index, activation, activation_width, batch, output, output_width, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: tensor_index, batch
+        type(c_ptr), intent(in) :: activation, output
+        integer(c_size_t), intent(in) :: activation_width, output_width
+        type(status_t), intent(out) :: stat
+
+        call stat%clear()
+        if (batch_q8_tensor_ready(self, tensor_index)) then
+            call cuda_q8_matmul_device_f32(self%cuda, self%cuda_weights(tensor_index), activation, &
+                activation_width * int(batch, c_size_t), batch, output, output_width * int(batch, c_size_t), stat)
+        else if (batch_q4_tensor_ready(self, tensor_index)) then
+            call cuda_q4_matmul_device_one(self%cuda_q4, self%cuda_q4_weights(tensor_index), activation, &
+                activation_width * int(batch, c_size_t), batch, output, output_width * int(batch, c_size_t), stat)
+        else
+            call stat%set(FORTAI_UNSUPPORTED, 'unsupported batched projection tensor')
+        end if
+    end subroutine batch_project_one
+
+    subroutine batch_project_pair(self, first_index, second_index, activation, activation_width, batch, &
+            first_output, first_width, second_output, second_width, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: first_index, second_index, batch
+        type(c_ptr), intent(in) :: activation, first_output, second_output
+        integer(c_size_t), intent(in) :: activation_width, first_width, second_width
+        type(status_t), intent(out) :: stat
+        integer(c_size_t) :: activation_total, first_total, second_total
+
+        call stat%clear()
+        activation_total = activation_width * int(batch, c_size_t)
+        first_total = first_width * int(batch, c_size_t)
+        second_total = second_width * int(batch, c_size_t)
+        if (batch_q8_tensor_ready(self, first_index) .and. batch_q8_tensor_ready(self, second_index)) then
+            call cuda_q8_matmul_device_f32(self%cuda, self%cuda_weights(first_index), activation, activation_total, &
+                batch, first_output, first_total, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_q8_matmul_device_f32(self%cuda, self%cuda_weights(second_index), activation, activation_total, &
+                batch, second_output, second_total, stat)
+        else if (batch_q4_tensor_ready(self, first_index) .and. batch_q4_tensor_ready(self, second_index)) then
+            call cuda_q4_matmul_device_pair(self%cuda_q4, self%cuda_q4_weights(first_index), &
+                self%cuda_q4_weights(second_index), activation, activation_total, batch, first_output, first_total, &
+                second_output, second_total, stat)
+        else
+            call stat%set(FORTAI_UNSUPPORTED, 'batched projection pair quantization mismatch')
+        end if
+    end subroutine batch_project_pair
+
+    subroutine batch_project_triplet(self, first_index, second_index, third_index, activation, activation_width, batch, &
+            first_output, first_width, second_output, second_width, third_output, third_width, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: first_index, second_index, third_index, batch
+        type(c_ptr), intent(in) :: activation, first_output, second_output, third_output
+        integer(c_size_t), intent(in) :: activation_width, first_width, second_width, third_width
+        type(status_t), intent(out) :: stat
+        integer(c_size_t) :: activation_total, first_total, second_total, third_total
+
+        call stat%clear()
+        activation_total = activation_width * int(batch, c_size_t)
+        first_total = first_width * int(batch, c_size_t)
+        second_total = second_width * int(batch, c_size_t)
+        third_total = third_width * int(batch, c_size_t)
+        if (batch_q8_tensor_ready(self, first_index) .and. batch_q8_tensor_ready(self, second_index) .and. &
+            batch_q8_tensor_ready(self, third_index)) then
+            call cuda_q8_matmul_device_f32(self%cuda, self%cuda_weights(first_index), activation, activation_total, &
+                batch, first_output, first_total, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_q8_matmul_device_f32(self%cuda, self%cuda_weights(second_index), activation, activation_total, &
+                batch, second_output, second_total, stat)
+            if (.not. stat%is_ok()) return
+            call cuda_q8_matmul_device_f32(self%cuda, self%cuda_weights(third_index), activation, activation_total, &
+                batch, third_output, third_total, stat)
+        else if (batch_q4_tensor_ready(self, first_index) .and. batch_q4_tensor_ready(self, second_index) .and. &
+                batch_q4_tensor_ready(self, third_index)) then
+            call cuda_q4_matmul_device_triplet(self%cuda_q4, self%cuda_q4_weights(first_index), &
+                self%cuda_q4_weights(second_index), self%cuda_q4_weights(third_index), activation, activation_total, &
+                batch, first_output, first_total, second_output, second_total, third_output, third_total, stat)
+        else
+            call stat%set(FORTAI_UNSUPPORTED, 'batched projection triplet quantization mismatch')
+        end if
+    end subroutine batch_project_triplet
+
     logical function native_mtp_requested()
         character(len=64) :: value
         integer :: length
@@ -1796,6 +2431,7 @@ contains
         logical, intent(in), optional :: save_mtp_hidden
         logical, intent(in), optional :: compute_logits
         integer(c_int) :: code, next_token_c
+        integer(int64) :: device_token
         logical :: should_use_mtp, should_save_mtp, should_compute_logits
 
         next_token = 0_int64
@@ -1806,6 +2442,7 @@ contains
         if (present(save_mtp_hidden)) should_save_mtp = save_mtp_hidden
         should_compute_logits = .true.
         if (present(compute_logits)) should_compute_logits = compute_logits
+        device_token = -1_int64
         if (self%fast_enabled) then
             code = fortai_llama_fast_context_decode_greedy(self%fast_handle, &
                 int(token_id, c_int), int(position, c_int), next_token_c, logit_sum)
@@ -1824,9 +2461,13 @@ contains
         end if
         if (self%cuda_device_pipeline) then
             call qwen35_cpu_forward_body(self, token_id, position, self%logits, stat, .false., should_use_mtp, &
-                should_save_mtp, should_compute_logits)
+                should_save_mtp, should_compute_logits, greedy_only=.true., greedy_token=device_token)
             if (.not. stat%is_ok()) return
             if (.not. should_compute_logits) return
+            if (device_token >= 0_int64) then
+                next_token = device_token
+                return
+            end if
             block
                 integer :: index
                 call self%cuda%argmax_device(self%cuda_logits, int(self%vocabulary_size, c_size_t), index, stat)
@@ -1901,7 +2542,7 @@ contains
     end subroutine qwen35_cpu_forward_greedy_speculative
 
     subroutine qwen35_cpu_forward_body(self, token_id, position, logits, stat, download_logits, use_mtp, &
-            save_mtp_hidden, compute_logits)
+            save_mtp_hidden, compute_logits, greedy_only, greedy_token)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id, position
         real(real32), contiguous, intent(out) :: logits(:)
@@ -1910,8 +2551,11 @@ contains
         logical, intent(in), optional :: use_mtp
         logical, intent(in), optional :: save_mtp_hidden
         logical, intent(in), optional :: compute_logits
-        integer :: i
-        logical :: capture_graph, should_download, should_use_mtp, should_save_mtp, should_compute_logits
+        logical, intent(in), optional :: greedy_only
+        integer(int64), intent(out), optional :: greedy_token
+        integer :: i, layer_start
+        logical :: capture_graph, capture_segment
+        logical :: should_download, should_use_mtp, should_save_mtp, should_compute_logits, should_greedy_device
 
         call stat % clear()
         should_download = .true.
@@ -1922,6 +2566,9 @@ contains
         if (present(save_mtp_hidden)) should_save_mtp = save_mtp_hidden
         should_compute_logits = .true.
         if (present(compute_logits)) should_compute_logits = compute_logits
+        should_greedy_device = .false.
+        if (present(greedy_only)) should_greedy_device = greedy_only
+        if (present(greedy_token)) greedy_token = -1_int64
         if ((.not. self%fast_enabled .and. .not. allocated(self % x)) .or. &
             size(logits) /= self % vocabulary_size) then
             call stat % set(FORTAI_INVALID, 'Qwen3.5 CPU model is not open')
@@ -1971,6 +2618,36 @@ contains
             if (.not. stat % is_ok()) return
         end if
         capture_graph = .false.
+        capture_segment = .false.
+        layer_start = 1
+        ! llama.cpp's scheduler keeps one reusable graph for each contiguous
+        ! device segment and leaves cross-device bridges outside capture.  A
+        ! split Q4 model has exactly that shape: capture the primary prefix
+        ! on the GGML scheduler stream, then execute the remote suffix with
+        ! its ordinary event/bridge schedule.  The first decode warms every
+        ! plan; the second captures stable pointers; later tokens replay it.
+        if (self%cuda_device_pipeline .and. self%cuda_segment_graph_enabled .and. &
+            should_compute_logits .and. position > 0_int64) then
+            if (self%cuda_segment_graph_ready) then
+                call self%cuda%graph_launch(stat)
+                if (.not. stat%is_ok()) return
+                layer_start = self%cuda_segment_graph_end + 1
+            else if (self%cuda_segment_graph_warmup) then
+                call self%cuda%capture_begin(stat)
+                if (stat%is_ok()) then
+                    capture_segment = .true.
+                else
+                    ! Capture is an optional launch optimization.  If a
+                    ! driver or a newly introduced kernel rejects it, keep
+                    ! the proven stream/event path for the rest of the run.
+                    call stat%clear()
+                    self%cuda_segment_graph_enabled = .false.
+                    self%cuda_segment_graph_warmup = .false.
+                end if
+            else
+                self%cuda_segment_graph_warmup = .true.
+            end if
+        end if
         ! Prompt evaluation can skip logits work for intermediate tokens.  The
         ! final token still runs the output projection and records the hidden
         ! state needed by the native MTP verifier.
@@ -1985,9 +2662,37 @@ contains
             end if
         end if
 
+        if (capture_segment) then
+            do i = 1, self%cuda_segment_graph_end
+                if (.not. cuda_layer_device_ready(self, i)) then
+                    call stat%set(FORTAI_UNSUPPORTED, 'CUDA segment graph layer became unavailable')
+                    return
+                end if
+                if (self%layers(i)%recurrent) then
+                    call forward_recurrent_device(self, i, stat)
+                else
+                    call forward_attention_device(self, i, position, stat)
+                end if
+                if (.not. stat%is_ok()) return
+            end do
+            call self%cuda%capture_end(stat)
+            if (.not. stat%is_ok()) then
+                self%cuda_segment_graph_enabled = .false.
+                self%cuda_segment_graph_warmup = .false.
+                call stat%clear()
+                capture_segment = .false.
+                layer_start = 1
+            else
+                self%cuda_segment_graph_ready = .true.
+                call self%cuda%graph_launch(stat)
+                if (.not. stat%is_ok()) return
+                layer_start = self%cuda_segment_graph_end + 1
+            end if
+        end if
+
         if (.not. self%cuda_device_pipeline .or. .not. self%cuda_graph_ready .or. &
             .not. self%cuda_graph_enabled .or. .not. should_compute_logits) then
-            do i = 1, self % layer_count
+            do i = layer_start, self % layer_count
                 if (self%cuda_device_pipeline) then
                     if (cuda_layer_device_ready(self, i)) then
                         if (self%layers(i)%recurrent) then
@@ -2062,7 +2767,11 @@ contains
 
         if (self%cuda_device_pipeline .and. should_compute_logits .and. (.not. self%cuda_graph_ready .or. &
             .not. self%cuda_graph_enabled)) then
-            call forward_output_device(self, stat)
+            if (should_greedy_device .and. present(greedy_token)) then
+                call forward_output_device_greedy(self, greedy_token, stat)
+            else
+                call forward_output_device(self, stat)
+            end if
             if (.not. stat%is_ok()) return
         end if
 
@@ -2088,6 +2797,21 @@ contains
         end if
 
         if (self%cuda_device_pipeline) then
+            ! A graph that already produced logits still needs only the
+            ! backend-side argmax for greedy decode.  The remote-output helper
+            ! sets greedy_token itself; the negative sentinel selects the
+            ! primary-device fallback for single-device graphs or Q8 output.
+            if (should_compute_logits .and. should_greedy_device .and. present(greedy_token)) then
+                if (greedy_token < 0_int64) then
+                    block
+                        integer :: index
+                        call self%cuda%argmax_device(self%cuda_logits, int(self%vocabulary_size, c_size_t), &
+                            index, stat)
+                        if (.not. stat%is_ok()) return
+                        greedy_token = int(index, int64)
+                    end block
+                end if
+            end if
             if (should_compute_logits .and. should_download) then
                 call self%cuda%download_real(self%cuda_logits, logits, stat)
                 if (.not. stat%is_ok()) return
@@ -2229,10 +2953,9 @@ contains
         character(len=16) :: value
         integer :: length
 
-        ! Prefer the resident llama.cpp graph when it is available.  The
-        ! native Fortran/GGML implementation remains an automatic fallback;
-        ! callers can force it with FORTAI_LLAMA_FASTPATH=native|0.
-        fast_path_mode = 3
+        ! FortAI production is always native.  The optional ABI path is kept
+        ! only for explicit comparison runs; it is never selected implicitly.
+        fast_path_mode = 0
         value = ''
         call get_environment_variable('FORTAI_LLAMA_FASTPATH', value, length=length)
         if (length <= 0) return
@@ -2241,7 +2964,7 @@ contains
         case ('0', 'native', 'off', 'none')
             fast_path_mode = 0
         case ('1', 'auto')
-            fast_path_mode = 3
+            fast_path_mode = 0
         case ('cpu')
             fast_path_mode = 1
         case ('cuda', 'gpu')
@@ -2360,6 +3083,20 @@ contains
         type(status_t), intent(out) :: stat
 
         call stat%clear()
+        if (self%file%tensors(first_index)%value_type == GGML_TYPE_Q8_0 .and. &
+            self%file%tensors(second_index)%value_type == GGML_TYPE_Q8_0 .and. &
+            (cuda_q8_on_second(self, first_index) .eqv. cuda_q8_on_second(self, second_index))) then
+            if (cuda_q8_on_second(self, first_index)) then
+                call cuda_q8_matvec_device_f32_pair(self%cuda_second, self%cuda_weights(first_index), &
+                    self%cuda_weights(second_index), device_input, input_elements, first_output, first_elements, &
+                    second_output, second_elements, stat)
+            else
+                call cuda_q8_matvec_device_f32_pair(self%cuda, self%cuda_weights(first_index), &
+                    self%cuda_weights(second_index), device_input, input_elements, first_output, first_elements, &
+                    second_output, second_elements, stat)
+            end if
+            return
+        end if
         if (is_q4_xl_type(self%file%tensors(first_index)%value_type) .and. &
             is_q4_xl_type(self%file%tensors(second_index)%value_type) .and. &
             self%cuda_q4_resident .and. self%cuda_q4_group_enabled) then
@@ -2411,6 +3148,48 @@ contains
         call cuda_device_matvec(self, third_index, device_input, input_elements, third_output, third_elements, stat)
     end subroutine cuda_device_matvec_triplet
 
+    subroutine cuda_device_matvec_quad(self, first_index, second_index, third_index, fourth_index, device_input, &
+            input_elements, first_output, first_elements, second_output, second_elements, third_output, &
+            third_elements, fourth_output, fourth_elements, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer, intent(in) :: first_index, second_index, third_index, fourth_index
+        type(c_ptr), intent(in) :: device_input, first_output, second_output, third_output, fourth_output
+        integer(c_size_t), intent(in) :: input_elements, first_elements, second_elements, third_elements, fourth_elements
+        type(status_t), intent(out) :: stat
+        logical :: all_q4, ready
+
+        call stat%clear()
+        all_q4 = is_q4_xl_type(self%file%tensors(first_index)%value_type) .and. &
+            is_q4_xl_type(self%file%tensors(second_index)%value_type) .and. &
+            is_q4_xl_type(self%file%tensors(third_index)%value_type) .and. &
+            is_q4_xl_type(self%file%tensors(fourth_index)%value_type)
+        ready = .false.
+        if (all_q4 .and. self%cuda_q4_resident .and. self%cuda_q4_group_enabled .and. &
+            allocated(self%cuda_q4_weights)) then
+            ready = c_associated(self%cuda_q4_weights(first_index)%handle) .and. &
+                c_associated(self%cuda_q4_weights(second_index)%handle) .and. &
+                c_associated(self%cuda_q4_weights(third_index)%handle) .and. &
+                c_associated(self%cuda_q4_weights(fourth_index)%handle)
+        end if
+        ! The native Q4 group scheduler can partition one quad across both
+        ! resident devices and bridge only the remote outputs.  Keeping the
+        ! four projections in one call is important for split Q4_XL: the
+        ! previous all-primary guard fell back to two pair calls whenever a
+        ! recurrent quad straddled the cards, doubling graph/event setup.
+        if (ready) then
+            call cuda_q4_matvec_device_quad(self%cuda_q4, self%cuda_q4_weights(first_index), &
+                self%cuda_q4_weights(second_index), self%cuda_q4_weights(third_index), &
+                self%cuda_q4_weights(fourth_index), device_input, input_elements, first_output, first_elements, &
+                second_output, second_elements, third_output, third_elements, fourth_output, fourth_elements, stat)
+            return
+        end if
+        call cuda_device_matvec_pair(self, first_index, second_index, device_input, input_elements, first_output, &
+            first_elements, second_output, second_elements, stat)
+        if (.not. stat%is_ok()) return
+        call cuda_device_matvec_pair(self, third_index, fourth_index, device_input, input_elements, third_output, &
+            third_elements, fourth_output, fourth_elements, stat)
+    end subroutine cuda_device_matvec_quad
+
     subroutine cuda_device_embedding(self, token_id, device_output, output_elements, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer(int64), intent(in) :: token_id
@@ -2448,10 +3227,30 @@ contains
         integer, intent(in) :: layer_index
         type(status_t), intent(out) :: stat
         integer(c_size_t) :: hidden_elements, ffn_elements
+        character(len=8) :: disable_env
+        integer :: disable_length
 
         call stat%clear()
         hidden_elements = int(size(self%x), c_size_t)
         ffn_elements = int(self%feed_forward_size, c_size_t)
+        ! Diagnostic escape hatch: retain the resident layer kernels while
+        ! evaluating only the FFN through the established host oracle.  This
+        ! is intentionally environment-gated and is removed after kernel
+        ! isolation; normal production execution never takes this branch.
+        disable_env = ''
+        call get_environment_variable('FORTAI_DISABLE_CUDA_FFN_DEVICE', disable_env, length=disable_length)
+        if (disable_length > 0 .and. disable_env(1:1) == '1') then
+            call self%cuda%download_real(self%cuda_normalized, self%normalized, stat)
+            if (.not. stat%is_ok()) return
+            call model_matvec_pair(self, self%layers(layer_index)%ffn_gate, self%layers(layer_index)%ffn_up, &
+                self%normalized, self%ffn_gate_work, self%ffn_up_work, stat)
+            if (.not. stat%is_ok()) return
+            call silu_product(self%ffn_gate_work, self%ffn_up_work)
+            call model_matvec(self, self%layers(layer_index)%ffn_down, self%ffn_gate_work, self%hidden_work, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%upload_real(self%cuda_hidden, self%hidden_work, stat)
+            return
+        end if
         if (self%cuda_q4_resident .and. self%cuda_q4_split .and. self%cuda_q4_group_enabled .and. &
             c_associated(self%cuda_second%handle) .and. cuda_q4_on_second(self, self%layers(layer_index)%ffn_gate) .and. &
             cuda_q4_on_second(self, self%layers(layer_index)%ffn_up) .and. &
@@ -2573,21 +3372,28 @@ contains
         hidden_bytes = hidden_elements * int(storage_size(self%x(1)) / 8, c_size_t)
         call cuda_qwen35_copy_device(self%cuda, self%cuda_x, self%cuda_residual, hidden_bytes, stat)
         if (.not. stat%is_ok()) return
-        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
-            self%cuda_attn_norm(layer_index), self%cuda_normalized, hidden_elements, &
-            self%norm_epsilon, stat)
+        if (cuda_norm_device_disabled()) then
+            call self%cuda%download_real(self%cuda_x, self%x, stat)
+            if (.not. stat%is_ok()) return
+            call rms_norm(self%x, self%file%tensors(self%layers(layer_index)%attn_norm), &
+                self%norm_epsilon, self%normalized, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%upload_real(self%cuda_normalized, self%normalized, stat)
+        else
+            call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
+                self%cuda_attn_norm(layer_index), self%cuda_normalized, hidden_elements, &
+                self%norm_epsilon, stat)
+        end if
         if (.not. stat%is_ok()) return
         if (all_q8_recurrent_weights(self, layer_index)) then
             call self%layers(layer_index)%cuda_recurrent%run_device(self%cuda_normalized, hidden_elements, &
                 self%cuda_hidden, hidden_elements, stat)
         else
-            call cuda_device_matvec_pair(self, self%layers(layer_index)%attn_qkv, &
-                self%layers(layer_index)%attn_gate, self%cuda_normalized, hidden_elements, self%cuda_qkv_device, &
+            call cuda_device_matvec_quad(self, self%layers(layer_index)%attn_qkv, &
+                self%layers(layer_index)%attn_gate, self%layers(layer_index)%ssm_alpha, &
+                self%layers(layer_index)%ssm_beta, self%cuda_normalized, hidden_elements, self%cuda_qkv_device, &
                 int(self%recurrent_conv_size, c_size_t), self%cuda_gate_device, &
-                int(self%recurrent_inner_size, c_size_t), stat)
-            if (.not. stat%is_ok()) return
-            call cuda_device_matvec_pair(self, self%layers(layer_index)%ssm_alpha, &
-                self%layers(layer_index)%ssm_beta, self%cuda_normalized, hidden_elements, self%cuda_alpha_device, &
+                int(self%recurrent_inner_size, c_size_t), self%cuda_alpha_device, &
                 int(self%recurrent_value_heads, c_size_t), self%cuda_beta_device, &
                 int(self%recurrent_value_heads, c_size_t), stat)
             if (.not. stat%is_ok()) return
@@ -2607,9 +3413,18 @@ contains
         if (.not. stat%is_ok()) return
         call cuda_qwen35_copy_device(self%cuda, self%cuda_x, self%cuda_residual, hidden_bytes, stat)
         if (.not. stat%is_ok()) return
-        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
-            self%cuda_post_norm(layer_index), self%cuda_normalized, hidden_elements, &
-            self%norm_epsilon, stat)
+        if (cuda_norm_device_disabled()) then
+            call self%cuda%download_real(self%cuda_x, self%x, stat)
+            if (.not. stat%is_ok()) return
+            call rms_norm(self%x, self%file%tensors(self%layers(layer_index)%post_norm), &
+                self%norm_epsilon, self%normalized, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%upload_real(self%cuda_normalized, self%normalized, stat)
+        else
+            call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
+                self%cuda_post_norm(layer_index), self%cuda_normalized, hidden_elements, &
+                self%norm_epsilon, stat)
+        end if
         if (.not. stat%is_ok()) return
         call forward_ffn_device(self, layer_index, stat)
         if (.not. stat%is_ok()) return
@@ -2632,6 +3447,54 @@ contains
             self%cuda_logits, logits_elements, stat)
     end subroutine forward_output_device
 
+    subroutine forward_output_device_greedy(self, greedy_token, stat)
+        class(qwen35_cpu_model_t), intent(inout) :: self
+        integer(int64), intent(out) :: greedy_token
+        type(status_t), intent(out) :: stat
+        integer(c_size_t) :: hidden_elements, logits_elements
+        logical :: remote_output
+
+        call stat%clear()
+        greedy_token = -1_int64
+        hidden_elements = int(size(self%x), c_size_t)
+        logits_elements = int(size(self%logits), c_size_t)
+        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, self%cuda_output_norm, &
+            self%cuda_normalized, hidden_elements, self%norm_epsilon, stat)
+        if (.not. stat%is_ok()) return
+
+        remote_output = .false.
+        if (self%cuda_q4_resident .and. self%cuda_q4_split .and. c_associated(self%cuda_second%handle) .and. &
+            allocated(self%cuda_q4_weights) .and. allocated(self%cuda_q4_weight_device)) then
+            if (self%output > 0 .and. self%output <= size(self%file%tensors) .and. &
+                self%output <= size(self%cuda_q4_weights) .and. self%output <= size(self%cuda_q4_weight_device)) then
+                if (is_q4_xl_type(self%file%tensors(self%output)%value_type) .and. &
+                    cuda_q4_on_second(self, self%output) .and. c_associated(self%cuda_q4_weights(self%output)%handle) .and. &
+                    c_associated(self%cuda_logits_second)) remote_output = .true.
+            end if
+        end if
+        if (remote_output) then
+            ! The Q4 projection and argmax stay on the second scheduler/device,
+            ! exactly like llama.cpp's ggml_argmax backend node.  Reusing the
+            ! existing count-one group API keeps one validated bridge and one
+            ! cached GGML-CUDA plan without introducing a wrapper runtime.
+            call cuda_q4_matvec_device_group_remote_output(self%cuda_q4, &
+                self%cuda_q4_weights(self%output), self%cuda_q4_weights(self%output), &
+                self%cuda_q4_weights(self%output), 1, self%cuda_normalized, hidden_elements, &
+                self%cuda_logits_second, logits_elements, c_null_ptr, 0_c_size_t, c_null_ptr, 0_c_size_t, stat)
+            if (.not. stat%is_ok()) return
+            block
+                integer :: index
+                call self%cuda_second%argmax_device(self%cuda_logits_second, &
+                    int(self%vocabulary_size, c_size_t), index, stat)
+                if (.not. stat%is_ok()) return
+                greedy_token = int(index, int64)
+            end block
+            return
+        end if
+        call cuda_device_matvec(self, self%output, self%cuda_normalized, hidden_elements, &
+            self%cuda_logits, logits_elements, stat)
+    end subroutine forward_output_device_greedy
+
     subroutine forward_attention_device(self, layer_index, position, stat)
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer, intent(in) :: layer_index
@@ -2645,9 +3508,18 @@ contains
         hidden_bytes = hidden_elements * int(storage_size(self%x(1)) / 8, c_size_t)
         call cuda_qwen35_copy_device(self%cuda, self%cuda_x, self%cuda_residual, hidden_bytes, stat)
         if (.not. stat%is_ok()) return
-        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
-            self%cuda_attn_norm(layer_index), self%cuda_normalized, hidden_elements, &
-            self%norm_epsilon, stat)
+        if (cuda_norm_device_disabled()) then
+            call self%cuda%download_real(self%cuda_x, self%x, stat)
+            if (.not. stat%is_ok()) return
+            call rms_norm(self%x, self%file%tensors(self%layers(layer_index)%attn_norm), &
+                self%norm_epsilon, self%normalized, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%upload_real(self%cuda_normalized, self%normalized, stat)
+        else
+            call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
+                self%cuda_attn_norm(layer_index), self%cuda_normalized, hidden_elements, &
+                self%norm_epsilon, stat)
+        end if
         if (.not. stat%is_ok()) return
         on_second = cuda_attention_on_second(self, layer_index)
         if (all_q8_attention_weights(self, layer_index)) then
@@ -2721,9 +3593,18 @@ contains
         if (.not. stat%is_ok()) return
         call cuda_qwen35_copy_device(self%cuda, self%cuda_x, self%cuda_residual, hidden_bytes, stat)
         if (.not. stat%is_ok()) return
-        call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
-            self%cuda_post_norm(layer_index), self%cuda_normalized, hidden_elements, &
-            self%norm_epsilon, stat)
+        if (cuda_norm_device_disabled()) then
+            call self%cuda%download_real(self%cuda_x, self%x, stat)
+            if (.not. stat%is_ok()) return
+            call rms_norm(self%x, self%file%tensors(self%layers(layer_index)%post_norm), &
+                self%norm_epsilon, self%normalized, stat)
+            if (.not. stat%is_ok()) return
+            call self%cuda%upload_real(self%cuda_normalized, self%normalized, stat)
+        else
+            call cuda_qwen35_rms_norm_device(self%cuda, self%cuda_x, &
+                self%cuda_post_norm(layer_index), self%cuda_normalized, hidden_elements, &
+                self%norm_epsilon, stat)
+        end if
         if (.not. stat%is_ok()) return
         call forward_ffn_device(self, layer_index, stat)
         if (.not. stat%is_ok()) return
@@ -2996,6 +3877,7 @@ contains
         end do
     end function q4_recurrent_projection_tensor
 
+
     logical function all_q8_recurrent_weights(self, layer_index)
         class(qwen35_cpu_model_t), intent(in) :: self
         integer, intent(in) :: layer_index
@@ -3249,6 +4131,16 @@ contains
         if (length > 0) cuda_host_q8_enabled = value(1:min(length, len(value))) /= '0'
     end function cuda_host_q8_enabled
 
+    logical function cuda_norm_device_disabled()
+        character(len=8) :: value
+        integer :: length
+
+        cuda_norm_device_disabled = .false.
+        value = ''
+        call get_environment_variable('FORTAI_DISABLE_CUDA_NORM_DEVICE', value, length=length)
+        if (length > 0) cuda_norm_device_disabled = value(1:min(length, len(value))) == '1'
+    end function cuda_norm_device_disabled
+
     logical function cuda_fused_ffn_host_enabled()
         character(len=8) :: value
         integer :: length
@@ -3289,8 +4181,22 @@ contains
     logical function cuda_layer_device_ready(self, layer_index)
         class(qwen35_cpu_model_t), intent(in) :: self
         integer, intent(in) :: layer_index
+        character(len=16) :: limit_value, skip_value
+        integer :: limit_length, limit, ios, skip_length
 
         cuda_layer_device_ready = .false.
+        limit_value = ''
+        call get_environment_variable('FORTAI_CUDA_DEVICE_LAYER_LIMIT', limit_value, length=limit_length)
+        if (limit_length > 0) then
+            read(limit_value(:min(limit_length, len(limit_value))), *, iostat=ios) limit
+            if (ios == 0 .and. limit >= 0 .and. layer_index > limit) return
+        end if
+        skip_value = ''
+        call get_environment_variable('FORTAI_DISABLE_CUDA_RECURRENT_DEVICE', skip_value, length=skip_length)
+        if (skip_length > 0 .and. skip_value(1:1) == '1' .and. self%layers(layer_index)%recurrent) return
+        skip_value = ''
+        call get_environment_variable('FORTAI_DISABLE_CUDA_ATTENTION_DEVICE', skip_value, length=skip_length)
+        if (skip_length > 0 .and. skip_value(1:1) == '1' .and. .not. self%layers(layer_index)%recurrent) return
         if (.not. cuda_layer_kernel_ready(self, layer_index)) return
         if (.not. allocated(self%cuda_attn_norm) .or. .not. allocated(self%cuda_post_norm)) return
         if (layer_index > size(self%cuda_attn_norm) .or. layer_index > size(self%cuda_post_norm)) return
@@ -4138,8 +5044,8 @@ contains
             return
         end if
         if (size(self%qkv_download_work) >= size(first_output) + size(second_output) + size(third_output) .and. &
-            cuda_q8_on_second(self, first_index) .eqv. cuda_q8_on_second(self, second_index) .and. &
-            cuda_q8_on_second(self, first_index) .eqv. cuda_q8_on_second(self, third_index)) then
+            (cuda_q8_on_second(self, first_index) .eqv. cuda_q8_on_second(self, second_index)) .and. &
+            (cuda_q8_on_second(self, first_index) .eqv. cuda_q8_on_second(self, third_index))) then
             if (cuda_q8_on_second(self, first_index)) then
                 call cuda_q8_matvec_host_triplet_contiguous(self%cuda_second, self%cuda_weights(first_index), &
                     self%cuda_weights(second_index), self%cuda_weights(third_index), &
@@ -4198,8 +5104,8 @@ contains
             call stat%set(FORTAI_INVALID, 'Qwen3.5 CUDA FFN dimensions do not agree')
             return
         end if
-        if (cuda_q8_on_second(self, layer%ffn_gate) .eqv. cuda_q8_on_second(self, layer%ffn_up) .and. &
-            cuda_q8_on_second(self, layer%ffn_gate) .eqv. cuda_q8_on_second(self, layer%ffn_down)) then
+        if ((cuda_q8_on_second(self, layer%ffn_gate) .eqv. cuda_q8_on_second(self, layer%ffn_up)) .and. &
+            (cuda_q8_on_second(self, layer%ffn_gate) .eqv. cuda_q8_on_second(self, layer%ffn_down))) then
             if (cuda_q8_on_second(self, layer%ffn_gate)) then
                 call cuda_q8_ffn_host(self%cuda_second, self%cuda_weights(layer%ffn_gate), &
                     self%cuda_weights(layer%ffn_up), self%cuda_weights(layer%ffn_down), &

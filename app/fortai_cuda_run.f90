@@ -21,7 +21,7 @@ program fortai_cuda_run
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
     real(real32) :: greedy_sum
     character(len=16) :: trace_tokens, trace_top_tokens
-    logical :: trace_enabled, disable_cuda, exclude_prompt
+    logical :: trace_enabled, disable_cuda, exclude_prompt, batch_smoke
     character(len=8) :: disable_cuda_env
     character(len=16) :: exclude_prompt_text
     character(len=16) :: second_device_text
@@ -34,6 +34,11 @@ program fortai_cuda_run
     logical :: vram_before_ok, vram_after_ok
     logical :: vram_second_before_ok, vram_second_after_ok
     real(real32) :: maximum_logit
+    integer(int64), allocatable :: batch_tokens(:)
+    real(real32), allocatable :: batch_logits(:), scalar_logits(:)
+    real(real32) :: batch_max_abs
+    integer :: batch_count, batch_i, scalar_index, batch_index, batch_smoke_length
+    character(len=8) :: batch_smoke_env
 
     call get_command_argument(1, model_path)
     if (len_trim(model_path) == 0) then
@@ -105,10 +110,58 @@ program fortai_cuda_run
         length=exclude_prompt_length)
     exclude_prompt = exclude_prompt_length > 0 .and. &
         exclude_prompt_text(1:exclude_prompt_length) == '1'
+    call get_environment_variable('FORTAI_BATCH_SMOKE', batch_smoke_env, length=batch_smoke_length)
+    batch_smoke = batch_smoke_length > 0 .and. batch_smoke_env(1:batch_smoke_length) == '1'
+    if (batch_smoke) then
+        batch_count = max(2, min(int(steps), 128))
+        if (.not. model%cuda_device_pipeline .or. .not. model%batch_supported(batch_count)) then
+            print '(a)', 'batch_smoke=unsupported'
+            call model%close()
+            stop 0
+        end if
+        allocate(batch_tokens(batch_count), batch_logits(model%vocabulary_size), &
+            scalar_logits(model%vocabulary_size))
+        do batch_i = 1, batch_count
+            batch_tokens(batch_i) = modulo(token + int(batch_i - 1, int64), int(model%vocabulary_size, int64))
+        end do
+        call model%reset()
+        do batch_i = 1, batch_count
+            call model%forward(batch_tokens(batch_i), int(batch_i - 1, int64), scalar_logits, stat, &
+                batch_i == batch_count, .false., batch_i == batch_count, batch_i == batch_count)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'batch_smoke=scalar_failed ' // stat%message
+                call model%close()
+                stop 1
+            end if
+        end do
+        call model%reset()
+        call model%forward_batch(batch_tokens, 0_int64, batch_logits, stat)
+        if (.not. stat%is_ok()) then
+            print '(a)', 'batch_smoke=batch_failed ' // stat%message
+            call model%close()
+            stop 1
+        end if
+        batch_max_abs = maxval(abs(batch_logits - scalar_logits))
+        scalar_index = maxloc(scalar_logits, dim=1) - 1
+        batch_index = maxloc(batch_logits, dim=1) - 1
+        print '(a,i0)', 'batch_smoke_count=', batch_count
+        print '(a,l1)', 'batch_smoke_supported=', model%batch_supported(batch_count)
+        print '(a,es16.8)', 'batch_smoke_max_abs=', batch_max_abs
+        print '(a,i0)', 'batch_smoke_scalar_argmax=', scalar_index
+        print '(a,i0)', 'batch_smoke_batch_argmax=', batch_index
+        print '(a,l1)', 'batch_smoke_argmax_equal=', scalar_index == batch_index
+        call model%close()
+        stop 0
+    end if
     first_position = 0_int64
     last_position = steps - 1_int64
     if (exclude_prompt) then
-        if ((model%fast_enabled .or. model%mtp_active) .and. top_count == 0) then
+        ! Match llama.cpp's production decode path for a greedy request: its
+        ! backend sampler consumes the device-side argmax and does not copy a
+        ! full vocabulary row to the host.  The native CUDA implementation
+        ! has the same path; using `forward` here would benchmark an
+        ! unnecessary logits download rather than model generation.
+        if ((model%fast_enabled .or. model%mtp_active .or. model%cuda_device_pipeline) .and. top_count == 0) then
             call model%forward_greedy(token, 0_int64, next_token, greedy_sum, stat)
             if (.not. stat%is_ok()) then
                 print '(a)', 'FortAI prompt forward failed: ' // stat%message
@@ -143,7 +196,10 @@ program fortai_cuda_run
     call system_clock(forward_start)
     position = first_position
     do while (position <= last_position)
-        if ((model%fast_enabled .or. model%mtp_active) .and. top_count == 0) then
+        ! Keep the decode comparison transfer-fair with llama.cpp: greedy
+        ! sampling is performed on-device, while top-logit diagnostics opt
+        ! into the full logits path above.
+        if ((model%fast_enabled .or. model%mtp_active .or. model%cuda_device_pipeline) .and. top_count == 0) then
             call model%forward_greedy_speculative(token, position, speculative_tokens, &
                 spec_count, greedy_sum, stat)
             if (.not. stat%is_ok()) then
@@ -200,6 +256,9 @@ program fortai_cuda_run
     end if
     print '(a,l1)', 'device_pipeline=', model%cuda_device_pipeline
     print '(a,l1)', 'cuda_graph_enabled=', model%cuda_graph_enabled
+    print '(a,l1)', 'cuda_segment_graph_enabled=', model%cuda_segment_graph_enabled
+    print '(a,l1)', 'cuda_segment_graph_ready=', model%cuda_segment_graph_ready
+    print '(a,i0)', 'cuda_segment_graph_end=', model%cuda_segment_graph_end
     print '(a,i0)', 'device=', device
     print '(a,i0)', 'vocabulary=', model%vocabulary_size
     print '(a,i0)', 'layers=', model%layer_count
