@@ -116,7 +116,12 @@ def body(prompt, stream):
 def measure_rates(prompt):
     result = post("/v1/chat/completions", body(prompt, False))
     t = result.get("timings", {})
-    return t.get("prompt_n"), t.get("prompt_per_second"), t.get("predicted_per_second")
+    # Speculative acceptance is the other half of the generation rate: a round
+    # costs the same whether or not its drafts are accepted, so tokens/round
+    # explains rate differences that kernel timings do not.
+    return (t.get("prompt_n"), t.get("prompt_per_second"),
+            t.get("predicted_per_second"), t.get("draft_n") or 0,
+            t.get("draft_n_accepted") or 0)
 
 
 def measure_ttft(prompt):
@@ -160,15 +165,21 @@ for size in PROMPT_SIZES:
         cases.append({"requested_prompt_tokens": size, "error": repr(exc)})
         print(f"  prompt ~{size:6d} tok: FAILED {exc}")
         continue
+    drafted = sum(r[3] for r in runs)
+    accepted = sum(r[4] for r in runs)
     cases.append({
         "requested_prompt_tokens": size,
         "prompt_tokens": runs[0][0],
         "prefill_tokens_per_second": statistics.median(r[1] for r in runs),
         "generation_tokens_per_second": statistics.median(r[2] for r in runs),
         "ttft_ms": ttft,
+        "draft_tokens": drafted,
+        "draft_accepted": accepted,
+        "draft_acceptance": accepted / drafted if drafted else None,
     })
     print(f"  prompt {runs[0][0]:6d} tok: prefill {statistics.median(r[1] for r in runs):8.1f} tok/s  "
-          f"gen {statistics.median(r[2] for r in runs):5.2f} tok/s  ttft {ttft:8.1f} ms")
+          f"gen {statistics.median(r[2] for r in runs):5.2f} tok/s  ttft {ttft:8.1f} ms  "
+          f"accept {100 * accepted / drafted if drafted else 0:5.1f}%")
 
 sampler.stop_flag.set()
 sampler.join(timeout=5)

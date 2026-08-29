@@ -53,6 +53,11 @@ export LLAMACPP_HOST=127.0.0.1
 # BENCH_CONTEXT overrides the context for either side, so FortAI can also be
 # measured at the reduced context llama.cpp is able to allocate.
 export LLAMACPP_CONTEXT="${BENCH_CONTEXT:-$LLAMACPP_CONTEXT}"
+# The production drop-in is sourced above, so any FortAI override has to be
+# re-applied after it.
+if [[ -n "${FORTAI_ENABLE_CUDA_Q4_SEGMENT_GRAPH:-}" ]]; then
+    export FORTAI_ENABLE_CUDA_Q4_SEGMENT_GRAPH
+fi
 export LLAMACPP_PORT="$port"
 export LLAMACPP_INSTANCE=bench
 

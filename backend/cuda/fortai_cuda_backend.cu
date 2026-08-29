@@ -3946,11 +3946,7 @@ __global__ void qwen_attention_apply_gqa_q8_batch(
 
         /* The grouped query heads share this KV row but retain independent Q8 query
          * scales.  Lane 0 stores one complete score per key/query row.
-         * Each key's warp reduction is independent of the others, so unrolling
-         * lets several of them overlap instead of paying the full shuffle
-         * latency once per key; at 16k context this loop was 82% of decode GPU
-         * time while moving only 12% of peak memory bandwidth. */
-#pragma unroll 4
+         */
         for (int local_key = 0; local_key < KeyTile; ++local_key) {
             const int source = key_base + local_key;
             const bool key_in_context = source <= max_query_position;

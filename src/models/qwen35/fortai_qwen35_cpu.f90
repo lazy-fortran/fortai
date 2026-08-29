@@ -1861,7 +1861,17 @@ contains
         character(len=16) :: value
         integer :: length
 
-        cuda_q4_segment_graph_requested = .true.
+        ! Off by default.  A captured segment graph replays the launch shape and
+        ! the scalar kernel arguments recorded at capture time, and the MTP
+        ! draft path depends on the current position, so replaying a graph
+        ! captured at one context length degrades the drafts produced at
+        ! another.  Measured on Qwen3.8-27B at a 4175-token prompt: draft
+        ! acceptance 64.0% with the graph against 82.3% without (llama.cpp
+        ! 80.0%), and generation 40.1 against 46.4 tok/s.  Prefill is unchanged
+        ! either way, so the graph currently buys nothing and costs accuracy of
+        ! the drafts.  Re-enable only once the position-dependent state is read
+        ! from device memory instead of being baked into the capture.
+        cuda_q4_segment_graph_requested = .false.
         value = ''
         call get_environment_variable('FORTAI_ENABLE_CUDA_Q4_SEGMENT_GRAPH', value, length=length)
         if (length <= 0 .or. length > len(value)) return
