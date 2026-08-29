@@ -23,8 +23,9 @@ start_script="${BENCH_LLAMA_START:-/home/ert/infra/slopcode-infra/scripts/server
 fortai_bin="${BENCH_FORTAI_BIN:-$root_dir/build/cuda/fortai_server}"
 port="${BENCH_PORT:-18091}"
 llama_context="${BENCH_LLAMA_CONTEXT:-8192}"
-gen_tokens="${BENCH_GEN_TOKENS:-192}"
-repeats="${BENCH_REPEATS:-3}"
+gen_tokens="${BENCH_GEN_TOKENS:-128}"
+repeats="${BENCH_REPEATS:-2}"
+prompt_sizes="${BENCH_PROMPT_SIZES:-256,1024,4096,16384}"
 result_dir="$root_dir/benchmark/results"
 log_dir="$root_dir/benchmark/logs"
 mkdir -p "$result_dir" "$log_dir"
@@ -92,6 +93,7 @@ for attempt in $(seq 1 900); do
 done
 
 env SIDE="$side" PORT="$port" CONTEXT="$context" GEN_TOKENS="$gen_tokens" REPEATS="$repeats" \
-    RESULT_FILE="$result_file" LOG_FILE="$log_file" \
+    RESULT_FILE="$result_file" LOG_FILE="$log_file" PROMPT_SIZES="$prompt_sizes" \
+    SERVER_PID="$server_pid" \
     python3 "$root_dir/benchmark/qwen38_server_probe.py"
 printf 'result=%s\nlog=%s\n' "$result_file" "$log_file"

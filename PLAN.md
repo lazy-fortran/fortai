@@ -19,8 +19,8 @@
 
 | ID | Requirement | Lifecycle |
 |---|---|---|
-| Q27-CORRECT | Greedy MTP reproduces the non-speculative target; sampled selection, rollback, and graph reuse pass independent oracles. | `leaf_status: PASS`; `claim_status: OPEN`; `parent_status: OPEN`; `review_verdict: PENDING`; `evidence_gate_verdict: PENDING` |
-| Q27-PREFILL | Matched cold prompt ingestion is at least as fast as llama.cpp. | `leaf_status: PASS`; `claim_status: OPEN`; `parent_status: OPEN`; `review_verdict: PENDING`; `evidence_gate_verdict: PENDING` |
+| Q27-CORRECT | Greedy MTP reproduces the non-speculative target; sampled selection, rollback, and graph reuse pass independent oracles. | `leaf_status: FAIL` (3/5 general prompts match; see Open defects); `claim_status: OPEN`; `parent_status: OPEN`; `review_verdict: PENDING`; `evidence_gate_verdict: PENDING` |
+| Q27-PREFILL | Matched cold prompt ingestion is at least as fast as llama.cpp. | `leaf_status: FAIL` (holds below ~4k, 55% of llama.cpp at ~16k); `claim_status: OPEN`; `parent_status: OPEN`; `review_verdict: PENDING`; `evidence_gate_verdict: PENDING` |
 | Q27-DECODE | Greedy and production-sampled MTP generation are at least as fast as llama.cpp at short and growing contexts. | `leaf_status: OPEN`; `claim_status: OPEN`; `parent_status: OPEN`; `review_verdict: PENDING`; `evidence_gate_verdict: FAIL` |
 | Q27-MEMORY | Peak RAM and per-GPU VRAM are no greater than llama.cpp. | `leaf_status: PASS`; `claim_status: OPEN`; `parent_status: OPEN`; `review_verdict: PENDING`; `evidence_gate_verdict: PENDING` |
 | Q27-FEATURES | Dual-GPU placement, FA, MTP, sampling, reasoning, prefix cache, and mmproj work through the native server. | `leaf_status: OPEN`; `claim_status: OPEN`; `parent_status: OPEN`; `review_verdict: PENDING`; `evidence_gate_verdict: PENDING` |
@@ -126,22 +126,69 @@ logits against llama.cpp's for forced-identical inputs -- not further kernel,
 sampler, or scheduling work, all of which the profile shows are already at or
 past parity.
 
+## Long-context scaling (2026-08-29)
+
+The decode profile above used short prompts. A prompt-size sweep shows it does
+not generalize: FortAI's advantage is confined to short contexts and inverts as
+the prompt grows, while llama.cpp holds a flat prefill rate.
+
+| Prompt tokens | Prefill FortAI / llama | Generation FortAI / llama | TTFT FortAI / llama |
+|---:|---:|---:|---:|
+| ~330 | 634 / 414 tok/s | 45.1 / 48.2 tok/s | 3.3 / 1.1 s |
+| ~4 150 | 1196 / 1165 tok/s | 40.5 / 48.1 tok/s | 7.9 / 4.0 s |
+| ~8 250 | 963 / 1231 tok/s | 32.8 / 46.7 tok/s | 15.6 / 7.0 s |
+| ~16 450 | 659 / 1205 tok/s | 30.4 / 43.4 tok/s | 35.5 / 14.4 s |
+
+llama.cpp's prefill is flat from 4k to 16k; FortAI's falls monotonically from
+1196 to 659 tok/s, and generation from 40.5 to 30.4 tok/s. This is a larger
+effect than the draft-acceptance gap and supersedes it as the priority. The
+shape -- cost growing with resident context rather than with batch -- points at
+attention over the grown K/V, not at projection throughput.
+
+Batch graph slots are keyed by only two regimes,
+`merge(2, 1, position_start + batch - 1 >= 4096)`, so one captured graph serves
+every position above 4096. CUDA graph capture bakes scalar kernel arguments, so
+any length-dependent scalar baked at capture time is reused unchanged from 4k
+to 262k. That is the first thing to audit.
+
+## Open defects
+
+- `CUDA batched RMS norm failed` (HTTP 500) on long prompts. Reproduced once in
+  three attempts on a 256/1024/4096/16384 ladder, never under
+  `CUDA_LAUNCH_BLOCKING=1`; it is a race and the reported kernel is only where
+  the sticky error surfaces. The dual-GPU host bridge in
+  `fortai_cuda_q4_context_transfer` was audited and its ring-slot event
+  ordering and `ensure_host_buffer` synchronization are sound, so the race is
+  elsewhere. A reliable reproducer is required before any fix.
+- Greedy MTP output matches the non-speculative scalar oracle on only 3 of 5
+  general prompts; the two failures diverge inside the reasoning stream. The
+  batched verification matmul and the scalar matvec reduce in different orders,
+  so a near-tie can flip the greedy argmax. Not yet distinguished from a
+  speculative defect -- needs a logit-level comparison at the first differing
+  position. `Q27-CORRECT` was validated on an arithmetic payload and does not
+  generalize.
+
 ## Next execution slice
 
-1. Instrument both runtimes to dump `h_nextn` and draft-head logits for a
-   forced-identical token sequence, and localize the first divergence. That is
-   the only remaining lever on `Q27-DECODE`.
-2. Replace per-step graph capture/instantiate with capture-once plus
+1. Fix long-context scaling first: audit every scalar baked into a captured
+   batch graph for length dependence, and key graph slots by the attention
+   regime that actually changes launch geometry rather than by a single 4096
+   boundary. This is the largest measured gap.
+2. Build a reliable reproducer for the long-prompt race, then fix it.
+3. Instrument both runtimes to dump `h_nextn` and draft-head logits for a
+   forced-identical token sequence, and localize the first divergence. This is
+   the remaining lever on short-context `Q27-DECODE`.
+4. Replace per-step graph capture/instantiate with capture-once plus
    `cudaGraphExecUpdate`, matching llama.cpp. Expect roughly 3% of round cost;
    require the exact target and CPU top-k oracles before retention.
-3. Restore an MTP-capable layout at reduced contexts. At 8192 the placement
+5. Restore an MTP-capable layout at reduced contexts. At 8192 the placement
    leaves a layer's projections split across both GPUs, so `batch_supported`
    rejects the verification batch and the server now degrades to the scalar
    oracle instead of failing the request. Matched-context decode cannot be
    compared until MTP runs there.
-4. Localize the sky-stream first-logit difference, then run prefix reuse,
+6. Localize the sky-stream first-logit difference, then run prefix reuse,
    reasoning-budget, mmproj, startup, and peak-memory gates from one build.
-5. Remove superseded experiments, run the full `fo` and CUDA suite, obtain an
+7. Remove superseded experiments, run the full `fo` and CUDA suite, obtain an
    independent review, and only then promote production.
 
 ## Retained / rejected
