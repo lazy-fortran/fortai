@@ -8,6 +8,10 @@ module fortai_status
     integer(int32), parameter, public :: FORTAI_UNSUPPORTED = 2_int32
     integer(int32), parameter, public :: FORTAI_IO_ERROR = 3_int32
     integer(int32), parameter, public :: FORTAI_OUT_OF_MEMORY = 4_int32
+    ! A CUDA/device call failed at runtime.  Distinct from
+    ! FORTAI_UNSUPPORTED so a fallback path can retry an unsupported
+    ! layout without ever retrying after a real device fault.
+    integer(int32), parameter, public :: FORTAI_DEVICE_ERROR = 5_int32
 
     type, public :: status_t
         integer(int32) :: code = FORTAI_OK

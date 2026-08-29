@@ -779,16 +779,18 @@ contains
                 call service_model%forward_batch(int(prompt_ids(batch_begin:batch_end), int64), &
                     int(batch_begin - 1, int64), logits, stat, batch_end == size(prompt_ids))
                 if (.not. stat%is_ok()) then
-                    ! A batch failure may have advanced recurrent/KV state.
-                    ! Reset and replay the complete prompt through the proven
-                    ! scalar path rather than mixing partially-mutated state.
+                    ! batch_supported() above already rejects a layout with no
+                    ! native batch plan, so a failure here is a genuine fault.
+                    ! Do not replay the prompt through the scalar path: a CUDA
+                    ! error is sticky, so the replay cannot succeed, and
+                    ! swallowing this status reports the fault from the wrong
+                    ! place several seconds later.
+                    write(error_unit, '(a,i0,a,i0,a)') &
+                        'fortai-native: prompt batch failed at token ', batch_begin, &
+                        ' count ', batch_count, ': ' // trim(stat%message)
                     call service_model%reset()
-                    prompt_start = 1
-                    timed_prompt_start = 1
-                    state_count = 0
-                    batch_begin = prompt_start
-                    call stat%clear()
-                    exit
+                    service_cache_valid = .false.
+                    return
                 end if
                 state_count = batch_end
                 batch_begin = batch_end + 1
@@ -836,7 +838,9 @@ contains
                     end if
                 end if
                 if (.not. stat%is_ok()) then
-                    write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
+                    write(error_unit, '(a,i0,a)') &
+                        'fortai-native: prompt forward failed at token ', i, &
+                        ': ' // trim(stat%message)
                     service_cache_valid = .false.
                     return
                 end if
@@ -1056,7 +1060,9 @@ contains
                 end if
             end if
             if (.not. stat%is_ok()) then
-                write(error_unit, '(a)') 'fortai-native: model forward failed: ' // trim(stat%message)
+                write(error_unit, '(a,i0,a)') &
+                    'fortai-native: generation forward failed at position ', &
+                    position, ': ' // trim(stat%message)
                 service_cache_valid = .false.
                 return
             end if

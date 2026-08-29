@@ -2405,6 +2405,12 @@ contains
         class(qwen35_cpu_model_t), intent(inout) :: self
         integer :: i
         type(status_t) :: cuda_stat
+        ! Every device call below used to discard its status.  A reset that
+        ! silently fails leaves stale device state behind and the next request
+        ! reports the damage from an unrelated call, so report it here.
+        logical :: reset_failed
+
+        reset_failed = .false.
 
         if (self%fast_enabled) call fast_context_reset(self)
         if (allocated(self % x)) self % x = 0.0_real32
@@ -2419,9 +2425,14 @@ contains
                 if (allocated(self%layers(i)%key_cache_q8_scales)) self%layers(i)%key_cache_q8_scales = 0.0_real32
                 if (allocated(self%layers(i)%value_cache_q8_scales)) &
                     self%layers(i)%value_cache_q8_scales = 0.0_real32
-                if (self%cuda_enabled) call self%layers(i)%cuda_recurrent%reset(cuda_stat)
-                if (self%cuda_enabled) call self%layers(i)%cuda_recurrent_second%reset(cuda_stat)
-                if (self%cuda_enabled) call self%layers(i)%cuda_attention%reset(cuda_stat)
+                if (self%cuda_enabled) then
+                    call self%layers(i)%cuda_recurrent%reset(cuda_stat)
+                    if (.not. cuda_stat%is_ok()) reset_failed = .true.
+                    call self%layers(i)%cuda_recurrent_second%reset(cuda_stat)
+                    if (.not. cuda_stat%is_ok()) reset_failed = .true.
+                    call self%layers(i)%cuda_attention%reset(cuda_stat)
+                    if (.not. cuda_stat%is_ok()) reset_failed = .true.
+                end if
             end do
         end if
         if (allocated(self%mtp_layer%key_cache)) self%mtp_layer%key_cache = 0.0_real32
@@ -2430,13 +2441,18 @@ contains
         if (allocated(self%mtp_layer%value_cache_q8)) self%mtp_layer%value_cache_q8 = 0_int8
         if (allocated(self%mtp_layer%key_cache_q8_scales)) self%mtp_layer%key_cache_q8_scales = 0.0_real32
         if (allocated(self%mtp_layer%value_cache_q8_scales)) self%mtp_layer%value_cache_q8_scales = 0.0_real32
-        if (self%cuda_enabled) call self%mtp_layer%cuda_attention%reset(cuda_stat)
+        if (self%cuda_enabled) then
+            call self%mtp_layer%cuda_attention%reset(cuda_stat)
+            if (.not. cuda_stat%is_ok()) reset_failed = .true.
+        end if
         if (allocated(self%mtp_pending_hidden)) self%mtp_pending_hidden = 0.0_real32
         if (c_associated(self%cuda_mtp_pending_hidden)) then
             if (self%mtp_cuda_slot == 0) then
                 call self%cuda%upload_real(self%cuda_mtp_pending_hidden, self%mtp_pending_hidden, cuda_stat)
+                if (.not. cuda_stat%is_ok()) reset_failed = .true.
             else if (self%mtp_cuda_slot == 1) then
                 call self%cuda_second%upload_real(self%cuda_mtp_pending_hidden, self%mtp_pending_hidden, cuda_stat)
+                if (.not. cuda_stat%is_ok()) reset_failed = .true.
             end if
         end if
         self%mtp_last_pair_position = -1_int64
@@ -2444,6 +2460,8 @@ contains
         self%mtp_last_pair_token = -1_int64
         self%mtp_last_draft_token = -1_int64
         self%mtp_last_draft_match = .false.
+        if (reset_failed) write(error_unit, '(a)') &
+            'fortai-native: CUDA state reset failed: ' // trim(cuda_stat%message)
     end subroutine qwen35_cpu_reset
 
     subroutine qwen35_cpu_forward(self, token_id, position, logits, stat, download_logits, use_mtp, save_mtp_hidden, &

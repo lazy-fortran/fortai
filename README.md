@@ -36,48 +36,55 @@ served from cache.
 
 | Prompt tokens | TTFT FortAI | TTFT llama | Prefill FortAI | Prefill llama | Gen FortAI | Gen llama |
 |---:|---:|---:|---:|---:|---:|---:|
-| ~330 | 3.3 s | 1.1 s | 634 tok/s | 414 tok/s | 45.1 tok/s | 48.2 tok/s |
-| ~1 100 | 4.1 s | 1.7 s | 1145 tok/s | 816 tok/s | 46.0 tok/s | 50.6 tok/s |
-| ~4 150 | 7.9 s | 4.0 s | 1196 tok/s | 1165 tok/s | 40.5 tok/s | 48.1 tok/s |
-| ~8 250 | 15.6 s | 7.0 s | 963 tok/s | 1231 tok/s | 32.8 tok/s | 46.7 tok/s |
-| ~12 350 | 24.7 s | 10.7 s | 786 tok/s | 1231 tok/s | 32.3 tok/s | 41.7 tok/s |
-| ~16 450 | 35.5 s | 14.4 s | 659 tok/s | 1205 tok/s | 30.4 tok/s | 43.4 tok/s |
+| ~330 | 3.3 s | 1.1 s | 635 tok/s | 414 tok/s | 43.7 tok/s | 48.2 tok/s |
+| ~1 100 | 4.0 s | 1.7 s | 1161 tok/s | 816 tok/s | 46.3 tok/s | 50.6 tok/s |
+| ~4 150 | 8.4 s | 4.0 s | 1197 tok/s | 1165 tok/s | 39.4 tok/s | 48.1 tok/s |
+| ~8 250 | 15.7 s | 7.0 s | 963 tok/s | 1231 tok/s | 34.1 tok/s | 46.7 tok/s |
+| ~12 350 | 24.6 s | 10.7 s | 786 tok/s | 1231 tok/s | 33.3 tok/s | 41.7 tok/s |
+| ~16 450 | 35.3 s | 14.4 s | 660 tok/s | 1205 tok/s | 31.3 tok/s | 43.4 tok/s |
 
-FortAI leads prefill below about 4k tokens and is level on generation there. It
-then degrades with context while llama.cpp holds: at ~16k tokens FortAI's
-prefill has fallen to 55% of llama.cpp's and TTFT is 2.5x worse. Closing that
-long-context scaling gap is the open work; `PLAN.md` has the profile.
+FortAI leads prefill below about 4k tokens and trails on generation everywhere.
+It then degrades with context while llama.cpp holds flat: at ~16k tokens
+FortAI's prefill is 55% of llama.cpp's, generation 72%, and TTFT 2.5x worse.
+Closing that long-context scaling gap is the open work; `PLAN.md` has the
+profile.
 
-Memory, from the same runs (contexts differ, so the K/V difference dominates
-the GPU column):
+Memory from the same runs. The contexts differ, so the K/V cache dominates the
+GPU columns:
 
-| Runtime | Context | GPU0 after load / peak | GPU1 after load / peak | Host RSS peak |
+| Runtime | Context | GPU0 load / peak | GPU1 load / peak | Host RSS peak |
 |---|---:|---:|---:|---:|
-| FortAI | 262144 | 15 559 / 15 799 MiB | 13 607 / 13 851 MiB | 1 700 MiB |
+| FortAI | 262144 | 15 548 / 15 772 MiB | 13 607 / 13 851 MiB | 1 926 MiB |
 | llama.cpp | 32768 | 9 871 / 9 881 MiB | 9 871 / 9 887 MiB | 15 688 MiB |
 
 Correctness is checked by `benchmark/check_qwen38_mtp_equivalence.sh`, which
 runs the same greedy prompts with MTP speculation on and with
 `FORTAI_NATIVE_MTP=0` so every token comes from the non-speculative scalar
-path. 3 of 5 prompts match exactly. The other two diverge inside the reasoning
-stream; the batched verification matmul and the scalar matvec reduce in
-different orders, so a near-tie can flip the greedy argmax and the streams
-separate from there. This is not yet distinguished from a speculative defect --
-that needs a logit-level comparison at the first differing position.
+path. **3 of 5 prompts match exactly.** The other two diverge inside the
+reasoning stream, at the same character offset on every run -- both paths are
+individually deterministic, so this is a systematic difference between the
+batched verification matmul and the scalar matvec, not noise. Whether it is
+only their differing reduction order flipping a near-tie argmax, or a real
+speculative defect, needs a logit-level comparison at the first differing
+position.
 
 Reproduce with `benchmark/compare_qwen38_server.sh fortai|llama` and
 `benchmark/check_qwen38_mtp_equivalence.sh`.
 
 ### Known defects
 
-- Long prompts can fail with `CUDA batched RMS norm failed` (HTTP 500). It
-  reproduced once in three attempts on a 256/1024/4096/16384 ladder and never
-  under `CUDA_LAUNCH_BLOCKING=1`, so it is a race, not an out-of-bounds. The
-  reported kernel is only where the sticky error surfaces.
+- Long prompts failed once with `CUDA batched RMS norm failed` (HTTP 500).
+  `benchmark/repro_long_prompt_fault.sh` replays the exact failing ladder
+  inside one server process; 48 long-prompt requests have not reproduced it,
+  and it never appeared under `CUDA_LAUNCH_BLOCKING=1`. The paths that hid it
+  are gone: the batched prompt loop no longer swallows its own failure and
+  replays the prompt through the scalar path (a CUDA error is sticky, so that
+  replay could never succeed), `reset()` no longer discards device statuses,
+  and a device fault is no longer reported as `FORTAI_UNSUPPORTED`. A
+  recurrence now names the failing batch and token offset.
 - At some reduced contexts the weight placement leaves a layer's projections
   split across both GPUs, so the MTP verification batch is unsupported. The
-  server now retires speculation for that request and continues on the scalar
-  path instead of failing it.
+  server retires speculation for that request and continues on the scalar path.
 
 ### Whisper CUDA (`large-v3-turbo`)
 

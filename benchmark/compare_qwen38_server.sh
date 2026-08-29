@@ -3,12 +3,12 @@
 #
 # Usage: benchmark/compare_qwen38_server.sh fortai|llama
 #
-# Both sides read the same production environment file (default: the
-# slopcode-llamacpp systemd drop-in) so model, draft, MTP depth, tensor split,
-# batching, K/V types and sampler are identical.  Only the context differs:
-# llama.cpp cannot allocate the 262144-token production cache, so it uses
-# BENCH_LLAMA_CONTEXT.  Every request carries a unique nonce prefix, which
-# defeats the shared prefix cache and keeps each prefill cold.
+# Both sides read the same production environment file (the slopcode-llamacpp
+# systemd drop-in) so model, draft, MTP depth, tensor split, batching, K/V
+# types and sampler are identical.  Only the context differs: llama.cpp cannot
+# allocate the 262144-token production cache.  Every request carries a unique
+# nonce prefix, which defeats the shared prefix cache and keeps each prefill
+# cold.  BENCH_PROMPT_SIZES and BENCH_CONTEXT are the only knobs.
 set -euo pipefail
 
 side="${1:-}"
@@ -18,14 +18,16 @@ case "$side" in
 esac
 
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-env_file="${BENCH_ENV_FILE:-/home/ert/.config/systemd/user/slopcode-llamacpp.service.d/local.conf}"
-start_script="${BENCH_LLAMA_START:-/home/ert/infra/slopcode-infra/scripts/server_start_llamacpp.sh}"
-fortai_bin="${BENCH_FORTAI_BIN:-$root_dir/build/cuda/fortai_server}"
-port="${BENCH_PORT:-18091}"
-llama_context="${BENCH_LLAMA_CONTEXT:-8192}"
-gen_tokens="${BENCH_GEN_TOKENS:-128}"
-repeats="${BENCH_REPEATS:-2}"
-prompt_sizes="${BENCH_PROMPT_SIZES:-256,1024,4096,16384}"
+env_file=/home/ert/.config/systemd/user/slopcode-llamacpp.service.d/local.conf
+start_script=/home/ert/infra/slopcode-infra/scripts/server_start_llamacpp.sh
+fortai_bin="$root_dir/build/cuda/fortai_server"
+port=18091
+gen_tokens=128
+repeats=2
+prompt_sizes="${BENCH_PROMPT_SIZES:-256,1024,4096,8192,12288,16384}"
+# llama.cpp cannot allocate the production K/V cache; 32768 is the largest
+# context that both loads and covers the sweep's longest prompt.
+llama_context=32768
 result_dir="$root_dir/benchmark/results"
 log_dir="$root_dir/benchmark/logs"
 mkdir -p "$result_dir" "$log_dir"

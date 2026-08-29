@@ -1,11 +1,14 @@
 module fortai_backend_cuda
     use, intrinsic :: iso_c_binding, only: c_float, c_int, c_int8_t, c_int32_t, c_int64_t, c_loc, c_ptr, &
         c_null_ptr, c_size_t, c_associated
-    use fortai_status, only: FORTAI_INVALID, FORTAI_UNSUPPORTED, status_t
+    use fortai_status, only: FORTAI_DEVICE_ERROR, FORTAI_INVALID, &
+        FORTAI_UNSUPPORTED, status_t
     implicit none
     private
 
     integer(c_int), parameter, public :: FORTAI_CUDA_OK = 0_c_int
+    integer(c_int), parameter, public :: FORTAI_CUDA_INVALID = 1_c_int
+    integer(c_int), parameter, public :: FORTAI_CUDA_RUNTIME_ERROR = 2_c_int
 
     type, public :: cuda_q8_context_t
         type(c_ptr) :: handle = c_null_ptr
@@ -1004,6 +1007,27 @@ module fortai_backend_cuda
 
 contains
 
+    ! Map a backend return code onto a status.  FORTAI_CUDA_INVALID is a
+    ! caller/layout problem a fallback may legitimately handle;
+    ! FORTAI_CUDA_RUNTIME_ERROR is a device fault, and CUDA errors are sticky,
+    ! so no later call on that context can succeed.  Collapsing both onto
+    ! FORTAI_UNSUPPORTED made a fault look retryable and surfaced it from
+    ! whichever unrelated call ran next.
+    subroutine set_cuda_status(stat, code, message)
+        type(status_t), intent(inout) :: stat
+        integer(c_int), intent(in) :: code
+        character(len=*), intent(in) :: message
+
+        select case (code)
+        case (FORTAI_CUDA_OK)
+            call stat%clear()
+        case (FORTAI_CUDA_INVALID)
+            call stat%set(FORTAI_INVALID, message)
+        case default
+            call stat%set(FORTAI_DEVICE_ERROR, message)
+        end select
+    end subroutine set_cuda_status
+
     subroutine cuda_memory_info(device, free_bytes, total_bytes, stat)
         integer, intent(in) :: device
         integer(c_size_t), intent(out) :: free_bytes, total_bytes
@@ -1043,7 +1067,7 @@ contains
         if (.not. c_associated(self%handle)) return
         code = c_q4_context_destroy(self%handle)
         self%handle = c_null_ptr
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 context destruction failed')
     end subroutine cuda_q4_context_destroy
 
@@ -1058,7 +1082,7 @@ contains
             return
         end if
         code = c_q4_context_synchronize(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 context synchronization failed')
     end subroutine cuda_q4_context_synchronize
 
@@ -1087,7 +1111,7 @@ contains
             return
         end if
         code = c_q4_context_set_consumer_stream(self%handle, int(device_slot, c_int), stream)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 consumer stream setup failed')
     end subroutine cuda_q4_context_set_consumer_stream
 
@@ -1110,7 +1134,7 @@ contains
         end if
         code = c_q4_context_transfer(self%handle, int(source_slot, c_int), source, &
             int(destination_slot, c_int), destination, bytes)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 cross-device transfer failed')
     end subroutine cuda_q4_context_transfer
 
@@ -1147,7 +1171,7 @@ contains
         if (.not. c_associated(self%handle)) return
         code = c_q4_weights_destroy(self%handle)
         self%handle = c_null_ptr
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 weight destruction failed')
     end subroutine cuda_q4_weights_destroy
 
@@ -1169,7 +1193,8 @@ contains
         code = c_q4_matvec_host(context%handle, weights%handle, activation, &
             int(size(activation) * storage_size(activation(1)) / 8, c_size_t), output, &
             int(size(output) * storage_size(output(1)) / 8, c_size_t), elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 matvec failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 matvec failed')
     end subroutine cuda_q4_matvec_host
 
     subroutine cuda_q4_matvec_host_pair(context, first_weights, second_weights, activation, first_output, &
@@ -1193,7 +1218,8 @@ contains
             int(size(activation) * storage_size(activation(1)) / 8, c_size_t), first_output, &
             int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
             int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 paired matvec failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 paired matvec failed')
     end subroutine cuda_q4_matvec_host_pair
 
     subroutine cuda_q4_matvec_host_triplet(context, first_weights, second_weights, third_weights, activation, &
@@ -1218,7 +1244,8 @@ contains
             first_output, int(size(first_output) * storage_size(first_output(1)) / 8, c_size_t), second_output, &
             int(size(second_output) * storage_size(second_output(1)) / 8, c_size_t), third_output, &
             int(size(third_output) * storage_size(third_output(1)) / 8, c_size_t), elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 triplet matvec failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 triplet matvec failed')
     end subroutine cuda_q4_matvec_host_triplet
 
     subroutine cuda_q4_matvec_device(context, weights, device_activation, activation_elements, device_output, &
@@ -1238,7 +1265,7 @@ contains
         end if
         code = c_q4_matvec_device(context%handle, weights%handle, device_activation, activation_elements, &
             device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 resident matvec failed')
     end subroutine cuda_q4_matvec_device
 
@@ -1260,7 +1287,7 @@ contains
         end if
         code = c_q4_matvec_device_swiglu(context%handle, gate_weights%handle, up_weights%handle, &
             device_activation, activation_elements, device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 fused SwiGLU matvec failed')
     end subroutine cuda_q4_matvec_device_swiglu
 
@@ -1282,7 +1309,7 @@ contains
         end if
         code = c_q4_matvec_device_swiglu_remote_output(context%handle, gate_weights%handle, &
             up_weights%handle, device_activation, activation_elements, device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 fused remote SwiGLU matvec failed')
     end subroutine cuda_q4_matvec_device_swiglu_remote_output
 
@@ -1304,7 +1331,7 @@ contains
         end if
         code = c_q4_matvec_device_swiglu_down(context%handle, gate_weights%handle, up_weights%handle, &
             down_weights%handle, device_activation, activation_elements, device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 fused SwiGLU/down matvec failed')
     end subroutine cuda_q4_matvec_device_swiglu_down
 
@@ -1329,7 +1356,7 @@ contains
         code = c_q4_matmul_device_swiglu_down_slot(context%handle, int(device_slot, c_int), gate_weights%handle, &
             up_weights%handle, down_weights%handle, device_activation, activation_elements, int(batch, c_int), &
             device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 batched fused SwiGLU/down matmul failed')
     end subroutine cuda_q4_matmul_device_swiglu_down_slot
 
@@ -1358,7 +1385,7 @@ contains
         sizes = [first_output_elements, second_output_elements]
         code = c_q4_matvec_device_group(context%handle, c_loc(handles), device_activation, activation_elements, &
             c_loc(outputs), c_loc(sizes), 2_c_int)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 resident paired matvec failed')
     end subroutine cuda_q4_matvec_device_pair
 
@@ -1392,7 +1419,7 @@ contains
         sizes = [first_output_elements, second_output_elements, third_output_elements]
         code = c_q4_matvec_device_group(context%handle, c_loc(handles), device_activation, activation_elements, &
             c_loc(outputs), c_loc(sizes), 3_c_int)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 resident triplet matvec failed')
     end subroutine cuda_q4_matvec_device_triplet
 
@@ -1420,7 +1447,7 @@ contains
             third_weights%handle, fourth_weights%handle, device_activation, activation_elements, first_output, &
             first_output_elements, second_output, second_output_elements, third_output, third_output_elements, &
             fourth_output, fourth_output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 resident quad matvec failed')
     end subroutine cuda_q4_matvec_device_quad
 
@@ -1449,7 +1476,8 @@ contains
         sizes = [first_output_elements, second_output_elements]
         code = c_q4_matmul_device_group(context%handle, c_loc(handles), device_activation, activation_elements, &
             int(batch, c_int), c_loc(outputs), c_loc(sizes), 2_c_int)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched pair failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 batched pair failed')
     end subroutine cuda_q4_matmul_device_pair
 
     subroutine cuda_q4_matmul_device_one(context, weights, device_activation, activation_elements, batch, &
@@ -1470,7 +1498,8 @@ contains
         end if
         code = c_q4_matmul_device(context%handle, weights%handle, device_activation, activation_elements, &
             int(batch, c_int), device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched matrix failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 batched matrix failed')
     end subroutine cuda_q4_matmul_device_one
 
     subroutine cuda_q4_matmul_device_triplet(context, first_weights, second_weights, third_weights, &
@@ -1500,7 +1529,8 @@ contains
         sizes = [first_output_elements, second_output_elements, third_output_elements]
         code = c_q4_matmul_device_group(context%handle, c_loc(handles), device_activation, activation_elements, &
             int(batch, c_int), c_loc(outputs), c_loc(sizes), 3_c_int)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched triplet failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 batched triplet failed')
     end subroutine cuda_q4_matmul_device_triplet
 
     subroutine cuda_q4_matmul_device_pair_slot(context, device_slot, first_weights, second_weights, device_activation, &
@@ -1529,7 +1559,8 @@ contains
         sizes = [first_output_elements, second_output_elements]
         code = c_q4_matmul_device_group_slot(context%handle, int(device_slot, c_int), c_loc(handles), &
             device_activation, activation_elements, int(batch, c_int), c_loc(outputs), c_loc(sizes), 2_c_int)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched pair slot failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 batched pair slot failed')
     end subroutine cuda_q4_matmul_device_pair_slot
 
     subroutine cuda_q4_matmul_device_one_slot(context, device_slot, weights, device_activation, activation_elements, &
@@ -1557,7 +1588,8 @@ contains
         sizes = [output_elements]
         code = c_q4_matmul_device_group_slot(context%handle, int(device_slot, c_int), c_loc(handles), &
             device_activation, activation_elements, int(batch, c_int), c_loc(outputs), c_loc(sizes), 1_c_int)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched matrix slot failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 batched matrix slot failed')
     end subroutine cuda_q4_matmul_device_one_slot
 
     subroutine cuda_q4_matmul_device_triplet_slot(context, device_slot, first_weights, second_weights, third_weights, &
@@ -1589,7 +1621,8 @@ contains
         sizes = [first_output_elements, second_output_elements, third_output_elements]
         code = c_q4_matmul_device_group_slot(context%handle, int(device_slot, c_int), c_loc(handles), &
             device_activation, activation_elements, int(batch, c_int), c_loc(outputs), c_loc(sizes), 3_c_int)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched triplet slot failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 batched triplet slot failed')
     end subroutine cuda_q4_matmul_device_triplet_slot
 
     subroutine cuda_q4_matmul_device_quad_slot(context, device_slot, first_weights, second_weights, third_weights, &
@@ -1622,7 +1655,8 @@ contains
         sizes = [first_output_elements, second_output_elements, third_output_elements, fourth_output_elements]
         code = c_q4_matmul_device_group_slot(context%handle, int(device_slot, c_int), c_loc(handles), &
             device_activation, activation_elements, int(batch, c_int), c_loc(outputs), c_loc(sizes), 4_c_int)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched quad slot failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 batched quad slot failed')
     end subroutine cuda_q4_matmul_device_quad_slot
 
     subroutine cuda_q4_matvec_device_group_remote_output(context, first_weights, second_weights, third_weights, &
@@ -1666,7 +1700,7 @@ contains
         end if
         code = c_q4_matvec_device_group_remote_output(context%handle, c_loc(handles), device_activation, &
             activation_elements, c_loc(outputs), c_loc(sizes), int(count, c_int))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 resident remote-output group failed')
     end subroutine cuda_q4_matvec_device_group_remote_output
 
@@ -1687,7 +1721,7 @@ contains
         end if
         code = c_q4_matvec_device_remote_input(context%handle, weights%handle, device_activation, &
             activation_elements, device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 resident remote-input matvec failed')
     end subroutine cuda_q4_matvec_device_remote_input
 
@@ -1707,7 +1741,7 @@ contains
             return
         end if
         code = c_q4_embedding_device(context%handle, weights%handle, token_id, device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 resident embedding failed')
     end subroutine cuda_q4_embedding_device
 
@@ -1729,7 +1763,8 @@ contains
         end if
         code = c_q4_embedding_device_batch(context%handle, weights%handle, c_loc(host_tokens), int(batch, c_int), &
             device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA Q4 batched embedding failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA Q4 batched embedding failed')
     end subroutine cuda_q4_embedding_device_batch
 
     subroutine cuda_q4_embedding_device_batch_slot(context, device_slot, weights, &
@@ -1753,7 +1788,7 @@ contains
         end if
         code = c_q4_embedding_device_batch_slot(context%handle, int(device_slot, c_int), &
             weights%handle, c_loc(host_tokens), int(batch, c_int), device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q4 slotted embedding failed')
     end subroutine cuda_q4_embedding_device_batch_slot
 
@@ -1781,7 +1816,7 @@ contains
         if (.not. c_associated(self%handle)) return
         code = c_context_destroy(self%handle)
         self%handle = c_null_ptr
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 context destruction failed')
     end subroutine cuda_q8_context_destroy
 
@@ -1797,7 +1832,7 @@ contains
             return
         end if
         code = c_context_set_position(self%handle, int(position, c_int))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA device position update failed')
     end subroutine cuda_q8_context_set_position
 
@@ -1812,7 +1847,7 @@ contains
             return
         end if
         code = c_context_synchronize(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA context synchronization failed')
     end subroutine cuda_q8_context_synchronize
 
@@ -1828,7 +1863,7 @@ contains
             return
         end if
         code = c_context_adopt_stream(self%handle, stream)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA stream hand-off failed')
     end subroutine cuda_q8_context_adopt_stream
 
@@ -1854,7 +1889,7 @@ contains
             return
         end if
         code = c_context_capture_begin(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA graph capture begin failed')
     end subroutine cuda_q8_context_capture_begin
 
@@ -1869,7 +1904,7 @@ contains
             return
         end if
         code = c_context_capture_end(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA graph capture end failed')
     end subroutine cuda_q8_context_capture_end
 
@@ -1884,7 +1919,7 @@ contains
             return
         end if
         code = c_context_graph_launch(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA graph launch failed')
     end subroutine cuda_q8_context_graph_launch
 
@@ -1900,7 +1935,7 @@ contains
             return
         end if
         code = c_context_capture_begin_slot(self%handle, int(slot, c_int))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA graph slot capture begin failed')
     end subroutine cuda_q8_context_capture_begin_slot
 
@@ -1916,7 +1951,7 @@ contains
             return
         end if
         code = c_context_capture_end_slot(self%handle, int(slot, c_int))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA graph slot capture end failed')
     end subroutine cuda_q8_context_capture_end_slot
 
@@ -1932,7 +1967,7 @@ contains
             return
         end if
         code = c_context_graph_launch_slot(self%handle, int(slot, c_int))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA graph slot launch failed')
     end subroutine cuda_q8_context_graph_launch_slot
 
@@ -1969,7 +2004,7 @@ contains
         if (.not. c_associated(self%handle)) return
         code = c_weights_destroy(self%handle)
         self%handle = c_null_ptr
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 weight destruction failed')
     end subroutine cuda_q8_weights_destroy
 
@@ -2003,7 +2038,7 @@ contains
         if (.not. c_associated(self%handle) .or. .not. c_associated(buffer)) return
         code = c_buffer_destroy(self%handle, buffer)
         buffer = c_null_ptr
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 device buffer destruction failed')
     end subroutine cuda_q8_free_buffer
 
@@ -2022,7 +2057,7 @@ contains
             return
         end if
         code = c_buffer_upload(self%handle, buffer, host_data, bytes)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 device upload failed')
     end subroutine cuda_q8_upload
 
@@ -2041,7 +2076,7 @@ contains
         end if
         code = c_buffer_upload_ptr(self%handle, buffer, c_loc(host_data), &
             int(size(host_data), c_size_t) * int(storage_size(host_data(1)) / 8, c_size_t))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA real device upload failed')
     end subroutine cuda_q8_upload_real
 
@@ -2060,7 +2095,7 @@ contains
             return
         end if
         code = c_buffer_download(self%handle, host_data, buffer, bytes)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 device download failed')
     end subroutine cuda_q8_download
 
@@ -2079,7 +2114,7 @@ contains
         end if
         code = c_buffer_download_ptr(self%handle, c_loc(host_data), buffer, &
             int(size(host_data), c_size_t) * int(storage_size(host_data(1)) / 8, c_size_t))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 real download failed')
     end subroutine cuda_q8_download_real
 
@@ -2099,7 +2134,7 @@ contains
             return
         end if
         code = c_matvec_resident(context%handle, weights%handle, activation, output, kernel_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 resident matvec failed')
     end subroutine cuda_q8_matvec_resident
 
@@ -2116,7 +2151,7 @@ contains
             return
         end if
         code = c_reserve_matvec_scratch(context%handle, activation_elements, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA F32 matvec scratch reservation failed')
     end subroutine cuda_q8_reserve_matvec_scratch
 
@@ -2138,7 +2173,7 @@ contains
         end if
         code = c_matvec_device_f32(context%handle, weights%handle, activation, activation_elements, &
             output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA device F32 matvec failed')
     end subroutine cuda_q8_matvec_device_f32
 
@@ -2164,7 +2199,7 @@ contains
         code = c_matvec_device_f32_pair(context%handle, first_weights%handle, second_weights%handle, &
             activation, activation_elements, first_output, first_output_elements, second_output, &
             second_output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA device F32 matvec pair failed')
     end subroutine cuda_q8_matvec_device_f32_pair
 
@@ -2187,7 +2222,7 @@ contains
         end if
         code = c_matmul_device_f32(context%handle, weights%handle, activation, activation_elements, &
             int(batch, c_int), output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA device F32 batched matmul failed')
     end subroutine cuda_q8_matmul_device_f32
 
@@ -2207,7 +2242,7 @@ contains
             return
         end if
         code = c_embedding_device(context%handle, weights%handle, token_id, output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 embedding lookup failed')
     end subroutine cuda_qwen35_embedding_device
 
@@ -2230,7 +2265,7 @@ contains
         end if
         code = c_embedding_device_batch(context%handle, weights%handle, c_loc(host_tokens), &
             int(batch, c_int), output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA batched embedding lookup failed')
     end subroutine cuda_qwen35_embedding_device_batch
 
@@ -2248,7 +2283,7 @@ contains
             return
         end if
         code = c_qwen35_copy_device(context%handle, device_input, device_output, bytes)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA device copy failed')
     end subroutine cuda_qwen35_copy_device
 
@@ -2267,7 +2302,7 @@ contains
             return
         end if
         code = c_qwen35_add_device(context%handle, device_left, device_right, device_output, elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA device add failed')
     end subroutine cuda_qwen35_add_device
 
@@ -2288,7 +2323,7 @@ contains
         end if
         code = c_qwen35_copy_column_device(context%handle, device_input, stride, int(column, c_int), &
             device_output, elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA device column copy failed')
     end subroutine cuda_qwen35_copy_column_device
 
@@ -2306,7 +2341,8 @@ contains
             return
         end if
         code = c_qwen35_add_matrix_device(context%handle, device_left, device_right, device_output, elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA matrix add failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA matrix add failed')
     end subroutine cuda_qwen35_add_matrix_device
 
     subroutine cuda_qwen35_rms_norm_device(context, device_input, device_weights, device_output, &
@@ -2327,7 +2363,7 @@ contains
         end if
         code = c_qwen35_rms_norm_device(context%handle, device_input, device_weights, device_output, &
             elements, epsilon)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA device RMS norm failed')
     end subroutine cuda_qwen35_rms_norm_device
 
@@ -2350,7 +2386,8 @@ contains
         end if
         code = c_qwen35_rms_norm_matrix_device(context%handle, device_input, device_weights, device_output, &
             hidden, int(batch, c_int), epsilon)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA batched RMS norm failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA batched RMS norm failed')
     end subroutine cuda_qwen35_rms_norm_matrix_device
 
     subroutine cuda_qwen35_silu_product_device(context, device_gate, device_up, elements, stat)
@@ -2367,7 +2404,7 @@ contains
             return
         end if
         code = c_qwen35_silu_product_device(context%handle, device_gate, device_up, elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA SiLU product failed')
     end subroutine cuda_qwen35_silu_product_device
 
@@ -2385,7 +2422,8 @@ contains
             return
         end if
         code = c_qwen35_silu_product_matrix_device(context%handle, device_gate, device_up, elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA matrix SiLU product failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA matrix SiLU product failed')
     end subroutine cuda_qwen35_silu_product_matrix_device
 
     subroutine cuda_qwen35_argmax_device(context, device_logits, elements, host_index, stat)
@@ -2428,7 +2466,7 @@ contains
         end if
         code = c_qwen35_argmax_rows_device(context%handle, device_logits, row_elements, &
             int(size(host_indices), c_int), c_loc(host_indices))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA row argmax failed')
     end subroutine cuda_qwen35_argmax_rows_device
 
@@ -2454,7 +2492,7 @@ contains
         code = c_qwen35_topk_rows_device(context%handle, device_logits, row_elements, &
             int(size(host_indices, 2), c_int), int(size(host_indices, 1), c_int), &
             c_loc(host_indices), c_loc(host_values))
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA row top-k failed')
     end subroutine cuda_qwen35_topk_rows_device
 
@@ -2474,7 +2512,8 @@ contains
         end if
         code = c_qwen35_concat_device(context%handle, device_first, device_second, &
             elements, device_output)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, 'CUDA concat failed')
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
+            'CUDA concat failed')
     end subroutine cuda_qwen35_concat_device
 
     subroutine cuda_qwen35_concat_matrix_device(context, device_first, device_second, hidden, &
@@ -2495,7 +2534,7 @@ contains
         end if
         code = c_qwen35_concat_matrix_device(context%handle, device_first, device_second, &
             hidden, int(batch, c_int), device_output)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA batched concat failed')
     end subroutine cuda_qwen35_concat_matrix_device
 
@@ -2517,7 +2556,7 @@ contains
         end if
         code = c_qwen35_shift_target_hidden_device(context%handle, device_input, &
             device_pending, hidden, int(batch, c_int), device_output)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA target-hidden shift failed')
     end subroutine cuda_qwen35_shift_target_hidden_device
 
@@ -2541,7 +2580,7 @@ contains
         end if
         code = c_matvec_host(context%handle, weights%handle, activation, activation_bytes, &
             output, output_bytes, elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 host matvec failed')
     end subroutine cuda_q8_matvec_host
 
@@ -2568,7 +2607,7 @@ contains
         code = c_matvec_host_pair(context%handle, first_weights%handle, second_weights%handle, &
             activation, activation_bytes, first_output, first_output_bytes, second_output, &
             second_output_bytes, elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 host matvec pair failed')
     end subroutine cuda_q8_matvec_host_pair
 
@@ -2597,7 +2636,7 @@ contains
         code = c_matvec_host_triplet(context%handle, first_weights%handle, second_weights%handle, &
             third_weights%handle, activation, activation_bytes, first_output, first_output_bytes, &
             second_output, second_output_bytes, third_output, third_output_bytes, elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 host matvec triplet failed')
     end subroutine cuda_q8_matvec_host_triplet
 
@@ -2623,7 +2662,7 @@ contains
         code = c_matvec_host_triplet_contiguous(context%handle, first_weights%handle, &
             second_weights%handle, third_weights%handle, activation, activation_bytes, host_output, &
             host_output_bytes, elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 contiguous triplet failed')
     end subroutine cuda_q8_matvec_host_triplet_contiguous
 
@@ -2648,7 +2687,7 @@ contains
         end if
         code = c_ffn_host(context%handle, gate_weights%handle, up_weights%handle, down_weights%handle, &
             host_activation, activation_bytes, host_output, output_bytes, elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 FFN host operation failed')
     end subroutine cuda_q8_ffn_host
 
@@ -2671,7 +2710,7 @@ contains
         end if
         code = c_ffn_device(context%handle, gate_weights%handle, up_weights%handle, down_weights%handle, &
             device_activation, activation_elements, device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Q8 FFN device operation failed')
     end subroutine cuda_q8_ffn_device
 
@@ -2751,7 +2790,7 @@ contains
         if (.not. c_associated(self%handle)) return
         code = c_qwen35_recurrent_destroy(self%handle)
         self%handle = c_null_ptr
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen3.5 CUDA recurrent layer destruction failed')
     end subroutine cuda_qwen35_recurrent_destroy
 
@@ -2763,7 +2802,7 @@ contains
         call stat%clear()
         if (.not. c_associated(self%handle)) return
         code = c_qwen35_recurrent_reset(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen3.5 CUDA recurrent layer reset failed')
     end subroutine cuda_qwen35_recurrent_reset
 
@@ -2786,7 +2825,7 @@ contains
         end if
         code = c_qwen35_recurrent_run(self%handle, host_activation, activation_bytes, host_output, &
             output_bytes, elapsed_ms)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen3.5 CUDA recurrent run failed')
     end subroutine cuda_qwen35_recurrent_run
 
@@ -2807,7 +2846,7 @@ contains
         end if
         code = c_qwen35_recurrent_run_device(self%handle, device_activation, activation_elements, &
             device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen3.5 CUDA recurrent device run failed')
     end subroutine cuda_qwen35_recurrent_run_device
 
@@ -2828,7 +2867,7 @@ contains
         end if
         code = c_qwen35_recurrent_run_core_device(self%handle, device_qkv, qkv_elements, device_gate, gate_elements, &
             device_alpha, alpha_elements, device_beta, beta_elements, device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen3.5 CUDA recurrent core failed')
     end subroutine cuda_qwen35_recurrent_run_core_device
 
@@ -2850,7 +2889,7 @@ contains
         end if
         code = c_qwen35_recurrent_run_core_device_batch(self%handle, device_qkv, qkv_elements, device_gate, gate_elements, &
             device_alpha, alpha_elements, device_beta, beta_elements, int(batch, c_int), device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen3.5 CUDA recurrent batched core failed')
     end subroutine cuda_qwen35_recurrent_run_core_device_batch
 
@@ -2865,7 +2904,7 @@ contains
             return
         end if
         code = c_qwen35_recurrent_restore_first(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen3.5 recurrent rollback failed')
     end subroutine cuda_qwen35_recurrent_restore_first
 
@@ -2880,7 +2919,7 @@ contains
             return
         end if
         code = c_qwen35_recurrent_restore_second(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen3.5 recurrent second-row rollback failed')
     end subroutine cuda_qwen35_recurrent_restore_second
 
@@ -2984,7 +3023,7 @@ contains
         if (.not. c_associated(self%handle)) return
         code = c_qwen35_attention_destroy(self%handle)
         self%handle = c_null_ptr
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Qwen attention destruction failed')
     end subroutine cuda_qwen35_attention_destroy
 
@@ -2996,7 +3035,7 @@ contains
         call stat%clear()
         if (.not. c_associated(self%handle)) return
         code = c_qwen35_attention_reset(self%handle)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Qwen attention reset failed')
     end subroutine cuda_qwen35_attention_reset
 
@@ -3017,7 +3056,7 @@ contains
         end if
         code = c_qwen35_attention_run_device(self%handle, device_activation, activation_elements, &
             int(position, c_int), device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Qwen attention device execution failed')
     end subroutine cuda_qwen35_attention_run_device
 
@@ -3039,7 +3078,7 @@ contains
         end if
         code = c_qwen35_attention_run_core_device(self%handle, device_query, query_elements, device_key, &
             key_elements, device_value, value_elements, int(position, c_int), device_output, output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'CUDA Qwen attention core failed')
     end subroutine cuda_qwen35_attention_run_core_device
 
@@ -3062,7 +3101,7 @@ contains
         code = c_qwen35_attention_run_core_device_batch(self%handle, device_query, query_elements, device_key, &
             key_elements, device_value, value_elements, int(position, c_int), int(batch, c_int), device_output, &
             output_elements)
-        if (code /= FORTAI_CUDA_OK) call stat%set(FORTAI_UNSUPPORTED, &
+        if (code /= FORTAI_CUDA_OK) call set_cuda_status(stat, code, &
             'Qwen attention batched core failed')
     end subroutine cuda_qwen35_attention_run_core_device_batch
 

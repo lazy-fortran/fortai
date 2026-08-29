@@ -153,13 +153,22 @@ to 262k. That is the first thing to audit.
 
 ## Open defects
 
-- `CUDA batched RMS norm failed` (HTTP 500) on long prompts. Reproduced once in
-  three attempts on a 256/1024/4096/16384 ladder, never under
-  `CUDA_LAUNCH_BLOCKING=1`; it is a race and the reported kernel is only where
-  the sticky error surfaces. The dual-GPU host bridge in
-  `fortai_cuda_q4_context_transfer` was audited and its ring-slot event
-  ordering and `ensure_host_buffer` synchronization are sound, so the race is
-  elsewhere. A reliable reproducer is required before any fix.
+- `CUDA batched RMS norm failed` (HTTP 500) on long prompts. Observed once.
+  `benchmark/repro_long_prompt_fault.sh` drives the exact failing ladder
+  (256/1024/4096/16384, two 128-token requests per size) repeatedly inside one
+  server process; 48 long-prompt requests across three configurations have not
+  reproduced it, and it never appeared under `CUDA_LAUNCH_BLOCKING=1`.
+
+  Three code paths that made it undiagnosable have been removed, and the
+  leading hypothesis now follows from them. The reported error came from the
+  scalar prompt replay, which only ran because the batched prompt loop
+  swallowed its own failure, called `reset()` and replayed the whole prompt.
+  Since a CUDA error is sticky that replay could never succeed, and `reset()`
+  itself discarded every device status. The batch failure is now reported and
+  propagated instead of replayed, `reset()` reports device failures, and a
+  device fault is no longer classified as `FORTAI_UNSUPPORTED`. If it recurs it
+  will name the failing batch and token offset directly.
+
 - Greedy MTP output matches the non-speculative scalar oracle on only 3 of 5
   general prompts; the two failures diverge inside the reasoning stream. The
   batched verification matmul and the scalar matvec reduce in different orders,
