@@ -1,5 +1,5 @@
 program fortai_cuda_run
-    use, intrinsic :: iso_c_binding, only: c_size_t
+    use, intrinsic :: iso_c_binding, only: c_associated, c_size_t
     use, intrinsic :: iso_fortran_env, only: int64, real32
     use fortai_backend_cuda, only: cuda_memory_info
     use fortai_qwen35_cpu, only: qwen35_cpu_model_t
@@ -21,7 +21,7 @@ program fortai_cuda_run
     real(real32) :: elapsed, load_seconds, forward_seconds, sample_seconds, tokens_per_second, checksum
     real(real32) :: greedy_sum
     character(len=16) :: trace_tokens, trace_top_tokens
-    logical :: trace_enabled, disable_cuda, exclude_prompt, batch_smoke
+    logical :: trace_enabled, disable_cuda, exclude_prompt, batch_smoke, batch_bench
     character(len=8) :: disable_cuda_env
     character(len=16) :: exclude_prompt_text
     character(len=16) :: second_device_text
@@ -39,6 +39,9 @@ program fortai_cuda_run
     real(real32) :: batch_max_abs
     integer :: batch_count, batch_i, scalar_index, batch_index, batch_smoke_length
     character(len=8) :: batch_smoke_env
+    character(len=8) :: batch_bench_env
+    integer :: batch_bench_length, bench_total, bench_begin, bench_end, bench_size
+    real(real32) :: batch_prefill_seconds, batch_prefill_tokens_per_second
 
     call get_command_argument(1, model_path)
     if (len_trim(model_path) == 0) then
@@ -112,6 +115,75 @@ program fortai_cuda_run
         exclude_prompt_text(1:exclude_prompt_length) == '1'
     call get_environment_variable('FORTAI_BATCH_SMOKE', batch_smoke_env, length=batch_smoke_length)
     batch_smoke = batch_smoke_length > 0 .and. batch_smoke_env(1:batch_smoke_length) == '1'
+    call get_environment_variable('FORTAI_BATCH_BENCH', batch_bench_env, length=batch_bench_length)
+    batch_bench = batch_bench_length > 0 .and. batch_bench_env(1:batch_bench_length) == '1'
+    if (batch_bench) then
+        bench_total = max(2, min(int(steps), 4096))
+        bench_size = max(2, min(model%cuda_batch_capacity, bench_total))
+        if (.not. model%cuda_device_pipeline .or. .not. model%batch_supported(bench_size)) then
+            print '(a)', 'batch_bench=unsupported'
+            call model%close()
+            stop 0
+        end if
+        allocate(batch_tokens(bench_total), batch_logits(model%vocabulary_size))
+        do batch_i = 1, bench_total
+            batch_tokens(batch_i) = modulo(token + int(batch_i - 1, int64), int(model%vocabulary_size, int64))
+        end do
+        call model%reset()
+        bench_begin = 1
+        do while (bench_begin <= bench_total)
+            bench_end = min(bench_total, bench_begin + model%cuda_batch_capacity - 1)
+            call model%forward_batch(batch_tokens(bench_begin:bench_end), int(bench_begin - 1, int64), &
+                batch_logits, stat, bench_end == bench_total)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'batch_bench=warmup_failed ' // stat%message
+                call model%close()
+                stop 1
+            end if
+            bench_begin = bench_end + 1
+        end do
+        call model%reset()
+        call system_clock(forward_start, clock_rate)
+        bench_begin = 1
+        do while (bench_begin <= bench_total)
+            bench_end = min(bench_total, bench_begin + model%cuda_batch_capacity - 1)
+            call model%forward_batch(batch_tokens(bench_begin:bench_end), int(bench_begin - 1, int64), &
+                batch_logits, stat, bench_end == bench_total)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'batch_bench=failed ' // stat%message
+                call model%close()
+                stop 1
+            end if
+            bench_begin = bench_end + 1
+        end do
+        ! CUDA launches are asynchronous.  Fence both scheduler streams
+        ! before stopping the clock; otherwise this reports host enqueue
+        ! rate, while an MTP hidden-state download reports real GPU time.
+        call model%cuda%synchronize(stat)
+        if (.not. stat%is_ok()) then
+            print '(a)', 'batch_bench=primary_sync_failed ' // stat%message
+            call model%close()
+            stop 1
+        end if
+        if (c_associated(model%cuda_second%handle)) then
+            call model%cuda_second%synchronize(stat)
+            if (.not. stat%is_ok()) then
+                print '(a)', 'batch_bench=secondary_sync_failed ' // stat%message
+                call model%close()
+                stop 1
+            end if
+        end if
+        call system_clock(forward_end)
+        batch_prefill_seconds = real(forward_end - forward_start, real32) / real(clock_rate, real32)
+        batch_prefill_tokens_per_second = real(bench_total, real32) / max(batch_prefill_seconds, 1.0e-6_real32)
+        print '(a,l1)', 'batch_bench_supported=', model%batch_supported(bench_size)
+        print '(a,i0)', 'batch_bench_tokens=', bench_total
+        print '(a,i0)', 'batch_bench_capacity=', model%cuda_batch_capacity
+        print '(a,es16.8)', 'batch_prefill_seconds=', batch_prefill_seconds
+        print '(a,es16.8)', 'batch_prefill_tokens_per_second=', batch_prefill_tokens_per_second
+        call model%close()
+        stop 0
+    end if
     if (batch_smoke) then
         batch_count = max(2, min(int(steps), 128))
         if (.not. model%cuda_device_pipeline .or. .not. model%batch_supported(batch_count)) then
@@ -206,6 +278,10 @@ program fortai_cuda_run
                 print '(a)', 'FortAI CUDA forward failed: ' // stat%message
                 error stop 1
             end if
+            if (trace_enabled .and. model%mtp_active) then
+                print '(a,i0,a,i0,a,l1)', 'draft[', position, ']=', &
+                    model%mtp_last_draft_token, ',match=', model%mtp_last_draft_match
+            end if
             checksum = checksum + greedy_sum
             do emitted = 1, min(spec_count, int(last_position - position + 1_int64))
                 token = speculative_tokens(emitted)
@@ -255,6 +331,7 @@ program fortai_cuda_run
         print '(a)', 'backend=fortai-cuda-host-q8'
     end if
     print '(a,l1)', 'device_pipeline=', model%cuda_device_pipeline
+    print '(a,l1)', 'batch2_supported=', model%batch_supported(2)
     print '(a,l1)', 'cuda_graph_enabled=', model%cuda_graph_enabled
     print '(a,l1)', 'cuda_segment_graph_enabled=', model%cuda_segment_graph_enabled
     print '(a,l1)', 'cuda_segment_graph_ready=', model%cuda_segment_graph_ready
@@ -264,6 +341,7 @@ program fortai_cuda_run
     print '(a,i0)', 'layers=', model%layer_count
     print '(a,l1)', 'mtp_available=', model%mtp_available
     print '(a,l1)', 'mtp_active=', model%mtp_active
+    print '(a,i0)', 'mtp_cuda_slot=', model%mtp_cuda_slot
     print '(a,i0)', 'mtp_last_draft_token=', model%mtp_last_draft_token
     print '(a,l1)', 'mtp_last_draft_match=', model%mtp_last_draft_match
     print '(a,i0)', 'steps=', steps

@@ -24,48 +24,42 @@ oracle.
 
 ## Measured serving
 
-The following direct OpenAI-compatible requests were measured on 2026-08-27
-with CUDA 13.3 and two RTX 5060 Ti (16 GiB) cards. Qwen3.8-27B
-`UD-Q4_K_XL` used the production split (`0.57,0.43`), 14 compute threads,
-`batch=2048`, `ubatch=256`, q8 K/V, flash attention, and eight greedy output
-tokens. Every row used a fresh prompt prefix, so the resident prefix cache
-could not affect the result. The payload is the one sent by OpenCode; these
-are model timings from the response, not full CLI orchestration time. The
-FortAI rows are the post-fix native path: intermediate prompt tokens now skip
-the vocabulary projection, argmax, and MTP host handoff while the final prompt
-token still produces the exact hidden-state handoff required for generation.
+The current Qwen3.8-27B `UD-Q4_K_XL` comparison was measured on 2026-08-29 with
+CUDA 13.3 and two RTX 5060 Ti 16 GiB cards. Both servers were started from the
+same production environment: MTP depth 2 (`draft-mtp`), flash attention,
+`batch=2048`, `ubatch=256`, 14 threads, tensor split `0.57,0.43`, q8_0 target
+K/V, q4_0 draft K/V, and the production sampler. FortAI used its production
+262144-token context; llama.cpp `bb4caa7` used 8192 because it cannot allocate
+the production K/V cache. Each rate is the median of three runs taken from the
+server's own `timings` block, and every request carried a unique prefix so no
+prefill was served from the prefix cache.
 
-| Prompt tokens (FortAI / llama.cpp) | FortAI prefill (tok/s) | llama.cpp prefill (tok/s) | FortAI generation (tok/s) | llama.cpp generation (tok/s) |
-|---:|---:|---:|---:|---:|
-| 188 / 159 | 22.1 | 185.3 | 19.9 | 22.8 |
-| 571 / 543 | 20.7 | 336.9 | 17.1 | 28.7 |
-| 1070 / 1056 | 19.2 | 551.3 | 14.3 | 17.6 |
-| 2058 / 2080 | 16.6 | 767.3 | 11.0 | 24.5 |
+| Matched request | FortAI | llama.cpp | FortAI / llama.cpp |
+|---|---:|---:|---:|
+| Prefill, 2073-token prompt | 1222.7 tok/s | 1113.3 tok/s | 1.098 |
+| Prefill, ~4050-token prompt | 1211.2 tok/s | 1195.6 tok/s | 1.013 |
+| Generation, greedy, short context | 41.8 tok/s | 43.7 tok/s | 0.957 |
+| Generation, sampled, short context | 38.1 tok/s | 49.7 tok/s | 0.767 |
+| Generation, sampled, ~4050-token context | 43.3 tok/s | 45.6 tok/s | 0.949 |
 
-The llama.cpp reference used `-c 4096` because its full production-context
-allocation did not fit beside the independent test services; FortAI used its
-production `-c 262144` profile and native MTP sidecar. Thus the table is a
-stress result, not a claim of speed parity; prompt sizes are matched within
-the stated token buckets, but the two fresh-prefix request strings are not
-byte-identical. FortAI currently needs true prompt batching to close the
-remaining prefill gap ([issue #2](https://github.com/lazy-fortran/fortai/issues/2));
-a bounded full OpenCode CLI run is not yet promotion evidence.
+Prefill is ahead. Generation is behind, and a paired Nsight profile locates the
+cause precisely: **per-round cost is already at parity** -- 55.3 ms per
+speculative round for FortAI against 56.1 ms for llama.cpp -- and the whole
+difference is that FortAI needs about 13% more target-verification rounds
+because fewer of its MTP drafts are accepted. Over four greedy prompts FortAI
+accepts 277/440 drafts (63.0%) at 41.47 tok/s while llama.cpp accepts 286/421
+(67.9%) at 43.39 tok/s; the 4.4% throughput gap equals the 4.2% tokens-per-round
+gap. Both runtimes draft two tokens per round and use the same acceptance rule,
+so the remaining work is draft-head numerics, not kernels, sampling, or
+scheduling. `PLAN.md` records the full profile and the next step.
 
-The latest matched native CUDA decode check used the same 27B model, 128-token
-context, 64 generated tokens, q8 K/V, flash attention, two GPUs split
-`0.57,0.43`, and two OpenMP threads.  The independent 8-token trace was exact
-in both runs.  Greedy decode now keeps a remote Q4 output head and performs
-`argmax` on its owning GPU, so it does not copy a full vocabulary row over
-PCIe.
+Reproduce either side with `benchmark/compare_qwen38_server.sh fortai|llama`.
 
-| Run | FortAI tok/s | llama.cpp tok/s | FortAI / llama.cpp |
-|---:|---:|---:|---:|
-| 1 | 22.69 | 23.02 | 0.985 |
-| 2 | 22.46 | 22.65 | 0.992 |
-| Median | 22.58 | 22.84 | 0.989 |
-
-This is within the observed run-to-run variance, but remains evidence rather
-than a blanket promotion claim for every context length or prompt workload.
+At the production context FortAI occupies 15,894,315,008 bytes on GPU0 and
+14,388,559,872 bytes on GPU1. llama.cpp aborts while requesting its 9 GiB GPU0
+KV buffer at the same settings; its loadable 4096-token configuration occupies
+about 8,948 and 9,088 MiB. These measurements support the current hardware
+configuration, not a blanket claim for every context length or GPU.
 
 ### Whisper CUDA (`large-v3-turbo`)
 

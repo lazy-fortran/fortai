@@ -8,6 +8,7 @@ program test_fortai_smoke
     use fortai_gguf, only: gguf_validate_header
     use fortai_gguf_runtime, only: GGML_TYPE_Q8_0, gguf_tensor_t
     use fortai_model_ir, only: model_ir_t
+    use fortai_mt19937, only: mt19937_seed, mt19937_t, mt19937_uint32, mt19937_uniform_real64
     use fortai_plan_ir, only: plan_ir_t
     use fortai_qwen35, only: qwen35_config_t
     use fortai_qwen35_dflash2, only: qwen35_dflash2_available
@@ -68,6 +69,7 @@ program test_fortai_smoke
     call test_cpu_matvec(failures)
     call test_tokenizer(failures)
     call test_sampler(failures)
+    call test_mt19937(failures)
     call test_http_integer_parser(failures)
     call test_speculative(failures)
     call test_ir_contracts(failures)
@@ -84,6 +86,24 @@ program test_fortai_smoke
     print '(a)', 'FortAI smoke tests passed'
 
 contains
+
+    subroutine test_mt19937(failures)
+        integer, intent(inout) :: failures
+        integer(int64), parameter :: expected(10) = [ &
+            3499211612_int64, 581869302_int64, 3890346734_int64, 3586334585_int64, 545404204_int64, &
+            4161255391_int64, 3922919429_int64, 949333985_int64, 2715962298_int64, 1323567403_int64]
+        type(mt19937_t) :: generator
+        integer :: i
+
+        call mt19937_seed(generator, 5489_int64)
+        do i = 1, size(expected)
+            call require(mt19937_uint32(generator) == expected(i), &
+                'MT19937 standard uint32 oracle', failures)
+        end do
+        call mt19937_seed(generator, 1234_int64)
+        call require(abs(mt19937_uniform_real64(generator) - 0.49766366630595166_real64) < 1.0e-16_real64, &
+            'libstdc++ uniform_real_distribution oracle', failures)
+    end subroutine test_mt19937
 
     subroutine test_http_integer_parser(failures)
         integer, intent(inout) :: failures

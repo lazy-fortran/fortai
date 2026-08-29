@@ -29,6 +29,18 @@ int FORTAI_WEAK fortai_cuda_q4_context_synchronize(fortai_cuda_q4_context *conte
     return FORTAI_CUDA_OK;
 }
 
+int FORTAI_WEAK fortai_cuda_q4_context_transfer(fortai_cuda_q4_context *context,
+    int source_slot, const void *source, int destination_slot,
+    void *destination, size_t bytes) {
+    (void)context;
+    (void)source_slot;
+    (void)source;
+    (void)destination_slot;
+    (void)destination;
+    (void)bytes;
+    return unavailable();
+}
+
 void * FORTAI_WEAK fortai_cuda_q4_context_stream(fortai_cuda_q4_context *context,
     int device_slot) {
     (void)context;
@@ -43,6 +55,7 @@ int FORTAI_WEAK fortai_cuda_q4_context_set_consumer_stream(fortai_cuda_q4_contex
     (void)stream;
     return unavailable();
 }
+
 
 int FORTAI_WEAK fortai_cuda_q4_weights_upload(fortai_cuda_q4_context *context, int value_type,
     const void *host_weights, size_t weight_bytes, int rows, int width, int device,
@@ -173,6 +186,26 @@ int FORTAI_WEAK fortai_cuda_q4_matvec_device_swiglu_down(
     return unavailable();
 }
 
+int FORTAI_WEAK fortai_cuda_q4_matmul_device_swiglu_down_slot(
+    fortai_cuda_q4_context *context, int device_slot,
+    const fortai_cuda_q4_weights *gate_weights,
+    const fortai_cuda_q4_weights *up_weights,
+    const fortai_cuda_q4_weights *down_weights,
+    const void *device_activation, size_t activation_elements, int batch,
+    void *device_output, size_t output_elements) {
+    (void)context;
+    (void)device_slot;
+    (void)gate_weights;
+    (void)up_weights;
+    (void)down_weights;
+    (void)device_activation;
+    (void)activation_elements;
+    (void)batch;
+    (void)device_output;
+    (void)output_elements;
+    return unavailable();
+}
+
 int FORTAI_WEAK fortai_cuda_q4_matvec_device_group(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights * const *weights, const void *device_activation,
     size_t activation_elements, void * const *device_outputs,
@@ -209,6 +242,16 @@ int FORTAI_WEAK fortai_cuda_q4_matmul_device_group(fortai_cuda_q4_context *conte
     const size_t *output_elements, int count) {
     (void)context; (void)weights; (void)device_activation; (void)activation_elements;
     (void)batch; (void)device_outputs; (void)output_elements; (void)count;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q4_matmul_device_group_slot(fortai_cuda_q4_context *context,
+    int device_slot, const fortai_cuda_q4_weights * const *weights,
+    const void *device_activation, size_t activation_elements, int batch,
+    void * const *device_outputs, const size_t *output_elements, int count) {
+    (void)context; (void)device_slot; (void)weights; (void)device_activation;
+    (void)activation_elements; (void)batch; (void)device_outputs;
+    (void)output_elements; (void)count;
     return unavailable();
 }
 
@@ -267,6 +310,15 @@ int FORTAI_WEAK fortai_cuda_q4_embedding_device_batch(
     return unavailable();
 }
 
+int FORTAI_WEAK fortai_cuda_q4_embedding_device_batch_slot(
+    fortai_cuda_q4_context *context, int device_slot,
+    const fortai_cuda_q4_weights *weights, const int32_t *host_tokens,
+    int batch, void *device_output, size_t output_elements) {
+    (void)context; (void)device_slot; (void)weights; (void)host_tokens;
+    (void)batch; (void)device_output; (void)output_elements;
+    return unavailable();
+}
+
 int FORTAI_WEAK fortai_cuda_q8_context_create(int device,
     fortai_cuda_q8_context **context) {
     (void)device;
@@ -322,6 +374,24 @@ int FORTAI_WEAK fortai_cuda_q8_context_capture_end(fortai_cuda_q8_context *conte
 
 int FORTAI_WEAK fortai_cuda_q8_context_graph_launch(fortai_cuda_q8_context *context) {
     (void)context;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q8_context_capture_begin_slot(
+    fortai_cuda_q8_context *context, int slot) {
+    (void)context; (void)slot;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q8_context_capture_end_slot(
+    fortai_cuda_q8_context *context, int slot) {
+    (void)context; (void)slot;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_q8_context_graph_launch_slot(
+    fortai_cuda_q8_context *context, int slot) {
+    (void)context; (void)slot;
     return unavailable();
 }
 
@@ -783,6 +853,18 @@ int FORTAI_WEAK fortai_cuda_qwen35_recurrent_run_core_device_batch(
     return unavailable();
 }
 
+int FORTAI_WEAK fortai_cuda_qwen35_recurrent_restore_first(
+    fortai_cuda_qwen35_recurrent *layer) {
+    (void)layer;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_recurrent_restore_second(
+    fortai_cuda_qwen35_recurrent *layer) {
+    (void)layer;
+    return unavailable();
+}
+
 int FORTAI_WEAK fortai_cuda_qwen35_attention_create(
     fortai_cuda_q8_context *context, const fortai_cuda_q8_weights *query_weights,
     const fortai_cuda_q8_weights *key_weights, const fortai_cuda_q8_weights *value_weights,
@@ -890,6 +972,56 @@ int FORTAI_WEAK fortai_cuda_qwen35_argmax_device(
     (void)device_logits;
     (void)elements;
     if (host_index) *host_index = 0;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_argmax_rows_device(
+    fortai_cuda_q8_context *context, const void *device_logits,
+    size_t row_elements, int rows, int *host_indices) {
+    (void)context;
+    (void)device_logits;
+    (void)row_elements;
+    if (host_indices) {
+        for (int row = 0; row < rows; ++row) host_indices[row] = 0;
+    }
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_topk_rows_device(
+    fortai_cuda_q8_context *context, const void *device_logits,
+    size_t row_elements, int rows, int top_k, int *host_indices,
+    float *host_values) {
+    (void)context;
+    (void)device_logits;
+    (void)row_elements;
+    (void)rows;
+    (void)top_k;
+    (void)host_indices;
+    (void)host_values;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_concat_device(
+    fortai_cuda_q8_context *context, const void *device_first,
+    const void *device_second, size_t elements, void *device_output) {
+    (void)context; (void)device_first; (void)device_second; (void)elements;
+    (void)device_output;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_concat_matrix_device(
+    fortai_cuda_q8_context *context, const void *device_first,
+    const void *device_second, size_t hidden, int batch, void *device_output) {
+    (void)context; (void)device_first; (void)device_second; (void)hidden;
+    (void)batch; (void)device_output;
+    return unavailable();
+}
+
+int FORTAI_WEAK fortai_cuda_qwen35_shift_target_hidden_device(
+    fortai_cuda_q8_context *context, const void *device_input,
+    void *device_pending, size_t hidden, int batch, void *device_output) {
+    (void)context; (void)device_input; (void)device_pending; (void)hidden;
+    (void)batch; (void)device_output;
     return unavailable();
 }
 

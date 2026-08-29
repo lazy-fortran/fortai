@@ -65,7 +65,8 @@ fi
 printf 'library=%s\nobject=%s\n' "$library" "$object" >"$inputs_file"
 
 "$nvcc_bin" -O3 -arch="$cuda_arch" "$object" "$library" \
-    "$out_dir/fortai_cuda_backend.o" "$out_dir/fortai_cuda_q4_backend.o" \
+    "$out_dir/fortai_cuda_backend.o" "$out_dir/fortai_cuda_fattn_backend.o" \
+    "$out_dir/fortai_cuda_q4_backend.o" \
     -L"$ggml_prefix/lib" -Xlinker -rpath -Xlinker "$ggml_prefix/lib" \
     -lggml-cuda -lggml-cpu -lggml -lggml-base -lgfortran -lquadmath -lgomp \
     -o "$out_dir/fortai_cuda_run"

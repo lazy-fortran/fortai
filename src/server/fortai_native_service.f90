@@ -2,6 +2,7 @@ module fortai_native_service
     use, intrinsic :: iso_c_binding, only: c_char, c_int, c_null_char
     use, intrinsic :: iso_fortran_env, only: error_unit, int32, int64, real32, real64
     use fortai_gguf_runtime, only: gguf_file_t
+    use fortai_mt19937, only: mt19937_seed, mt19937_t, mt19937_uniform_real64
     use fortai_native_tokenizer, only: fortai_native_tokenizer_t
     use fortai_qwen35_cpu, only: qwen35_cpu_model_t
     use fortai_string, only: string_t
@@ -33,6 +34,8 @@ module fortai_native_service
     real(real64), save :: service_last_generation_ms = 0.0_real64
     integer(int64), save :: service_last_prompt_tokens = 0_int64
     integer(int64), save :: service_last_generation_tokens = 0_int64
+    integer(int64), save :: service_last_draft_tokens = 0_int64
+    integer(int64), save :: service_last_draft_accepted = 0_int64
 
     type :: sampling_options_t
         integer :: top_k = 40
@@ -69,6 +72,8 @@ module fortai_native_service
     public :: fortai_native_service_last_generation_ms
     public :: fortai_native_service_last_prompt_tokens
     public :: fortai_native_service_last_generation_tokens
+    public :: fortai_native_service_last_draft_tokens
+    public :: fortai_native_service_last_draft_accepted
 
 contains
 
@@ -189,6 +194,8 @@ contains
         service_last_generation_ms = 0.0_real64
         service_last_prompt_tokens = 0_int64
         service_last_generation_tokens = 0_int64
+        service_last_draft_tokens = 0_int64
+        service_last_draft_accepted = 0_int64
     end subroutine fortai_native_service_close
 
     logical function fortai_native_service_default_thinking()
@@ -261,6 +268,14 @@ contains
     integer(int64) function fortai_native_service_last_generation_tokens()
         fortai_native_service_last_generation_tokens = service_last_generation_tokens
     end function fortai_native_service_last_generation_tokens
+
+    integer(int64) function fortai_native_service_last_draft_tokens()
+        fortai_native_service_last_draft_tokens = service_last_draft_tokens
+    end function fortai_native_service_last_draft_tokens
+
+    integer(int64) function fortai_native_service_last_draft_accepted()
+        fortai_native_service_last_draft_accepted = service_last_draft_accepted
+    end function fortai_native_service_last_draft_accepted
 
     logical function fortai_native_service_tokenize(text, add_special, parse_special, ids)
         character(len=*), intent(in) :: text
@@ -560,22 +575,27 @@ contains
         type(sampling_options_t) :: options
         integer(int32), allocatable :: prompt_ids(:), generated_ids(:), sampling_history(:), state_tokens(:)
         integer(int32), allocatable :: history_counts(:), candidate_indices(:)
+        integer(int32), allocatable :: speculative_candidate_indices(:, :)
         real(real32), allocatable :: logits(:), adjusted_logits(:), candidate_values(:)
+        real(real32), allocatable :: speculative_candidate_values(:, :)
         integer(int64) :: current, next_token, position
         integer(int64) :: draft_next_token
         integer(int64) :: speculative_tokens(32)
-        integer(int64) :: random_state
+        integer(int64) :: sampled_draft_tokens(2), sampled_verify_tokens(3)
+        integer(int64) :: random_seed
+        type(mt19937_t) :: random_generator
         integer(int64) :: prompt_clock_start, prompt_clock_end
         integer(int64) :: generation_clock_start, generation_clock_end, clock_rate
-        integer :: i, j, generated_count, speculative_count, prompt_start, state_count, cache_count
+        integer :: i, j, generated_count, stop_token_count, speculative_count, prompt_start, state_count, cache_count
         integer :: batch_begin, batch_end, batch_count, batch_capacity
-        integer :: timed_prompt_start
+        integer :: timed_prompt_start, accepted_drafts, sample_history_count, vocabulary_size
         real(real32) :: logit_sum, draft_logit_sum
         logical :: use_external_draft, use_native_mtp
         logical :: stop_generation, ignore_eos, cache_hit, cache_logits_usable
         logical :: needs_logits, preserve_old_logits, state_step_speculative, prompt_batched
+        logical :: use_device_topk, cache_result_logits_valid, attempt_speculative
         integer(int32), allocatable :: new_cache_tokens(:)
-        real(real32), allocatable :: new_cache_logits(:)
+        real(real32), allocatable :: new_cache_logits(:), speculative_logits(:)
         type(status_t) :: stat, draft_stat
 
         options%top_k = top_k
@@ -593,6 +613,8 @@ contains
         service_last_generation_ms = 0.0_real64
         service_last_prompt_tokens = 0_int64
         service_last_generation_tokens = 0_int64
+        service_last_draft_tokens = 0_int64
+        service_last_draft_accepted = 0_int64
         if (.not. service_ready) return
         if (max_tokens <= 0) return
         if (.not. finite_real32(temperature)) return
@@ -631,23 +653,32 @@ contains
             allocate(adjusted_logits(service_model%vocabulary_size))
             allocate(history_counts(service_model%vocabulary_size))
         end if
-        random_state = seed
-        if (random_state == 0_int64) then
+        random_seed = seed
+        if (random_seed == 0_int64) then
             block
                 integer :: clock
                 call system_clock(count=clock)
-                random_state = int(clock, int64)
-                if (random_state == 0_int64) random_state = int(z'6a09e667f3bcc909', int64)
+                random_seed = int(clock, int64)
+                if (random_seed == 0_int64) random_seed = int(z'6a09e667f3bcc909', int64)
             end block
         end if
+        call mt19937_seed(random_generator, random_seed)
         ! Keep the standalone draft state synchronized with the target.  The
         ! target remains authoritative because the native hybrid model has no
         ! multi-token decode ABI yet; this still makes external-draft wiring
         ! real and deterministic rather than merely accepting the flag.
         use_external_draft = service_external_draft_active .and. temperature == 0.0_real32 .and. &
             .not. sampling_penalties_active(options)
-        use_native_mtp = service_model%mtp_active .and. temperature == 0.0_real32 .and. &
-            .not. sampling_penalties_active(options)
+        use_native_mtp = service_model%mtp_active
+        vocabulary_size = service_model%vocabulary_size
+        use_device_topk = use_native_mtp .and. temperature > 0.0_real32 .and. &
+            options%top_k > 0 .and. options%top_k <= 32 .and. .not. sampling_penalties_active(options)
+        if (use_native_mtp .and. needs_logits .and. .not. use_device_topk) &
+            allocate(speculative_logits(3 * vocabulary_size))
+        if (use_device_topk) then
+            allocate(speculative_candidate_indices(options%top_k, 3))
+            allocate(speculative_candidate_values(options%top_k, 3))
+        end if
         ignore_eos = native_ignore_eos_requested()
         cache_count = service_cache_count
         cache_hit = service_cache_valid
@@ -681,7 +712,7 @@ contains
                     if (size(service_cache_logits) == service_model%vocabulary_size) cache_logits_usable = .true.
                 end if
             end if
-            if (needs_logits) then
+            if (needs_logits .and. size(prompt_ids) == cache_count) then
                 if (.not. cache_logits_usable) cache_hit = .false.
             end if
         end if
@@ -703,8 +734,9 @@ contains
         if (cache_hit) then
             if (prompt_start > size(prompt_ids)) then
                 if (cache_logits_usable) then
+                    if (allocated(logits)) logits = service_cache_logits
                     if (temperature > 0.0_real32) then
-                        current = sample_logits(service_cache_logits, temperature, random_state, sampling_history, &
+                        current = sample_logits(service_cache_logits, temperature, random_generator, sampling_history, &
                             size(prompt_ids), options, adjusted_logits, history_counts, candidate_indices, &
                             candidate_values)
                     else if (sampling_penalties_active(options)) then
@@ -732,7 +764,9 @@ contains
             batch_begin = prompt_start
             do while (batch_begin <= size(prompt_ids))
                 batch_count = min(batch_capacity, size(prompt_ids) - batch_begin + 1)
-                if (batch_count <= 1) exit
+                if (batch_count > 32 .and. mod(batch_count, 32) /= 0) &
+                    batch_count = 32 * (batch_count / 32)
+                if (batch_count > 8 .and. batch_count < 32) batch_count = 8
                 if (.not. service_model%batch_supported(batch_count)) then
                     ! A mixed/remote layout may not have a native batch plan.
                     ! Leave the complete suffix for the scalar oracle rather
@@ -761,7 +795,7 @@ contains
                 prompt_start = batch_begin
                 if (batch_end == size(prompt_ids)) then
                     if (temperature > 0.0_real32) then
-                        current = sample_logits(logits, temperature, random_state, sampling_history, size(prompt_ids), &
+                        current = sample_logits(logits, temperature, random_generator, sampling_history, size(prompt_ids), &
                             options, adjusted_logits, history_counts, candidate_indices, candidate_values)
                     else if (sampling_penalties_active(options)) then
                         current = greedy_penalized(logits, adjusted_logits, history_counts, sampling_history, &
@@ -781,7 +815,7 @@ contains
                         i == size(prompt_ids), .false., i == size(prompt_ids), i == size(prompt_ids))
                     if (stat%is_ok()) then
                         if (i == size(prompt_ids)) then
-                            current = sample_logits(logits, temperature, random_state, sampling_history, i, options, &
+                            current = sample_logits(logits, temperature, random_generator, sampling_history, i, options, &
                                 adjusted_logits, history_counts, candidate_indices, candidate_values)
                         end if
                     end if
@@ -827,25 +861,141 @@ contains
         if (timed_prompt_start <= size(prompt_ids)) then
             service_last_prompt_tokens = int(size(prompt_ids) - timed_prompt_start + 1, int64)
         end if
+        cache_result_logits_valid = needs_logits .and. allocated(logits)
         generated_count = 0
+        stop_token_count = 0
         call system_clock(count=generation_clock_start)
         do while (generated_count < max_tokens .and. size(prompt_ids) + generated_count < service_model%max_context)
             if (current < 0_int64) exit
-            if (.not. ignore_eos .and. service_tokenizer%is_stop(int(current, int32))) exit
+            if (.not. ignore_eos .and. service_tokenizer%is_stop(int(current, int32))) then
+                stop_token_count = 1
+                exit
+            end if
             generated_count = generated_count + 1
             generated_ids(generated_count) = int(current, int32)
             sampling_history(size(prompt_ids) + generated_count) = int(current, int32)
             if (generated_count == max_tokens) exit
             position = int(size(prompt_ids) + generated_count - 1, int64)
             state_step_speculative = .false.
-            if (use_native_mtp .and. max_tokens - generated_count >= 2) then
-                call service_model%forward_greedy_speculative(current, position, speculative_tokens, &
-                    speculative_count, logit_sum, stat)
-                if (.not. stat%is_ok()) then
-                    write(error_unit, '(a)') 'fortai-native: speculative model forward failed: ' // trim(stat%message)
-                    service_cache_valid = .false.
-                    return
+            attempt_speculative = use_native_mtp .and. max_tokens - generated_count >= 2
+            if (attempt_speculative) then
+                if (needs_logits) then
+                    if (use_device_topk) then
+                        call service_model%prepare_sampled_speculative_topk(current, position, sampled_draft_tokens, &
+                            speculative_candidate_indices, speculative_candidate_values, stat)
+                    else
+                        call service_model%prepare_sampled_speculative(current, position, sampled_draft_tokens, &
+                            speculative_logits, stat)
+                    end if
+                    if (stat%is_ok()) then
+                        sample_history_count = size(prompt_ids) + generated_count
+                        if (temperature > 0.0_real32) then
+                            if (use_device_topk) then
+                                sampled_verify_tokens(1) = sample_topk_candidates( &
+                                    speculative_candidate_indices(:, 1), speculative_candidate_values(:, 1), &
+                                    temperature, random_generator, options, adjusted_logits)
+                            else
+                                sampled_verify_tokens(1) = sample_logits(speculative_logits(:vocabulary_size), &
+                                    temperature, random_generator, sampling_history, sample_history_count, options, &
+                                    adjusted_logits, history_counts, candidate_indices, candidate_values)
+                            end if
+                        else
+                            sampled_verify_tokens(1) = greedy_penalized(speculative_logits(:vocabulary_size), &
+                                adjusted_logits, history_counts, sampling_history, sample_history_count, options)
+                        end if
+                        accepted_drafts = 0
+                        if (sampled_verify_tokens(1) == sampled_draft_tokens(1)) then
+                            accepted_drafts = 1
+                            sampling_history(sample_history_count + 1) = int(sampled_draft_tokens(1), int32)
+                            if (temperature > 0.0_real32) then
+                                if (use_device_topk) then
+                                    sampled_verify_tokens(2) = sample_topk_candidates( &
+                                        speculative_candidate_indices(:, 2), speculative_candidate_values(:, 2), &
+                                        temperature, random_generator, options, adjusted_logits)
+                                else
+                                    sampled_verify_tokens(2) = sample_logits( &
+                                        speculative_logits(vocabulary_size + 1:2 * vocabulary_size), temperature, &
+                                        random_generator, sampling_history, sample_history_count + 1, options, &
+                                        adjusted_logits, history_counts, candidate_indices, candidate_values)
+                                end if
+                            else
+                                sampled_verify_tokens(2) = greedy_penalized( &
+                                    speculative_logits(vocabulary_size + 1:2 * vocabulary_size), adjusted_logits, &
+                                    history_counts, sampling_history, sample_history_count + 1, options)
+                            end if
+                            if (sampled_verify_tokens(2) == sampled_draft_tokens(2)) then
+                                accepted_drafts = 2
+                                sampling_history(sample_history_count + 2) = int(sampled_draft_tokens(2), int32)
+                                if (temperature > 0.0_real32) then
+                                    if (use_device_topk) then
+                                        sampled_verify_tokens(3) = sample_topk_candidates( &
+                                            speculative_candidate_indices(:, 3), speculative_candidate_values(:, 3), &
+                                            temperature, random_generator, options, adjusted_logits)
+                                    else
+                                        sampled_verify_tokens(3) = sample_logits( &
+                                            speculative_logits(2 * vocabulary_size + 1:3 * vocabulary_size), &
+                                            temperature, random_generator, sampling_history, sample_history_count + 2, &
+                                            options, adjusted_logits, history_counts, candidate_indices, candidate_values)
+                                    end if
+                                else
+                                    sampled_verify_tokens(3) = greedy_penalized( &
+                                        speculative_logits(2 * vocabulary_size + 1:3 * vocabulary_size), &
+                                        adjusted_logits, history_counts, sampling_history, &
+                                        sample_history_count + 2, options)
+                                end if
+                            end if
+                        end if
+                        call service_model%accept_sampled_speculative(sampled_draft_tokens, position, &
+                            accepted_drafts, stat)
+                        if (stat%is_ok()) then
+                            service_last_draft_tokens = service_last_draft_tokens + 2_int64
+                            service_last_draft_accepted = service_last_draft_accepted + int(accepted_drafts, int64)
+                        end if
+                    end if
+                    if (stat%is_ok()) then
+                        speculative_count = accepted_drafts + 1
+                        if (accepted_drafts > 0) speculative_tokens(:accepted_drafts) = &
+                            sampled_draft_tokens(:accepted_drafts)
+                        speculative_tokens(speculative_count) = sampled_verify_tokens(speculative_count)
+                        if (use_device_topk) then
+                            cache_result_logits_valid = .false.
+                        else
+                            logits = speculative_logits( &
+                                (speculative_count - 1) * vocabulary_size + 1:speculative_count * vocabulary_size)
+                            cache_result_logits_valid = .true.
+                        end if
+                    end if
+                else
+                    call service_model%forward_greedy_speculative(current, position, speculative_tokens, &
+                        speculative_count, logit_sum, stat)
+                    if (stat%is_ok()) then
+                        service_last_draft_tokens = service_last_draft_tokens + 2_int64
+                        service_last_draft_accepted = service_last_draft_accepted + &
+                            int(max(0, speculative_count - 1), int64)
+                    end if
                 end if
+                if (.not. stat%is_ok()) then
+                    if (stat%code == FORTAI_UNSUPPORTED) then
+                        ! The resident layout cannot run an MTP verification
+                        ! batch (placement can leave a layer's projections
+                        ! split across both GPUs at some contexts).  The
+                        ! scalar path is the correctness oracle for exactly
+                        ! this case, so retire speculation for the rest of the
+                        ! request instead of failing a servable request.
+                        write(error_unit, '(a)') 'fortai-native: speculative decode unavailable for this layout, ' // &
+                            'continuing without MTP: ' // trim(stat%message)
+                        call stat%clear()
+                        use_native_mtp = .false.
+                        attempt_speculative = .false.
+                    else
+                        write(error_unit, '(a)') 'fortai-native: speculative model forward failed: ' // &
+                            trim(stat%message)
+                        service_cache_valid = .false.
+                        return
+                    end if
+                end if
+            end if
+            if (attempt_speculative) then
                 if (speculative_count <= 0 .or. speculative_count > size(speculative_tokens)) then
                     write(error_unit, '(a)') 'fortai-native: speculative model forward returned no tokens'
                     service_cache_valid = .false.
@@ -869,6 +1019,7 @@ contains
                 ! allowing the preceding tokens to be emitted immediately.
                 do j = 1, speculative_count - 1
                     if (.not. ignore_eos .and. service_tokenizer%is_stop(int(speculative_tokens(j), int32))) then
+                        stop_token_count = 1
                         stop_generation = .true.
                         exit
                     end if
@@ -880,9 +1031,12 @@ contains
                 current = speculative_tokens(speculative_count)
             else if (temperature > 0.0_real32) then
                 call service_model%forward(current, position, logits, stat)
-                if (stat%is_ok()) current = sample_logits(logits, temperature, random_state, sampling_history, &
-                    size(prompt_ids) + generated_count, options, adjusted_logits, history_counts, candidate_indices, &
-                    candidate_values)
+                if (stat%is_ok()) then
+                    current = sample_logits(logits, temperature, random_generator, sampling_history, &
+                        size(prompt_ids) + generated_count, options, adjusted_logits, history_counts, candidate_indices, &
+                        candidate_values)
+                    cache_result_logits_valid = .true.
+                end if
             else
                 if (state_count >= size(state_tokens)) then
                     write(error_unit, '(a)') 'fortai-native: generation state exceeded cache workspace'
@@ -939,7 +1093,7 @@ contains
             service_cache_next_token = current
             preserve_old_logits = cache_hit .and. state_count == cache_count
             if (needs_logits) then
-                if (allocated(logits)) then
+                if (allocated(logits) .and. cache_result_logits_valid) then
                     allocate(new_cache_logits(size(logits)))
                     new_cache_logits = logits
                     call move_alloc(new_cache_logits, service_cache_logits)
@@ -956,7 +1110,10 @@ contains
         else
             service_cache_valid = .false.
         end if
-        token_count = generated_count
+        ! llama.cpp includes the sampled stop token in API usage/predicted_n,
+        ! but excludes it from decoded content and throughput.  Keep those two
+        ! accounting domains separate for drop-in response compatibility.
+        token_count = generated_count + stop_token_count
         fortai_native_service_complete_text_sampling = output_text%length()
     end function fortai_native_service_complete_text_sampling
 
@@ -996,68 +1153,147 @@ contains
         type(sampling_options_t), intent(in) :: options
         integer :: maximum_index
 
-        call apply_sampling_penalties(logits, adjusted, counts, history, history_count, options)
+        if (sampling_penalties_active(options)) then
+            call apply_sampling_penalties(logits, adjusted, counts, history, history_count, options)
+        else
+            adjusted = logits
+        end if
         maximum_index = maxloc(adjusted, dim=1)
         greedy_penalized = int(maximum_index - 1, int64)
     end function greedy_penalized
 
-    integer(int64) function sample_logits(logits, temperature, random_state, history, history_count, options, &
+    integer(int64) function sample_logits(logits, temperature, random_generator, history, history_count, options, &
             adjusted, counts, candidate_indices, candidate_values)
         real(real32), intent(in) :: logits(:), temperature
-        integer(int64), intent(inout) :: random_state
+        type(mt19937_t), intent(inout) :: random_generator
         integer(int32), intent(in) :: history(:)
         integer, intent(in) :: history_count
         type(sampling_options_t), intent(in) :: options
         real(real32), intent(inout) :: adjusted(:), candidate_values(:)
         integer(int32), intent(inout) :: counts(:), candidate_indices(:)
-        real(real32) :: maximum, total, threshold, cumulative, probability, cutoff
+        real(real32) :: maximum, total, cumulative, probability, minimum_logit
+        real(real64) :: probability_sum, probability_run, probability_target
         integer :: i, candidate_count, selected_count
 
-        call apply_sampling_penalties(logits, adjusted, counts, history, history_count, options)
         candidate_count = min(size(adjusted), size(candidate_indices))
         if (options%top_k > 0) candidate_count = min(candidate_count, options%top_k)
-        call top_candidates(adjusted, candidate_count, candidate_indices, candidate_values)
-        maximum = candidate_values(1)
-        total = 0.0_real32
-        cutoff = options%min_p
-        do i = 1, candidate_count
-            probability = exp((candidate_values(i) - maximum) / temperature)
-            if (probability < cutoff) then
-                candidate_values(i) = 0.0_real32
-            else
-                candidate_values(i) = probability
-                total = total + probability
-            end if
-        end do
-        if (.not. (total > 0.0_real32)) then
-            sample_logits = int(candidate_indices(1) - 1, int64)
-            return
+        if (sampling_penalties_active(options)) then
+            call apply_sampling_penalties(logits, adjusted, counts, history, history_count, options)
+            call top_candidates(adjusted, candidate_count, candidate_indices, candidate_values)
+        else
+            call top_candidates(logits, candidate_count, candidate_indices, candidate_values)
         end if
         selected_count = candidate_count
         if (options%top_p < 1.0_real32) then
-            cutoff = total * options%top_p
+            ! The llama.cpp chain applies top-p before temperature.  Its
+            ! softmax and cumulative sum are deliberately single precision.
+            maximum = candidate_values(1)
+            total = 0.0_real32
+            do i = 1, candidate_count
+                adjusted(i) = exp(candidate_values(i) - maximum)
+                total = total + adjusted(i)
+            end do
             cumulative = 0.0_real32
             selected_count = 1
             do i = 1, candidate_count
-                if (candidate_values(i) > 0.0_real32) cumulative = cumulative + candidate_values(i)
-                if (cumulative >= cutoff) then
+                cumulative = cumulative + adjusted(i) / total
+                if (cumulative >= options%top_p) then
                     selected_count = i
                     exit
                 end if
             end do
         end if
-        threshold = uniform_random(random_state) * total_probability(candidate_values, selected_count)
-        cumulative = 0.0_real32
+        if (options%min_p > 0.0_real32) then
+            minimum_logit = candidate_values(1) + log(options%min_p)
+            do i = 2, selected_count
+                if (candidate_values(i) < minimum_logit) then
+                    selected_count = i - 1
+                    exit
+                end if
+            end do
+        end if
+        do i = 1, selected_count
+            candidate_values(i) = candidate_values(i) / temperature
+        end do
+        maximum = candidate_values(1)
+        probability_sum = 0.0_real64
+        do i = 1, selected_count
+            probability = exp(candidate_values(i) - maximum)
+            adjusted(i) = probability
+            probability_sum = probability_sum + real(probability, real64)
+        end do
+        probability_target = probability_sum * mt19937_uniform_real64(random_generator)
+        probability_run = 0.0_real64
         sample_logits = int(candidate_indices(1) - 1, int64)
         do i = 1, selected_count
-            if (candidate_values(i) <= 0.0_real32) cycle
-            cumulative = cumulative + candidate_values(i)
-            if (cumulative >= threshold) then
+            probability_run = probability_run + real(adjusted(i), real64)
+            if (probability_run >= probability_target) then
                 sample_logits = int(candidate_indices(i) - 1, int64)
                 return
             end if
         end do
     end function sample_logits
+
+    integer(int64) function sample_topk_candidates(candidate_indices, candidate_values, temperature, &
+            random_generator, options, workspace)
+        integer(int32), intent(in) :: candidate_indices(:)
+        real(real32), intent(in) :: candidate_values(:), temperature
+        type(mt19937_t), intent(inout) :: random_generator
+        type(sampling_options_t), intent(in) :: options
+        real(real32), intent(inout) :: workspace(:)
+        real(real32) :: maximum, total, cumulative, probability, minimum_logit
+        real(real64) :: probability_sum, probability_run, probability_target
+        integer :: i, candidate_count, selected_count
+
+        candidate_count = min(size(candidate_indices), size(candidate_values), size(workspace))
+        selected_count = candidate_count
+        if (options%top_p < 1.0_real32) then
+            maximum = candidate_values(1)
+            total = 0.0_real32
+            do i = 1, candidate_count
+                workspace(i) = exp(candidate_values(i) - maximum)
+                total = total + workspace(i)
+            end do
+            cumulative = 0.0_real32
+            selected_count = 1
+            do i = 1, candidate_count
+                cumulative = cumulative + workspace(i) / total
+                if (cumulative >= options%top_p) then
+                    selected_count = i
+                    exit
+                end if
+            end do
+        end if
+        if (options%min_p > 0.0_real32) then
+            minimum_logit = candidate_values(1) + log(options%min_p)
+            do i = 2, selected_count
+                if (candidate_values(i) < minimum_logit) then
+                    selected_count = i - 1
+                    exit
+                end if
+            end do
+        end if
+        do i = 1, selected_count
+            workspace(i) = candidate_values(i) / temperature
+        end do
+        maximum = workspace(1)
+        probability_sum = 0.0_real64
+        do i = 1, selected_count
+            probability = exp(workspace(i) - maximum)
+            workspace(i) = probability
+            probability_sum = probability_sum + real(probability, real64)
+        end do
+        probability_target = probability_sum * mt19937_uniform_real64(random_generator)
+        probability_run = 0.0_real64
+        sample_topk_candidates = int(candidate_indices(1), int64)
+        do i = 1, selected_count
+            probability_run = probability_run + real(workspace(i), real64)
+            if (probability_run >= probability_target) then
+                sample_topk_candidates = int(candidate_indices(i), int64)
+                return
+            end if
+        end do
+    end function sample_topk_candidates
 
     subroutine apply_sampling_penalties(logits, adjusted, counts, history, history_count, options)
         real(real32), intent(in) :: logits(:)
@@ -1095,17 +1331,6 @@ contains
             adjusted(i) = adjusted(i) - options%frequency_penalty * real(counts(i), real32)
         end do
     end subroutine apply_sampling_penalties
-
-    real(real32) function total_probability(values, count)
-        real(real32), intent(in) :: values(:)
-        integer, intent(in) :: count
-        integer :: i
-
-        total_probability = 0.0_real32
-        do i = 1, count
-            if (values(i) > 0.0_real32) total_probability = total_probability + values(i)
-        end do
-    end function total_probability
 
     subroutine top_candidates(values, count, indices, selected)
         real(real32), intent(in) :: values(:)
@@ -1224,20 +1449,6 @@ contains
         values(parent) = value
         indices(parent) = index
     end subroutine sift_max_heap
-
-    real(real32) function uniform_random(state)
-        integer(int64), intent(inout) :: state
-        integer(int64), parameter :: mask = int(z'7fffffffffffffff', int64)
-        integer(int64) :: bits
-
-        state = ieor(state, ishft(state, 13))
-        state = ieor(state, ishft(state, -7))
-        state = ieor(state, ishft(state, 17))
-        if (state == 0_int64) state = int(z'6a09e667f3bcc909', int64)
-        bits = iand(state, mask)
-        uniform_random = real(bits, real32) / 9223372036854775808.0_real32
-        if (uniform_random <= 0.0_real32) uniform_random = tiny(1.0_real32)
-    end function uniform_random
 
     integer(c_int) function fortai_native_service_complete(prompt, max_tokens, output, capacity, &
             token_count) bind(C, name='fortai_native_service_complete')

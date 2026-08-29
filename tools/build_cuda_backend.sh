@@ -17,18 +17,25 @@ if [[ ! -f "$ggml_prefix/include/ggml.h" || ! -f "$ggml_prefix/lib/libggml-cuda.
     echo "GGML CUDA backend not found under $ggml_prefix; set FORTAI_GGML_PREFIX" >&2
     exit 2
 fi
-"$nvcc_bin" -O3 --use_fast_math -std=c++17 -arch="$cuda_arch" -lineinfo \
+"$nvcc_bin" -O3 --use_fast_math --extended-lambda -std=c++17 -arch="$cuda_arch" -lineinfo \
     -Xcompiler=-fPIC -c "$root_dir/backend/cuda/fortai_cuda_backend.cu" \
     -o "$out_dir/fortai_cuda_backend.o"
+"$nvcc_bin" -O3 --use_fast_math --extended-lambda -std=c++17 -arch="$cuda_arch" -lineinfo \
+    -I"$ggml_prefix/include" -I"$ggml_source/ggml/src" \
+    -I"$ggml_source/ggml/src/ggml-cuda" -I"$root_dir/backend/cuda" \
+    -Xcompiler=-fPIC -c "$root_dir/backend/cuda/fortai_cuda_fattn_backend.cu" \
+    -o "$out_dir/fortai_cuda_fattn_backend.o"
 "$nvcc_bin" -O3 --use_fast_math -std=c++17 -arch="$cuda_arch" -lineinfo \
     -DGGML_CUDA_USE_GRAPHS -I"$ggml_prefix/include" -I"$ggml_source/ggml/src" \
     -I"$ggml_source/ggml/src/ggml-cuda" -I"$root_dir/backend/cuda" -Xcompiler=-fPIC -c \
     "$root_dir/backend/cuda/fortai_cuda_q4_backend.cu" -o "$out_dir/fortai_cuda_q4_backend.o"
 "$nvcc_bin" -O3 --use_fast_math -std=c++17 -arch="$cuda_arch" -lineinfo \
     "$root_dir/tools/cuda_backend_smoke.cu" "$out_dir/fortai_cuda_backend.o" \
+    "$out_dir/fortai_cuda_fattn_backend.o" \
     -o "$out_dir/cuda_backend_smoke"
 "$nvcc_bin" -O3 --use_fast_math -std=c++17 -arch="$cuda_arch" -lineinfo \
     "$root_dir/tools/cuda_ffn_smoke.cu" "$out_dir/fortai_cuda_backend.o" \
+    "$out_dir/fortai_cuda_fattn_backend.o" \
     -o "$out_dir/cuda_ffn_smoke"
 mkdir -p "$fortran_dir/mod"
 gfortran -O2 -J"$fortran_dir/mod" -c "$root_dir/src/fortai_status.f90" \
@@ -42,11 +49,12 @@ gfortran -O2 -I"$fortran_dir/mod" -J"$fortran_dir/mod" \
 "$nvcc_bin" -O3 -arch="$cuda_arch" \
     "$fortran_dir/fortai_status.o" "$fortran_dir/fortai_backend_cuda.o" \
     "$fortran_dir/fortran_cuda_backend_smoke.o" "$out_dir/fortai_cuda_backend.o" \
+    "$out_dir/fortai_cuda_fattn_backend.o" \
     "$out_dir/fortai_cuda_q4_backend.o" -L"$ggml_prefix/lib" \
     -Xlinker -rpath -Xlinker "$ggml_prefix/lib" -lggml-cuda -lggml-cpu -lggml -lggml-base \
     -lgfortran -lquadmath -o "$out_dir/fortran_cuda_backend_smoke"
-printf 'object=%s\nsmoke=%s\nffn_smoke=%s\nfortran_smoke=%s\narch=%s\nnvcc=%s\n' \
-    "$out_dir/fortai_cuda_backend.o" "$out_dir/cuda_backend_smoke" \
-    "$out_dir/cuda_ffn_smoke" \
+printf 'object=%s\nfattn_object=%s\nsmoke=%s\nffn_smoke=%s\nfortran_smoke=%s\narch=%s\nnvcc=%s\n' \
+    "$out_dir/fortai_cuda_backend.o" "$out_dir/fortai_cuda_fattn_backend.o" \
+    "$out_dir/cuda_backend_smoke" "$out_dir/cuda_ffn_smoke" \
     "$out_dir/fortran_cuda_backend_smoke" \
     "$cuda_arch" "$nvcc_bin"

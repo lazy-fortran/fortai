@@ -25,6 +25,12 @@ void *fortai_cuda_q4_context_stream(fortai_cuda_q4_context *context,
  * device-wide synchronization fallback. */
 int fortai_cuda_q4_context_set_consumer_stream(fortai_cuda_q4_context *context,
     int device_slot, void *stream);
+/* Queue a resident activation through the bounded pinned ring between CUDA
+ * slots.  Source and destination scheduler streams are connected entirely by
+ * CUDA events; the host never waits for either PCIe leg. */
+int fortai_cuda_q4_context_transfer(fortai_cuda_q4_context *context,
+    int source_slot, const void *source, int destination_slot,
+    void *destination, size_t bytes);
 int fortai_cuda_q4_weights_upload(fortai_cuda_q4_context *context, int value_type,
     const void *host_weights, size_t weight_bytes, int rows, int width, int device,
     fortai_cuda_q4_weights **weights);
@@ -77,6 +83,13 @@ int fortai_cuda_q4_matvec_device_swiglu_down(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights *up_weights,
     const fortai_cuda_q4_weights *down_weights, const void *device_activation,
     size_t activation_elements, void *device_output, size_t output_elements);
+int fortai_cuda_q4_matmul_device_swiglu_down_slot(
+    fortai_cuda_q4_context *context, int device_slot,
+    const fortai_cuda_q4_weights *gate_weights,
+    const fortai_cuda_q4_weights *up_weights,
+    const fortai_cuda_q4_weights *down_weights,
+    const void *device_activation, size_t activation_elements, int batch,
+    void *device_output, size_t output_elements);
 
 
 /* Execute a group of projections that consume the same resident activation.
@@ -107,6 +120,13 @@ int fortai_cuda_q4_matmul_device_group(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights * const *weights, const void *device_activation,
     size_t activation_elements, int batch, void * const *device_outputs,
     const size_t *output_elements, int count);
+/* Slot-aware form used by the native prompt batch path.  The slot is the
+ * zero-based device index in the Q4 context (0 = first, 1 = second); all
+ * weights, activation, and outputs remain on that device. */
+int fortai_cuda_q4_matmul_device_group_slot(fortai_cuda_q4_context *context,
+    int device_slot, const fortai_cuda_q4_weights * const *weights,
+    const void *device_activation, size_t activation_elements, int batch,
+    void * const *device_outputs, const size_t *output_elements, int count);
 
 /* Single-matrix form used when a projection has no sibling with the same
  * activation.  It shares the cached batched GGML plan with the grouped form. */
@@ -136,6 +156,10 @@ int fortai_cuda_q4_embedding_device(fortai_cuda_q4_context *context,
 int fortai_cuda_q4_embedding_device_batch(fortai_cuda_q4_context *context,
     const fortai_cuda_q4_weights *weights, const int32_t *host_tokens, int batch,
     void *device_output, size_t output_elements);
+int fortai_cuda_q4_embedding_device_batch_slot(fortai_cuda_q4_context *context,
+    int device_slot, const fortai_cuda_q4_weights *weights,
+    const int32_t *host_tokens, int batch, void *device_output,
+    size_t output_elements);
 
 #ifdef __cplusplus
 }

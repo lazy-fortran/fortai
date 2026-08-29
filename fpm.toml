@@ -8,12 +8,26 @@ copyright = "Copyright 2026, lazy-fortran contributors"
 
 [build]
 auto-tests = true
+link = ["ggml-cpu", "ggml-cuda", "ggml", "ggml-base", "pthread", "dl"]
+flags = [
+  "-O2",
+  "-march=native",
+  "-mtune=native",
+  "-funroll-loops",
+  "-fopenmp",
+  "-fno-fast-math",
+  "-ffp-contract=off",
+  "-fno-math-errno",
+  "-flto",
+  "-L/home/ert/.local/llama.cpp-upstream-main-650913862/lib",
+  "-Wl,-rpath,/home/ert/.local/llama.cpp-upstream-main-650913862/lib",
+]
 
 [profiles]
 native = ["native"]
 
 [features]
-native.flags = "-O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto"
+native.flags = "-O2 -march=native -mtune=native -funroll-loops -fopenmp -fno-fast-math -ffp-contract=off -fno-math-errno -flto -L/home/ert/.local/llama.cpp-upstream-main-650913862/lib -Wl,-rpath,/home/ert/.local/llama.cpp-upstream-main-650913862/lib -lggml-cpu -lggml-cuda -lggml -lggml-base -lpthread -ldl"
 
 [fortran]
 implicit-typing = false

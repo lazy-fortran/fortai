@@ -13,10 +13,14 @@ upstream techniques are used with independent FortAI implementations:
 - scheduler-owned streams and event edges for split-device work;
 - cached CUDA graph capture/replay with capture-safe stream selection;
 - quantized MMVQ/MMQ tiling and packed activation layouts; and
+- the `fattn-common.cuh` active-view Q8 dequantization strategy feeding a
+  native WMMA attention tile (the resident KV cache remains Q8_0); and
 - backend-side greedy `argmax`, so a decode transfers a token ID rather than
   a full vocabulary row.
 
-No upstream source was copied into the native kernels.  The upstream GGML/
+The attention algorithmic reference is `ggml/src/ggml-cuda/fattn-common.cuh`,
+`fattn-vec.cuh`, and `fattn-mma-f16.cuh` at the revision above.  No upstream
+source was copied into the native kernels.  The upstream GGML/
 llama.cpp project is distributed under the MIT license:
 
 ```text

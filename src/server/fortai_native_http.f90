@@ -15,7 +15,8 @@ module fortai_native_http
         fortai_native_service_context_size, fortai_native_service_cache_reuse_supported, &
         fortai_native_service_cache_reuse_active, fortai_native_service_cache_reuse_count, &
         fortai_native_service_last_prompt_ms, fortai_native_service_last_generation_ms, &
-        fortai_native_service_last_prompt_tokens, fortai_native_service_last_generation_tokens
+        fortai_native_service_last_prompt_tokens, fortai_native_service_last_generation_tokens, &
+        fortai_native_service_last_draft_tokens, fortai_native_service_last_draft_accepted
     use fortai_whisper_service, only: fortai_whisper_http_handle
     use fortai_string, only: string_t
     implicit none
@@ -1880,19 +1881,32 @@ contains
         close_tag = index(raw(start:), '</think>')
         if (close_tag > 0) then
             finish = start + close_tag - 2
-            if (finish >= start) call append_trimmed_newlines(reasoning, raw(start:finish))
+            if (finish >= start) call append_trimmed_leading_newlines(reasoning, raw(start:finish))
             content_start = start + close_tag - 1 + len('</think>')
             if (prefix_end > 0) call content%append(raw(:prefix_end))
             if (content_start <= len(raw)) call append_trimmed_newlines(content, raw(content_start:))
         else
             if (prefix_end > 0) call content%append(raw(:prefix_end))
-            if (start <= len(raw)) call append_trimmed_newlines(reasoning, raw(start:))
+            if (start <= len(raw)) call append_trimmed_leading_newlines(reasoning, raw(start:))
         end if
         if (reasoning_format == 'deepseek-legacy') then
             call content%clear()
             call content%set(raw)
         end if
     end subroutine split_reasoning
+
+    subroutine append_trimmed_leading_newlines(output, text)
+        type(string_t), intent(inout) :: output
+        character(len=*), intent(in) :: text
+        integer :: first
+
+        first = 1
+        do while (first <= len(text))
+            if (text(first:first) /= char(10) .and. text(first:first) /= char(13)) exit
+            first = first + 1
+        end do
+        if (first <= len(text)) call output%append(text(first:))
+    end subroutine append_trimmed_leading_newlines
 
     subroutine append_trimmed_newlines(output, text)
         type(string_t), intent(inout) :: output
@@ -2183,7 +2197,7 @@ contains
         type(string_t), intent(inout) :: output
         integer, intent(in) :: prompt_tokens, generation_tokens
         real(real64) :: prompt_ms, generation_ms, prompt_rate, generation_rate
-        integer(int64) :: measured_prompt_tokens, measured_generation_tokens
+        integer(int64) :: measured_prompt_tokens, measured_generation_tokens, displayed_generation_tokens
 
         prompt_ms = max(0.0_real64, fortai_native_service_last_prompt_ms())
         generation_ms = max(0.0_real64, fortai_native_service_last_generation_ms())
@@ -2195,6 +2209,7 @@ contains
         if (measured_generation_tokens == 0_int64 .and. generation_tokens > 0 .and. generation_ms > 0.0_real64) then
             measured_generation_tokens = int(generation_tokens, int64)
         end if
+        displayed_generation_tokens = max(measured_generation_tokens, int(max(0, generation_tokens), int64))
         prompt_rate = 0.0_real64
         generation_rate = 0.0_real64
         if (prompt_ms > 0.0_real64) prompt_rate = 1000.0_real64 * real(measured_prompt_tokens, real64) / prompt_ms
@@ -2207,11 +2222,17 @@ contains
         call output%append(',"prompt_per_second":')
         call append_json_real(output, prompt_rate)
         call output%append(',"predicted_n":')
-        call output%append_int(int(measured_generation_tokens))
+        call output%append_int(int(displayed_generation_tokens))
         call output%append(',"predicted_ms":')
         call append_json_real(output, generation_ms)
         call output%append(',"predicted_per_second":')
         call append_json_real(output, generation_rate)
+        if (fortai_native_service_last_draft_tokens() > 0_int64) then
+            call output%append(',"draft_n":')
+            call output%append_int(int(fortai_native_service_last_draft_tokens()))
+            call output%append(',"draft_n_accepted":')
+            call output%append_int(int(fortai_native_service_last_draft_accepted()))
+        end if
         call output%append('}')
     end subroutine append_timings
 
@@ -2680,7 +2701,6 @@ contains
         logical :: prompt_array, whisper_model
         character(len=:), allocatable :: path_value, model_path
         character(len=:), allocatable :: reasoning_format, reasoning_effort
-        integer :: reasoning_budget
 
         response_length = 0_c_int
         status = 500_c_int
@@ -3124,7 +3144,6 @@ contains
         end if
         call reasoning_instruction%clear()
         if (supports_reasoning_effort .and. enable_thinking) then
-            reasoning_budget = server_reasoning_budget()
             if (len_trim(reasoning_effort) == 0) reasoning_effort = 'xhigh'
             select case (trim(reasoning_effort))
             case ('xhigh')
@@ -3135,15 +3154,6 @@ contains
                 call reasoning_instruction%set('Reasoning effort is set to low. Keep your thinking brief and focused, moving '&
                     // 'directly to the conclusion without unnecessary elaboration.')
             end select
-            if (reasoning_budget > 0) then
-                if (reasoning_instruction%length() == 0) then
-                    call reasoning_instruction%set('Keep hidden reasoning within a budget of ' // &
-                        integer_text(reasoning_budget) // ' tokens.')
-                else
-                    call reasoning_instruction%append(' Keep hidden reasoning within a budget of ' // &
-                        integer_text(reasoning_budget) // ' tokens.')
-                end if
-            end if
         end if
         call tools_json%clear()
         if (.not. json_array_value(body%as_character(), 'tools', tools_json)) call tools_json%clear()
@@ -3284,19 +3294,6 @@ contains
         escaped = json_escape(value)
         call output%append_string(escaped)
     end function append_json
-
-    integer function server_reasoning_budget()
-        character(len=32) :: value
-        integer :: length, ios, parsed
-
-        server_reasoning_budget = 0
-        value = ''
-        call get_environment_variable('FORTAI_REASONING_BUDGET', value, length=length)
-        if (length <= 0) call get_environment_variable('LLAMACPP_REASONING_BUDGET', value, length=length)
-        if (length <= 0 .or. length > len(value)) return
-        read(value(:length), *, iostat=ios) parsed
-        if (ios == 0 .and. parsed > 0 .and. parsed <= max_generation) server_reasoning_budget = parsed
-    end function server_reasoning_budget
 
     subroutine apply_reasoning_environment(enable_thinking, explicit)
         logical, intent(inout) :: enable_thinking, explicit

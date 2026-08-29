@@ -102,20 +102,67 @@ int main(int argc, char **argv) {
     const bool correct = host_abs <= 2.0e-3f && host_rel <= 1.0e-4f &&
         resident_abs <= 2.0e-3f && resident_rel <= 1.0e-4f &&
         grouped_abs <= 2.0e-3f && grouped_rel <= 1.0e-4f;
+
+    constexpr int topk_rows = 3;
+    constexpr int topk_width = 248320;
+    constexpr int topk_count = 20;
+    std::vector<float> topk_input(topk_rows * topk_width);
+    std::vector<int> topk_indices(topk_rows * topk_count);
+    std::vector<float> topk_values(topk_rows * topk_count);
+    for (int row = 0; row < topk_rows; ++row) {
+        for (int column = 0; column < topk_width; ++column) {
+            const uint32_t mixed = static_cast<uint32_t>(column * 2654435761u) ^
+                static_cast<uint32_t>((row + 1) * 2246822519u);
+            topk_input[row * topk_width + column] =
+                static_cast<float>(static_cast<int32_t>(mixed)) / 2147483648.0f;
+        }
+        topk_input[row * topk_width + 17] = 3.0f;
+        topk_input[row * topk_width + 29] = 3.0f;
+    }
+    void *device_topk = nullptr;
+    check(fortai_cuda_q8_device_buffer_create(context,
+        topk_input.size() * sizeof(float), &device_topk), context,
+        "top-k allocation");
+    check(fortai_cuda_q8_device_buffer_upload(context, device_topk, topk_input.data(),
+        topk_input.size() * sizeof(float)), context, "top-k input upload");
+    check(fortai_cuda_qwen35_topk_rows_device(context, device_topk, topk_width,
+        topk_rows, topk_count, topk_indices.data(), topk_values.data()), context,
+        "row top-k");
+    bool topk_correct = true;
+    for (int row = 0; row < topk_rows; ++row) {
+        std::vector<int> oracle_indices(topk_width);
+        for (int column = 0; column < topk_width; ++column) oracle_indices[column] = column;
+        std::partial_sort(oracle_indices.begin(), oracle_indices.begin() + topk_count,
+            oracle_indices.end(), [&](int left, int right) {
+                const float left_value = topk_input[row * topk_width + left];
+                const float right_value = topk_input[row * topk_width + right];
+                return left_value > right_value ||
+                    (left_value == right_value && left < right);
+            });
+        for (int rank = 0; rank < topk_count; ++rank) {
+            const int offset = row * topk_count + rank;
+            const int oracle_index = oracle_indices[rank];
+            if (topk_indices[offset] != oracle_index ||
+                topk_values[offset] != topk_input[row * topk_width + oracle_index]) {
+                topk_correct = false;
+            }
+        }
+    }
     std::printf("{\"implementation\":\"fortai-cuda-q8-backend-abi\",\"device\":%d,"
         "\"rows\":%d,\"width\":%d,\"host_elapsed_ms\":%.6f,"
         "\"resident_kernel_ms\":%.6f,\"grouped_pair_ms\":%.6f,\"grouped_triplet_ms\":%.6f,"
         "\"host_max_abs_error\":%.9g,"
         "\"host_max_rel_error\":%.9g,\"resident_max_abs_error\":%.9g,"
         "\"resident_max_rel_error\":%.9g,\"grouped_max_abs_error\":%.9g,"
-        "\"grouped_max_rel_error\":%.9g,\"correct\":%s}\n", device, rows, width,
+        "\"grouped_max_rel_error\":%.9g,\"topk_correct\":%s,\"correct\":%s}\n", device, rows, width,
         host_ms, resident_ms, pair_ms, triplet_ms, host_abs, host_rel, resident_abs, resident_rel,
         grouped_abs, grouped_rel,
-        correct ? "true" : "false");
+        topk_correct ? "true" : "false", correct && topk_correct ? "true" : "false");
 
+    check(fortai_cuda_q8_device_buffer_destroy(context, device_topk), context, "top-k free");
     check(fortai_cuda_q8_device_buffer_destroy(context, device_output), context, "output free");
     check(fortai_cuda_q8_device_buffer_destroy(context, device_activation), context, "activation free");
     check(fortai_cuda_q8_weights_destroy(device_weights), context, "weight free");
     check(fortai_cuda_q8_context_destroy(context), nullptr, "context destroy");
-    return correct ? EXIT_SUCCESS : EXIT_FAILURE;
+    return correct && topk_correct ? EXIT_SUCCESS : EXIT_FAILURE;
 }
