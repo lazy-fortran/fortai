@@ -4983,6 +4983,25 @@ __global__ void qwen_attention_apply_gqa_q4_batch(
 #pragma unroll
     for (int q = 0; q < QueryTokens; ++q) {
         if (q >= query_count) continue;
+        /* Unpartitioned launches own the whole key range, so this block already
+         * holds the final softmax state.  Normalize and gate here rather than
+         * staging through the partition scratch: that buffer is grown with
+         * cudaMalloc, which cannot run inside a CUDA graph capture, and the
+         * combine pass would only re-read what is already in registers. */
+        if (partial_output == nullptr) {
+            const size_t query_offset = static_cast<size_t>(query_base + q) * query_stride +
+                query_head_offset;
+            const float inverse = running_norm[q] > 0.0f ? 1.0f / running_norm[q] : 0.0f;
+#pragma unroll
+            for (int i = 0; i < ValueSize / 32; ++i) {
+                const int component = component_base + i;
+                const float gate = query[query_offset + ValueSize + component];
+                attention[static_cast<size_t>(query_base + q) * attention_stride +
+                    static_cast<size_t>(query_head) * ValueSize + component] =
+                    accumulator[q][i] * inverse * qwen_sigmoid(gate);
+            }
+            continue;
+        }
         const size_t row = static_cast<size_t>(query_base + q) * heads + query_head;
         const size_t partial_offset =
             (row * max_partitions + partition) * (ValueSize + 2);
@@ -7986,12 +8005,23 @@ extern "C" int fortai_cuda_qwen35_attention_run_core_device_batch(
                             static_cast<int>(attention_stride), batch, context->position);
                 }
             } else {
-                constexpr int online_partitions = 8;
-                const bool partition_q4 = layer->impl.cache_key_type == 2 &&
+                /* Partitioning the key range buys parallelism only when the
+                 * batch itself supplies few blocks, as in scalar decode.  A
+                 * prefill ubatch already fills the GPU, and partitioning it
+                 * would multiply the scratch buffer by the partition count for
+                 * no gain.  The batch<=4 guard used to exclude prefill from the
+                 * grouped q4 kernel entirely, sending every prompt chunk of the
+                 * q4 draft cache through the unpartitioned scalar-oriented
+                 * fallback: one block scanned the whole key range, which cost
+                 * 233 ms per chunk at 16k tokens and dominated prefill. */
+                const int online_partitions = batch <= 4 ? 8 : 1;
+                const bool q4_cache = layer->impl.cache_key_type == 2 &&
                     layer->impl.cache_value_type == 2 &&
-                    layer->impl.head_size == 256 && layer->impl.value_size == 256 &&
-                    batch <= 4;
-                const bool grouped_q4 = partition_q4 &&
+                    layer->impl.head_size == 256 && layer->impl.value_size == 256;
+                /* Only a partitioned launch needs the shared scratch, and only
+                 * scalar decode benefits from partitioning. */
+                const bool partition_q4 = q4_cache && online_partitions > 1;
+                const bool grouped_q4 = q4_cache &&
                     layer->impl.heads == 6 * layer->impl.key_value_heads;
                 if (partition_q4) {
                     const size_t partial_bytes = static_cast<size_t>(batch) *
@@ -8016,7 +8046,8 @@ extern "C" int fortai_cuda_qwen35_attention_run_core_device_batch(
                         layer->impl.heads, layer->impl.key_value_heads,
                         layer->impl.max_context, context->position,
                         static_cast<int>(query_stride), static_cast<int>(attention_stride),
-                        batch, static_cast<float *>(context->scratch_attention_meta),
+                        batch, partition_q4 ?
+                            static_cast<float *>(context->scratch_attention_meta) : nullptr,
                         online_partitions);
                     error = cudaGetLastError();
                 } else if (error == cudaSuccess) {

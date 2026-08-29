@@ -66,8 +66,35 @@ PROMPTS = [
     "What is the difference between a pointer and an allocatable in Fortran?",
     "Describe in two sentences how speculative decoding works.",
 ]
+
+
+def tokenize(text):
+    payload = json.dumps({"content": text}).encode()
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/tokenize", data=payload,
+                                     headers={"Content-Type": "application/json"})
+    return len(json.loads(urllib.request.urlopen(request, timeout=600).read())["tokens"])
+
+
+# A long prompt is the only case that reaches the batched prefill attention
+# kernels; the short prompts above stay on the scalar path and would not catch
+# a regression there.
+WORDS = ("the quick brown fox jumps over the lazy dog while a Fortran compiler "
+         "emits vectorized kernels for dense linear algebra on modern hardware ")
+_text = WORDS
+while tokenize(_text) < 4096:
+    _text = _text * 2
+_words = _text.split(" ")
+_lo, _hi = 1, len(_words)
+while _lo < _hi:
+    _mid = (_lo + _hi) // 2
+    if tokenize(" ".join(_words[:_mid])) >= 4096:
+        _hi = _mid
+    else:
+        _lo = _mid + 1
+PROMPTS.append(" ".join(_words[:_lo]) + "\n\nSummarize the passage above in one sentence.")
 res = []
-for prompt in PROMPTS:
+for index, prompt in enumerate(PROMPTS):
+    print(f"    prompt {index} ({len(prompt)} chars)", flush=True)
     payload = json.dumps({"model": "qwen",
                           "messages": [{"role": "user", "content": prompt}],
                           "max_tokens": gen, "temperature": 0.0}).encode()
@@ -97,12 +124,12 @@ for a, b in zip(on, off):
     same = a["content"] == b["content"] and a["reasoning"] == b["reasoning"]
     failures += not same
     draft = (a.get("timings") or {})
-    cases.append({"prompt": a["prompt"], "identical": same,
+    cases.append({"prompt": a["prompt"][:200], "identical": same,
                   "speculative_draft_n": draft.get("draft_n"),
                   "speculative_draft_accepted": draft.get("draft_n_accepted"),
                   "speculative_chars": len(a["content"] or ""),
                   "scalar_chars": len(b["content"] or "")})
-    print(("PASS  " if same else "FAIL  ") + a["prompt"])
+    print(("PASS  " if same else "FAIL  ") + a["prompt"][:70])
     if not same:
         for field in ("content", "reasoning"):
             x, y = a[field] or "", b[field] or ""
